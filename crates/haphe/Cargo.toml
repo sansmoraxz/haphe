@@ -1,0 +1,9 @@
+[package]
+name = "haphe"
+version = "0.1.0"
+edition = "2024"
+description = "Generator for script engine bindings efficiently and generically"
+license = "Apache-2.0"
+
+[dependencies]
+haphe-core = { path = "../haphe-core" }

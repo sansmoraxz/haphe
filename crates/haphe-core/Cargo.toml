@@ -1,0 +1,8 @@
+[package]
+name = "haphe-core"
+version = "0.1.0"
+edition = "2024"
+description = "Core IR and traits for haphe scripting-language binding generator"
+license = "Apache-2.0"
+
+[dependencies]
