@@ -1,0 +1,38 @@
+error[E0659]: `script` is ambiguous
+ --> tests/ui/helper_attr_before_derive.rs:3:3
+  |
+3 | #[script(thread_safety = none)]
+  |   ^^^^^^ ambiguous name
+  |
+  = note: ambiguous because of a name conflict with a derive helper attribute
+note: `script` could refer to the derive helper attribute defined here
+ --> tests/ui/helper_attr_before_derive.rs:4:10
+  |
+4 | #[derive(Script)]
+  |          ^^^^^^
+note: `script` could also refer to the attribute macro imported here
+ --> tests/ui/helper_attr_before_derive.rs:1:21
+  |
+1 | use haphe::{Script, script};
+  |                     ^^^^^^
+  = help: use `crate::script` to refer to this attribute macro unambiguously
+
+error: derive helper attribute is used before it is introduced
+ --> tests/ui/helper_attr_before_derive.rs:3:3
+  |
+3 | #[script(thread_safety = none)]
+  |   ^^^^^^
+4 | #[derive(Script)]
+  |          ------ the attribute is introduced here
+  |
+  = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
+  = note: for more information, see issue #79202 <https://github.com/rust-lang/rust/issues/79202>
+  = note: `#[deny(legacy_derive_helpers)]` (part of `#[deny(future_incompatible)]`) on by default
+
+warning: unused import: `script`
+ --> tests/ui/helper_attr_before_derive.rs:1:21
+  |
+1 | use haphe::{Script, script};
+  |                     ^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default

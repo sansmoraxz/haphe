@@ -1,0 +1,13 @@
+error[E0277]: `Color` has no struct descriptor
+  --> tests/ui/enum_in_structs_section.rs:11:19
+   |
+11 |         structs: [Color],
+   |                   ^^^^^ unsatisfied trait bound
+   |
+help: the trait `ScriptStruct` is not implemented for `Color`
+  --> tests/ui/enum_in_structs_section.rs:4:1
+   |
+ 4 | enum Color {
+   | ^^^^^^^^^^
+   = note: structs listed in `registry!` under `structs:` need `#[derive(Script)]`
+   = note: if `Color` is an enum, list it under `enums:` instead

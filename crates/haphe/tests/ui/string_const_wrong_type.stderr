@@ -1,0 +1,5 @@
+error[E0080]: evaluation panicked: constant `LIMIT` has a string value but its declared type is not a string type
+ --> tests/ui/string_const_wrong_type.rs:5:42
+  |
+5 |                 constants: [LIMIT: i64 = "100"],
+  |                                          ^^^^^ evaluation of `REGISTRY::_` failed here

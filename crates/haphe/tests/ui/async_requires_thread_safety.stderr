@@ -1,0 +1,5 @@
+error[E0080]: evaluation panicked: types with async methods must declare #[script(thread_safety = ...)] explicitly
+ --> tests/ui/async_requires_thread_safety.rs:4:10
+  |
+4 | #[script(methods)]
+  |          ^^^^^^^ evaluation of `_` failed here

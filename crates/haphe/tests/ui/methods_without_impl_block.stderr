@@ -1,0 +1,12 @@
+error[E0277]: `Point` declares `#[script(methods)]` but no `#[script] impl Point` block was found
+ --> tests/ui/methods_without_impl_block.rs:5:8
+  |
+5 | struct Point {
+  |        ^^^^^ unsatisfied trait bound
+  |
+help: the trait `ScriptImpl` is not implemented for `Point`
+ --> tests/ui/methods_without_impl_block.rs:5:1
+  |
+5 | struct Point {
+  | ^^^^^^^^^^^^
+  = note: add `#[script]` to an `impl Point` block, or remove `methods` from `#[script(...)]` on the type

@@ -2,7 +2,7 @@ use crate::function::FunctionDescriptor;
 use crate::types::{TypeDescriptor, TypeId};
 
 /// A logical grouping of functions, types, constants, and sub-modules.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ModuleDescriptor<'a> {
     /// Module name.
     pub name: &'a str,
@@ -19,7 +19,7 @@ pub struct ModuleDescriptor<'a> {
 }
 
 /// A named constant value exposed to scripting languages.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ConstantDescriptor<'a> {
     /// Constant name.
     pub name: &'a str,

@@ -1,0 +1,5 @@
+error: trait `Debug` is declared more than once
+ --> tests/ui/duplicate_trait_decl.rs:4:24
+  |
+4 | #[script(traits(Debug, Debug))]
+  |                        ^^^^^

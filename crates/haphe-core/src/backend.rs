@@ -44,10 +44,7 @@ pub trait BindingGenerator {
     fn capabilities(&self) -> BackendCapabilities;
 
     /// Consumes a validated type registry and produces generated files.
-    fn generate(
-        &self,
-        registry: &ValidatedRegistry<'_>,
-    ) -> Result<GeneratedOutput, Self::Error>;
+    fn generate(&self, registry: &ValidatedRegistry<'_>) -> Result<GeneratedOutput, Self::Error>;
 }
 
 /// IR features a backend can handle and constraints it imposes.
@@ -144,6 +141,14 @@ impl BackendCapabilities {
                         });
                     }
                 }
+                for prop in s.properties {
+                    if contains_callback(prop.ty) {
+                        errors.push(CompatibilityError::UnsupportedCallback {
+                            type_id: s.id,
+                            context: prop.name,
+                        });
+                    }
+                }
             }
             if !self.generics && !s.generic_params.is_empty() {
                 errors.push(CompatibilityError::UnsupportedGenerics { type_id: s.id });
@@ -187,10 +192,52 @@ impl BackendCapabilities {
             }
         }
 
+        for module in registry.modules() {
+            self.check_module(module, &mut errors);
+        }
+
         if errors.is_empty() {
             Ok(())
         } else {
             Err(errors)
+        }
+    }
+
+    fn check_module<'a>(
+        &self,
+        module: &crate::module::ModuleDescriptor<'a>,
+        errors: &mut Vec<CompatibilityError<'a>>,
+    ) {
+        for function in module.functions {
+            if !self.async_fns && function.is_async {
+                errors.push(CompatibilityError::UnsupportedModuleAsync {
+                    module: module.name,
+                    fn_name: function.name,
+                });
+            }
+            if !self.callbacks {
+                let has_callback = function.params.iter().any(|p| contains_callback(p.ty))
+                    || contains_callback(function.return_type);
+                if has_callback {
+                    errors.push(CompatibilityError::UnsupportedModuleCallback {
+                        module: module.name,
+                        context: function.name,
+                    });
+                }
+            }
+        }
+        if !self.callbacks {
+            for constant in module.constants {
+                if contains_callback(constant.ty) {
+                    errors.push(CompatibilityError::UnsupportedModuleCallback {
+                        module: module.name,
+                        context: constant.name,
+                    });
+                }
+            }
+        }
+        for submodule in module.submodules {
+            self.check_module(submodule, errors);
         }
     }
 }
@@ -286,22 +333,39 @@ pub enum CompatibilityError<'a> {
         required: ThreadSafety,
         actual: ThreadSafety,
     },
+    /// An async module function in a backend that doesn't support async.
+    UnsupportedModuleAsync { module: &'a str, fn_name: &'a str },
+    /// A callback type in a module function or constant in a backend that
+    /// doesn't support callbacks.
+    UnsupportedModuleCallback { module: &'a str, context: &'a str },
 }
 
 impl std::fmt::Display for CompatibilityError<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::UnsupportedAsync { type_id, fn_name } => {
-                write!(f, "type {type_id}: async function `{fn_name}` is not supported by this backend")
+                write!(
+                    f,
+                    "type {type_id}: async function `{fn_name}` is not supported by this backend"
+                )
             }
             Self::UnsupportedCallback { type_id, context } => {
-                write!(f, "type {type_id}: callback in `{context}` is not supported by this backend")
+                write!(
+                    f,
+                    "type {type_id}: callback in `{context}` is not supported by this backend"
+                )
             }
             Self::UnsupportedGenerics { type_id } => {
-                write!(f, "type {type_id}: generic type parameters are not supported by this backend")
+                write!(
+                    f,
+                    "type {type_id}: generic type parameters are not supported by this backend"
+                )
             }
             Self::UnsupportedProperties { type_id } => {
-                write!(f, "type {type_id}: computed properties are not supported by this backend")
+                write!(
+                    f,
+                    "type {type_id}: computed properties are not supported by this backend"
+                )
             }
             Self::UnsupportedTypeAlias { type_id } => {
                 write!(f, "type alias {type_id} is not supported by this backend")
@@ -315,6 +379,18 @@ impl std::fmt::Display for CompatibilityError<'_> {
                     f,
                     "type {type_id}: requires Send={}/Sync={} but has Send={}/Sync={}",
                     required.is_send, required.is_sync, actual.is_send, actual.is_sync
+                )
+            }
+            Self::UnsupportedModuleAsync { module, fn_name } => {
+                write!(
+                    f,
+                    "module `{module}`: async function `{fn_name}` is not supported by this backend"
+                )
+            }
+            Self::UnsupportedModuleCallback { module, context } => {
+                write!(
+                    f,
+                    "module `{module}`: callback in `{context}` is not supported by this backend"
                 )
             }
         }

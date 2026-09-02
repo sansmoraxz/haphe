@@ -8,6 +8,56 @@ scripting runtime (mlua, rhai, boa, steel, etc.). The binding code matches
 what you'd write by hand — haphe adds nothing to your runtime binary beyond
 the registration calls themselves.
 
+## Quickstart: derive the descriptors
+
+```rust
+use haphe::{Script, script};
+
+/// A 2D point.
+#[derive(Script, PartialEq)]
+#[script(thread_safety = send_sync, traits(PartialEq), methods)]
+struct Point {
+    x: f64,
+    #[script(readonly)]
+    y: f64,
+}
+
+#[script]
+impl Point {
+    #[script(constructor)]
+    fn new(x: f64, y: f64) -> Self { Point { x, y } }
+
+    fn distance_to(&self, other: &Point) -> f64 {
+        ((self.x - other.x).powi(2) + (self.y - other.y).powi(2)).sqrt()
+    }
+}
+
+/// Adds two numbers.
+#[script]
+fn add(a: i32, b: i32) -> i32 { a + b }
+
+haphe::registry! {
+    pub static REGISTRY = {
+        structs: [Point],
+        modules: [
+            mod math { functions: [add], types: [Point] },
+        ],
+    };
+}
+```
+
+Everything the macros generate is a compile-time constant, byte-for-byte what
+you would write by hand. Nothing is inferred: trait impls and thread safety
+are declared in the attribute and **verified** — declaring
+`traits(Display)` on a type that isn't `Display`, or `thread_safety =
+send_sync` on a `!Sync` type, is a compile error at the attribute (for generic
+types, at each exposed instantiation). The default thread-safety claim is
+`none`; only types with `async` methods must declare one explicitly (async
+runtimes may or may not be multithreaded).
+
+Descriptors can also be written by hand — the derive is a convenience layer
+over the same const-constructible IR.
+
 ## Architecture
 
 ### Embedded Runtime Model

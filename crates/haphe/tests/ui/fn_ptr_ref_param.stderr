@@ -1,0 +1,5 @@
+error: callback types with reference parameters are not supported; take owned values instead (e.g. `String` rather than `&str`)
+ --> tests/ui/fn_ptr_ref_param.rs:5:14
+  |
+5 |     on_name: fn(&str) -> i64,
+  |              ^^

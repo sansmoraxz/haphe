@@ -1,0 +1,5 @@
+error: generic functions cannot be exposed to scripts
+ --> tests/ui/generic_free_fn.rs:4:13
+  |
+4 | fn identity<T>(value: T) -> T {
+  |             ^

@@ -1,0 +1,10 @@
+error[E0119]: conflicting implementations of trait `ScriptImpl` for type `Point`
+  --> tests/ui/duplicate_impl_blocks.rs:16:1
+   |
+ 9 | #[script]
+   | --------- first implementation here
+...
+16 | #[script]
+   | ^^^^^^^^^ conflicting implementation for `Point`
+   |
+   = note: this error originates in the attribute macro `script` (in Nightly builds, run with -Z macro-backtrace for more info)

@@ -1,0 +1,17 @@
+error[E0277]: this `#[script] impl` block is not referenced by `Point`'s descriptor
+ --> tests/ui/impl_block_without_methods.rs:9:6
+  |
+9 | impl Point {
+  |      ^^^^^ unsatisfied trait bound
+  |
+help: the trait `haphe::__verify::HasScriptMethods` is not implemented for `Point`
+ --> tests/ui/impl_block_without_methods.rs:4:1
+  |
+4 | struct Point {
+  | ^^^^^^^^^^^^
+  = note: add `methods` to the `#[script(...)]` attribute on `Point`'s `#[derive(Script)]`
+note: required by a bound in `__c`
+ --> tests/ui/impl_block_without_methods.rs:9:6
+  |
+9 | impl Point {
+  |      ^^^^^ required by this bound in `__c`

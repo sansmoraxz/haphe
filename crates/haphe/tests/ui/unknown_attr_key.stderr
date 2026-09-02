@@ -1,0 +1,5 @@
+error: unknown `#[script]` attribute `readonyl` on a field (expected one of: rename, skip, readonly, bytes); did you mean `readonly`?
+ --> tests/ui/unknown_attr_key.rs:5:14
+  |
+5 |     #[script(readonyl)]
+  |              ^^^^^^^^

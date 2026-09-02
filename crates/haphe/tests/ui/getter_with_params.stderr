@@ -1,0 +1,5 @@
+error: getters cannot take parameters besides `&self`
+  --> tests/ui/getter_with_params.rs:11:14
+   |
+11 |     #[script(getter)]
+   |              ^^^^^^

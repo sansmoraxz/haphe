@@ -1,0 +1,23 @@
+error[E0277]: `NotDescribed` cannot be exposed to scripting runtimes
+ --> tests/ui/undescribable_field_type.rs:7:12
+  |
+7 |     inner: NotDescribed,
+  |            ^^^^^^^^^^^^ no `HapheType` descriptor for `NotDescribed`
+  |
+help: the trait `HapheType` is not implemented for `NotDescribed`
+ --> tests/ui/undescribable_field_type.rs:3:1
+  |
+3 | struct NotDescribed;
+  | ^^^^^^^^^^^^^^^^^^^
+  = note: if `NotDescribed` is your type, add `#[derive(Script)]` to it
+  = note: if `NotDescribed` is a third-party type, wrap it in a newtype and derive `Script` on that
+  = help: the following other types implement trait `HapheType`:
+            &T
+            &mut T
+            ()
+            (A, B, C, D, E, F, G, H, I, J, K, L)
+            (B, C, D, E, F, G, H, I, J, K, L)
+            (C, D, E, F, G, H, I, J, K, L)
+            (D, E, F, G, H, I, J, K, L)
+            (E, F, G, H, I, J, K, L)
+          and $N others

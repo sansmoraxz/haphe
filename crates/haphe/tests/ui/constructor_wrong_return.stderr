@@ -1,0 +1,8 @@
+error[E0308]: mismatched types
+  --> tests/ui/constructor_wrong_return.rs:12:24
+   |
+10 | impl Point {
+   |      ----- expected `Point` because of return type
+11 |     #[script(constructor)]
+12 |     fn make(n: i32) -> i32 {
+   |                        ^^^ expected `Point`, found `i32`

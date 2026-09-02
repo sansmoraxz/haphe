@@ -1,0 +1,5 @@
+error: `clone` on a `&mut` parameter would discard mutations; take `&T` or an owned value instead
+  --> tests/ui/clone_on_ref_mut.rs:11:34
+   |
+11 |     fn merge(&mut self, #[script(clone)] other: &mut Buffer) {
+   |                                  ^^^^^
