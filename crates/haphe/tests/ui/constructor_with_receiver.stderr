@@ -1,0 +1,5 @@
+error: constructors cannot take a `self` receiver
+  --> tests/ui/constructor_with_receiver.rs:11:14
+   |
+11 |     #[script(constructor)]
+   |              ^^^^^^^^^^^

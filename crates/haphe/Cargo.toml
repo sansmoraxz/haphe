@@ -7,3 +7,11 @@ license = "Apache-2.0"
 
 [dependencies]
 haphe-core = { path = "../haphe-core" }
+haphe-macros = { path = "../haphe-macros", optional = true }
+
+[features]
+default = ["macros"]
+macros = ["dep:haphe-macros"]
+
+[dev-dependencies]
+trybuild = "1"

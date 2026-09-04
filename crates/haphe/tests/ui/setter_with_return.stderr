@@ -1,0 +1,5 @@
+error: setters cannot return a value
+  --> tests/ui/setter_with_return.rs:16:14
+   |
+16 |     #[script(setter)]
+   |              ^^^^^^

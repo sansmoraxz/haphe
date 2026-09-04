@@ -1,0 +1,17 @@
+error: type aliases cannot have `methods`
+ --> tests/ui/alias_with_traits.rs:4:65
+  |
+4 | #[script(transparent, traits(Clone), thread_safety = send_sync, methods)]
+  |                                                                 ^^^^^^^
+
+error: type aliases cannot declare `traits(...)`
+ --> tests/ui/alias_with_traits.rs:4:30
+  |
+4 | #[script(transparent, traits(Clone), thread_safety = send_sync, methods)]
+  |                              ^^^^^
+
+error: type aliases cannot declare `thread_safety`
+ --> tests/ui/alias_with_traits.rs:4:54
+  |
+4 | #[script(transparent, traits(Clone), thread_safety = send_sync, methods)]
+  |                                                      ^^^^^^^^^

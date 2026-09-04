@@ -1,0 +1,5 @@
+error: `transparent` requires a struct with exactly one field (a newtype alias)
+ --> tests/ui/transparent_on_named_struct.rs:4:10
+  |
+4 | #[script(transparent)]
+  |          ^^^^^^^^^^^

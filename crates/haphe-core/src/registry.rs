@@ -20,6 +20,16 @@ pub enum RegistryError<'a> {
         owner: TypeId<'a>,
         param_name: &'a str,
     },
+    /// A module references a [`TypeId`] that is not registered — in a
+    /// function signature, a constant type, or
+    /// [`ModuleDescriptor::type_ids`](crate::ModuleDescriptor::type_ids).
+    DanglingModuleRef { module: &'a str, to: TypeId<'a> },
+    /// Two members of a type (fields, methods, constructors, or properties)
+    /// share an exposed name.
+    DuplicateMember { owner: TypeId<'a>, name: &'a str },
+    /// Two entries in a module (functions, constants, or submodules) share an
+    /// exposed name.
+    DuplicateModuleEntry { module: &'a str, name: &'a str },
 }
 
 impl std::fmt::Display for RegistryError<'_> {
@@ -33,6 +43,18 @@ impl std::fmt::Display for RegistryError<'_> {
                 write!(
                     f,
                     "type {owner} uses undeclared generic parameter `{param_name}`"
+                )
+            }
+            Self::DanglingModuleRef { module, to } => {
+                write!(f, "module `{module}` references unregistered type {to}")
+            }
+            Self::DuplicateMember { owner, name } => {
+                write!(f, "type {owner} exposes the name `{name}` more than once")
+            }
+            Self::DuplicateModuleEntry { module, name } => {
+                write!(
+                    f,
+                    "module `{module}` exposes the name `{name}` more than once"
                 )
             }
         }
@@ -138,29 +160,28 @@ impl<'a> TypeRegistry<'a> {
     /// and every [`TypeDescriptor::GenericParam`] names a declared parameter.
     pub fn validate(&'a self) -> Result<ValidatedRegistry<'a>, Vec<RegistryError<'a>>> {
         let mut errors = Vec::new();
-        let known: HashSet<TypeId<'a>> = self
+        let mut known: HashSet<TypeId<'a>> = HashSet::new();
+        for id in self
             .structs
             .iter()
             .map(|s| s.id)
             .chain(self.enums.iter().map(|e| e.id))
             .chain(self.type_aliases.iter().map(|a| a.id))
-            .collect();
+        {
+            if !known.insert(id) {
+                errors.push(RegistryError::DuplicateType { id });
+            }
+        }
 
         for s in self.structs {
-            let generic_names: HashSet<&str> =
-                s.generic_params.iter().map(|g| g.name).collect();
+            let generic_names: HashSet<&str> = s.generic_params.iter().map(|g| g.name).collect();
 
             for field in s.fields {
                 collect_dangling_refs(s.id, field.ty, &known, &mut errors);
                 collect_undeclared_generics(s.id, field.ty, &generic_names, &mut errors);
             }
             collect_dangling_refs_in_methods(s.id, s.methods, &known, &mut errors);
-            collect_undeclared_generics_in_methods(
-                s.id,
-                s.methods,
-                &generic_names,
-                &mut errors,
-            );
+            collect_undeclared_generics_in_methods(s.id, s.methods, &generic_names, &mut errors);
             collect_dangling_refs_in_methods(s.id, s.constructors, &known, &mut errors);
             collect_undeclared_generics_in_methods(
                 s.id,
@@ -178,11 +199,20 @@ impl<'a> TypeRegistry<'a> {
                     collect_dangling_refs(s.id, default, &known, &mut errors);
                 }
             }
+            collect_duplicate_members(
+                s.id,
+                s.fields
+                    .iter()
+                    .map(|f| f.name)
+                    .chain(s.methods.iter().map(|m| m.name))
+                    .chain(s.constructors.iter().map(|c| c.name))
+                    .chain(s.properties.iter().map(|p| p.name)),
+                &mut errors,
+            );
         }
 
         for e in self.enums {
-            let generic_names: HashSet<&str> =
-                e.generic_params.iter().map(|g| g.name).collect();
+            let generic_names: HashSet<&str> = e.generic_params.iter().map(|g| g.name).collect();
 
             for variant in e.variants {
                 match &variant.kind {
@@ -207,22 +237,36 @@ impl<'a> TypeRegistry<'a> {
                 }
             }
             collect_dangling_refs_in_methods(e.id, e.methods, &known, &mut errors);
-            collect_undeclared_generics_in_methods(
-                e.id,
-                e.methods,
-                &generic_names,
-                &mut errors,
-            );
+            collect_undeclared_generics_in_methods(e.id, e.methods, &generic_names, &mut errors);
             collect_dangling_refs_in_trait_impls(e.id, e.trait_impls, &known, &mut errors);
             for gp in e.generic_params {
                 if let Some(default) = gp.default {
                     collect_dangling_refs(e.id, default, &known, &mut errors);
                 }
             }
+            collect_duplicate_members(
+                e.id,
+                e.variants
+                    .iter()
+                    .map(|v| v.name)
+                    .chain(e.methods.iter().map(|m| m.name)),
+                &mut errors,
+            );
         }
 
         for alias in self.type_aliases {
             collect_dangling_refs(alias.id, alias.inner, &known, &mut errors);
+        }
+
+        let mut top_level_names = HashSet::new();
+        for module in self.modules {
+            if !top_level_names.insert(module.name) {
+                errors.push(RegistryError::DuplicateModuleEntry {
+                    module: module.name,
+                    name: module.name,
+                });
+            }
+            validate_module(module, &known, &mut errors);
         }
 
         if errors.is_empty() {
@@ -256,6 +300,73 @@ impl<'a> std::ops::Deref for ValidatedRegistry<'a> {
 
     fn deref(&self) -> &TypeRegistry<'a> {
         self.0
+    }
+}
+
+fn collect_duplicate_members<'a>(
+    owner: TypeId<'a>,
+    names: impl Iterator<Item = &'a str>,
+    errors: &mut Vec<RegistryError<'a>>,
+) {
+    let mut seen = HashSet::new();
+    for name in names {
+        if !seen.insert(name) {
+            errors.push(RegistryError::DuplicateMember { owner, name });
+        }
+    }
+}
+
+fn validate_module<'a>(
+    module: &'a ModuleDescriptor<'a>,
+    known: &HashSet<TypeId<'a>>,
+    errors: &mut Vec<RegistryError<'a>>,
+) {
+    let collect = |ty: &TypeDescriptor<'a>, errors: &mut Vec<RegistryError<'a>>| {
+        walk_type_refs(ty, &mut |ref_id| {
+            if !known.contains(ref_id) {
+                errors.push(RegistryError::DanglingModuleRef {
+                    module: module.name,
+                    to: *ref_id,
+                });
+            }
+        });
+    };
+    for function in module.functions {
+        for param in function.params {
+            collect(param.ty, errors);
+        }
+        collect(function.return_type, errors);
+    }
+    for constant in module.constants {
+        collect(constant.ty, errors);
+    }
+    for type_id in module.type_ids {
+        if !known.contains(type_id) {
+            errors.push(RegistryError::DanglingModuleRef {
+                module: module.name,
+                to: *type_id,
+            });
+        }
+    }
+
+    let mut seen = HashSet::new();
+    for name in module
+        .functions
+        .iter()
+        .map(|f| f.name)
+        .chain(module.constants.iter().map(|c| c.name))
+        .chain(module.submodules.iter().map(|m| m.name))
+    {
+        if !seen.insert(name) {
+            errors.push(RegistryError::DuplicateModuleEntry {
+                module: module.name,
+                name,
+            });
+        }
+    }
+
+    for submodule in module.submodules {
+        validate_module(submodule, known, errors);
     }
 }
 
@@ -457,10 +568,7 @@ impl<'a> TypeRegistryBuilder<'a> {
     ///
     /// Returns an error if a type (struct, enum, or alias) with the same id is
     /// already registered.
-    pub fn register_struct(
-        &mut self,
-        desc: StructDescriptor<'a>,
-    ) -> Result<(), RegistryError<'a>> {
+    pub fn register_struct(&mut self, desc: StructDescriptor<'a>) -> Result<(), RegistryError<'a>> {
         if self.has_type(&desc.id) {
             return Err(RegistryError::DuplicateType { id: desc.id });
         }
@@ -472,10 +580,7 @@ impl<'a> TypeRegistryBuilder<'a> {
     ///
     /// Returns an error if a type (struct, enum, or alias) with the same id is
     /// already registered.
-    pub fn register_enum(
-        &mut self,
-        desc: EnumDescriptor<'a>,
-    ) -> Result<(), RegistryError<'a>> {
+    pub fn register_enum(&mut self, desc: EnumDescriptor<'a>) -> Result<(), RegistryError<'a>> {
         if self.has_type(&desc.id) {
             return Err(RegistryError::DuplicateType { id: desc.id });
         }

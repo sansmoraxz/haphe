@@ -1,0 +1,13 @@
+error[E0277]: `Plain` has no struct descriptor
+ --> tests/ui/underived_type_in_registry.rs:7:19
+  |
+7 |         structs: [Plain],
+  |                   ^^^^^ unsatisfied trait bound
+  |
+help: the trait `ScriptStruct` is not implemented for `Plain`
+ --> tests/ui/underived_type_in_registry.rs:1:1
+  |
+1 | struct Plain {
+  | ^^^^^^^^^^^^
+  = note: structs listed in `registry!` under `structs:` need `#[derive(Script)]`
+  = note: if `Plain` is an enum, list it under `enums:` instead

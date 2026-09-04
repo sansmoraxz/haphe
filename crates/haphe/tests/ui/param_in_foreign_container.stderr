@@ -1,0 +1,5 @@
+error: generic parameters may only appear directly or inside built-in containers (`Option`, `Vec`, `Box`, slices, arrays, tuples, `HashMap`, `BTreeMap`, `Result`, references) in this position
+  --> tests/ui/param_in_foreign_container.rs:15:12
+   |
+15 |     items: collections::Vec<T>,
+   |            ^^^^^^^^^^^

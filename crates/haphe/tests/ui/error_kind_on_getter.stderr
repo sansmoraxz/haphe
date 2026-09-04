@@ -1,0 +1,5 @@
+error: properties cannot carry `error_kind`
+  --> tests/ui/error_kind_on_getter.rs:11:35
+   |
+11 |     #[script(getter, error_kind = "ValueError")]
+   |                                   ^^^^^^^^^^^^

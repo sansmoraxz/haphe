@@ -1,0 +1,19 @@
+error[E0277]: `Silent` doesn't implement `std::fmt::Display`
+ --> tests/ui/false_trait_declaration.rs:5:8
+  |
+5 | struct Silent {
+  |        ^^^^^^ unsatisfied trait bound
+  |
+help: the trait `std::fmt::Display` is not implemented for `Silent`
+ --> tests/ui/false_trait_declaration.rs:5:1
+  |
+5 | struct Silent {
+  | ^^^^^^^^^^^^^
+note: required by a bound in `__c`
+ --> tests/ui/false_trait_declaration.rs:3:10
+  |
+3 | #[derive(Script)]
+  |          ^^^^^^ required by this bound in `__c`
+4 | #[script(traits(Display))]
+  |                 ------- required by a bound in this function
+  = note: this error originates in the derive macro `Script` (in Nightly builds, run with -Z macro-backtrace for more info)

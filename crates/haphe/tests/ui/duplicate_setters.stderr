@@ -1,0 +1,5 @@
+error: duplicate setter for property `scale`
+  --> tests/ui/duplicate_setters.rs:21:14
+   |
+21 |     #[script(setter = "scale")]
+   |              ^^^^^^

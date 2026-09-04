@@ -1,0 +1,5 @@
+error[E0573]: expected type, found function `plain`
+ --> tests/ui/unannotated_fn_in_registry.rs:9:29
+  |
+9 |                 functions: [plain],
+  |                             ^^^^^ not a type

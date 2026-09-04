@@ -1,7 +1,7 @@
 use crate::types::TypeDescriptor;
 
 /// A Rust function or method exposed to scripting languages.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FunctionDescriptor<'a> {
     /// Function name.
     pub name: &'a str,
@@ -23,6 +23,18 @@ pub struct FunctionDescriptor<'a> {
     /// `PyValueError`, wasm → specific `Error` subclass, etc. `None` means
     /// use the backend's default error type.
     pub error_kind: Option<&'a str>,
+}
+
+/// Whether any function in the slice is `async`. Usable in `const` contexts.
+pub const fn any_async(fns: &[FunctionDescriptor<'_>]) -> bool {
+    let mut i = 0;
+    while i < fns.len() {
+        if fns[i].is_async {
+            return true;
+        }
+        i += 1;
+    }
+    false
 }
 
 /// How a method receives `self`.
@@ -56,7 +68,7 @@ pub enum Ownership {
 }
 
 /// A single function parameter.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ParamDescriptor<'a> {
     /// Parameter name.
     pub name: &'a str,

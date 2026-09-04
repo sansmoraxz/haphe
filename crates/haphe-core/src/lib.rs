@@ -15,23 +15,29 @@
 //! TypeRegistry → .validate() → ValidatedRegistry → binder.bind(&mut runtime)
 //! ```
 
+#[doc(hidden)]
+pub mod __verify;
 pub mod backend;
 pub mod function;
+pub mod haphe_type;
 pub mod module;
 pub mod registry;
+pub mod script;
 pub mod types;
 
 pub use backend::{
     BackendCapabilities, BindingGenerator, CompatibilityError, GeneratedFile, GeneratedOutput,
     RuntimeBinder,
 };
-pub use function::{FunctionDescriptor, Ownership, ParamDescriptor, Receiver};
+pub use function::{FunctionDescriptor, Ownership, ParamDescriptor, Receiver, any_async};
+pub use haphe_type::HapheType;
 pub use module::{ConstantDescriptor, ModuleDescriptor};
 pub use registry::{
     Describe, RegistryError, TypeKind, TypeRegistry, TypeRegistryBuilder, ValidatedRegistry,
 };
+pub use script::{ScriptAlias, ScriptEnum, ScriptFunction, ScriptImpl, ScriptStruct, ScriptType};
 pub use types::{
-    EnumDescriptor, EnumVariant, FieldDescriptor, GenericParam, PrimitiveType,
-    PropertyDescriptor, StructDescriptor, ThreadSafety, TraitImpl, TypeAliasDescriptor,
-    TypeDescriptor, TypeId, VariantKind,
+    EnumDescriptor, EnumVariant, FieldDescriptor, GenericParam, PrimitiveType, PropertyDescriptor,
+    StructDescriptor, ThreadSafety, TraitImpl, TypeAliasDescriptor, TypeDescriptor, TypeId,
+    VariantKind,
 };

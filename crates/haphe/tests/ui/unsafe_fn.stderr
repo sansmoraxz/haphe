@@ -1,0 +1,5 @@
+error: unsafe functions cannot be exposed to scripts
+ --> tests/ui/unsafe_fn.rs:4:1
+  |
+4 | unsafe fn poke(addr: usize) -> usize {
+  | ^^^^^^

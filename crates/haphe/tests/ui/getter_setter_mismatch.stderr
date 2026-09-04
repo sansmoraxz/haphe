@@ -1,0 +1,5 @@
+error[E0080]: evaluation panicked: property `scale`: the getter and setter describe different script types
+  --> tests/ui/getter_setter_mismatch.rs:17:36
+   |
+17 |     fn set_scale(&mut self, value: String) {
+   |                                    ^^^^^^ evaluation of `_` failed here

@@ -1,0 +1,5 @@
+error: setter for property `scale` has no matching `#[script(getter)]`
+  --> tests/ui/setter_without_getter.rs:11:14
+   |
+11 |     #[script(setter)]
+   |              ^^^^^^

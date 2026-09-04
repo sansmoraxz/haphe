@@ -1,0 +1,19 @@
+error[E0277]: `Cell<i32>` cannot be shared between threads safely
+ --> tests/ui/false_thread_safety.rs:7:8
+  |
+7 | struct Counter {
+  |        ^^^^^^^ `Cell<i32>` cannot be shared between threads safely
+  |
+  = help: within `Counter`, the trait `Sync` is not implemented for `Cell<i32>`
+  = note: if you want to do aliasing and mutation between multiple threads, use `std::sync::RwLock` or `std::sync::atomic::AtomicI32` instead
+note: required because it appears within the type `Counter`
+ --> tests/ui/false_thread_safety.rs:7:8
+  |
+7 | struct Counter {
+  |        ^^^^^^^
+  = note: required for `Counter` to implement `haphe::__verify::DeclaredSendSync`
+note: required by a bound in `__c`
+ --> tests/ui/false_thread_safety.rs:6:26
+  |
+6 | #[script(thread_safety = send_sync)]
+  |                          ^^^^^^^^^ required by this bound in `__c`

@@ -1,0 +1,5 @@
+error: tuple structs with multiple fields cannot derive `Script`; use named fields (single-field newtypes are exposed as type aliases)
+ --> tests/ui/tuple_struct.rs:4:8
+  |
+4 | struct Pair(f64, f64);
+  |        ^^^^

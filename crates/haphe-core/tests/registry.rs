@@ -1447,8 +1447,8 @@ fn capability_check_catches_insufficient_thread_safety() {
     let registry = TypeRegistry::new(&STRUCTS, &[], &[], &[]);
     let validated = registry.validate().unwrap();
 
-    let needs_send_sync = BackendCapabilities::ALL
-        .with_required_thread_safety(Some(ThreadSafety::SEND_SYNC));
+    let needs_send_sync =
+        BackendCapabilities::ALL.with_required_thread_safety(Some(ThreadSafety::SEND_SYNC));
     let errors = needs_send_sync.check(&validated).unwrap_err();
     assert_eq!(errors.len(), 1);
     assert!(matches!(
@@ -1476,7 +1476,6 @@ fn capability_check_thread_safety_passes_when_met() {
     let registry = TypeRegistry::new(&STRUCTS, &[], &[], &[]);
     let validated = registry.validate().unwrap();
 
-    let needs_send = BackendCapabilities::ALL
-        .with_required_thread_safety(Some(ThreadSafety::SEND));
+    let needs_send = BackendCapabilities::ALL.with_required_thread_safety(Some(ThreadSafety::SEND));
     assert!(needs_send.check(&validated).is_ok());
 }

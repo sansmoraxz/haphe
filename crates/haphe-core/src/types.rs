@@ -15,6 +15,26 @@ impl<'a> TypeId<'a> {
     pub const fn as_str(&self) -> &'a str {
         self.0
     }
+
+    /// Equality usable in `const` contexts.
+    pub const fn const_eq(&self, other: &TypeId<'_>) -> bool {
+        const_str_eq(self.0, other.0)
+    }
+}
+
+const fn const_str_eq(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut i = 0;
+    while i < a.len() {
+        if a[i] != b[i] {
+            return false;
+        }
+        i += 1;
+    }
+    true
 }
 
 impl std::fmt::Display for TypeId<'_> {
@@ -67,6 +87,53 @@ pub enum TypeDescriptor<'a> {
     /// Only valid inside a [`StructDescriptor`] or [`EnumDescriptor`] that
     /// declares a [`GenericParam`] with a matching name.
     GenericParam(&'a str),
+}
+
+impl TypeDescriptor<'_> {
+    /// Structural equality usable in `const` contexts.
+    ///
+    /// Mirrors the `PartialEq` implementation; two descriptors are equal when
+    /// they describe the same script-visible type.
+    pub const fn const_eq(&self, other: &TypeDescriptor<'_>) -> bool {
+        use TypeDescriptor as T;
+        match (self, other) {
+            (T::Primitive(a), T::Primitive(b)) => *a as u8 == *b as u8,
+            (T::String, T::String) | (T::Bytes, T::Bytes) | (T::Unit, T::Unit) => true,
+            (T::Option(a), T::Option(b)) | (T::List(a), T::List(b)) => a.const_eq(b),
+            (T::Array(a, n), T::Array(b, m)) => *n == *m && a.const_eq(b),
+            (T::Map(ka, va), T::Map(kb, vb)) | (T::Result(ka, va), T::Result(kb, vb)) => {
+                ka.const_eq(kb) && va.const_eq(vb)
+            }
+            (T::Tuple(a), T::Tuple(b)) => const_slice_eq(a, b),
+            (
+                T::Callback {
+                    params: pa,
+                    return_type: ra,
+                },
+                T::Callback {
+                    params: pb,
+                    return_type: rb,
+                },
+            ) => const_slice_eq(pa, pb) && ra.const_eq(rb),
+            (T::Ref(a), T::Ref(b)) => a.const_eq(b),
+            (T::GenericParam(a), T::GenericParam(b)) => const_str_eq(a, b),
+            _ => false,
+        }
+    }
+}
+
+const fn const_slice_eq(a: &[TypeDescriptor<'_>], b: &[TypeDescriptor<'_>]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut i = 0;
+    while i < a.len() {
+        if !a[i].const_eq(&b[i]) {
+            return false;
+        }
+        i += 1;
+    }
+    true
 }
 
 /// Rust primitive types.
@@ -187,7 +254,7 @@ impl ThreadSafety {
 /// Bounds are represented as string slices of trait names (e.g. `"Display"`,
 /// `"Clone"`). Backends match on well-known trait names to decide
 /// monomorphization or wrapper-generation strategies.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GenericParam<'a> {
     /// Parameter name, e.g. `"T"`, `"K"`, `"V"`.
     pub name: &'a str,
@@ -202,7 +269,7 @@ pub struct GenericParam<'a> {
 ///
 /// Backends generate accessor methods: pyo3 → `#[getter]`/`#[setter]`,
 /// rhai → `register_get`/`register_set`, mlua → index metamethods, etc.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PropertyDescriptor<'a> {
     /// Property name.
     pub name: &'a str,
@@ -215,7 +282,7 @@ pub struct PropertyDescriptor<'a> {
 }
 
 /// A Rust struct exposed to scripting languages.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StructDescriptor<'a> {
     /// Unique identifier used for cross-references via [`TypeDescriptor::Ref`].
     pub id: TypeId<'a>,
@@ -241,7 +308,7 @@ pub struct StructDescriptor<'a> {
 }
 
 /// A single field within a struct or struct-variant.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FieldDescriptor<'a> {
     /// Field name.
     pub name: &'a str,
@@ -254,7 +321,7 @@ pub struct FieldDescriptor<'a> {
 }
 
 /// A Rust enum exposed to scripting languages.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EnumDescriptor<'a> {
     /// Unique identifier used for cross-references via [`TypeDescriptor::Ref`].
     pub id: TypeId<'a>,
@@ -275,7 +342,7 @@ pub struct EnumDescriptor<'a> {
 }
 
 /// A single variant of an enum.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EnumVariant<'a> {
     /// Variant name.
     pub name: &'a str,
@@ -286,7 +353,7 @@ pub struct EnumVariant<'a> {
 }
 
 /// The data shape of an enum variant.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VariantKind<'a> {
     /// Unit variant, e.g. `Color::Red`.
     Unit,
@@ -302,7 +369,7 @@ pub enum VariantKind<'a> {
 /// (newtype). The [`transparent`](TypeAliasDescriptor::transparent) flag tells
 /// backends whether to expose the alias as the inner type (transparent) or
 /// preserve it as a distinct named type in the target language.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TypeAliasDescriptor<'a> {
     /// Unique identifier, usable via [`TypeDescriptor::Ref`].
     pub id: TypeId<'a>,

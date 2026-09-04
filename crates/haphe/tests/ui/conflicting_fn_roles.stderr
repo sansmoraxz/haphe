@@ -1,0 +1,5 @@
+error: `getter` conflicts with `constructor` — a function has one role
+  --> tests/ui/conflicting_fn_roles.rs:11:27
+   |
+11 |     #[script(constructor, getter)]
+   |                           ^^^^^^
