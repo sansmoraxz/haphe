@@ -1,0 +1,59 @@
+[package]
+name = "haphe-lua"
+version = "0.1.0"
+edition = "2024"
+description = "mlua backend for the haphe scripting-language binding generator"
+license = "Apache-2.0"
+
+[dependencies]
+haphe = { path = "../haphe", default-features = false }
+mlua = { version = "0.12" }
+
+[features]
+default = ["lua55"]
+
+# Lua runtime selection (pick one)
+lua55 = ["mlua/lua55"]
+lua54 = ["mlua/lua54"]
+lua53 = ["mlua/lua53"]
+lua52 = ["mlua/lua52"]
+lua51 = ["mlua/lua51"]
+luajit52 = ["mlua/luajit52"]
+luajit = ["mlua/luajit"]
+luau = ["mlua/luau"]
+
+# Optional Lua extensions
+luau-jit = ["mlua/luau-jit"]
+luau-vector4 = ["mlua/luau-vector4"]
+
+# Thread safety
+send = ["mlua/send"]
+error-send = ["mlua/error-send"]
+
+# Async support
+async = ["mlua/async"]
+
+# Serialization (serde integration for Lua values)
+serialize = ["mlua/serialize"]
+
+# mlua procedural macros (chunk!, #[lua_module], etc.)
+macros = ["mlua/macros"]
+
+# Build as a loadable Lua C module
+module = ["mlua/module"]
+
+# Bundle Lua source instead of linking a system library
+vendored = ["mlua/vendored"]
+
+# Error handling integration
+anyhow = ["mlua/anyhow"]
+
+# Extra wrapper types for UserData
+userdata-wrappers = ["mlua/userdata-wrappers"]
+
+[dev-dependencies]
+haphe = { path = "../haphe", features = ["macros"] }
+mlua = { version = "0.12", features = ["lua55"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync"] }
+serde = { version = "1", features = ["derive"] }
+anyhow = "1"
