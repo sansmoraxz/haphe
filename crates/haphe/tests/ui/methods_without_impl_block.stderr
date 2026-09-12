@@ -10,3 +10,21 @@ help: the trait `ScriptImpl` is not implemented for `Point`
 5 | struct Point {
   | ^^^^^^^^^^^^
   = note: add `#[script]` to an `impl Point` block, or remove `methods` from `#[script(...)]` on the type
+
+error[E0277]: the trait bound `Point: __BindMethods` is not satisfied
+ --> tests/ui/methods_without_impl_block.rs:5:8
+  |
+5 | struct Point {
+  |        ^^^^^ unsatisfied trait bound
+  |
+help: the trait `__BindMethods` is not implemented for `Point`
+ --> tests/ui/methods_without_impl_block.rs:5:1
+  |
+5 | struct Point {
+  | ^^^^^^^^^^^^
+help: this trait has no implementations, consider adding one
+ --> tests/ui/methods_without_impl_block.rs:3:10
+  |
+3 | #[derive(Script)]
+  |          ^^^^^^
+  = note: this error originates in the derive macro `Script` (in Nightly builds, run with -Z macro-backtrace for more info)

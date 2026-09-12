@@ -30,10 +30,7 @@ fn generic_param_names(input: &DeriveInput, errors: &mut Errors) -> Vec<String> 
     for param in &input.generics.params {
         match param {
             syn::GenericParam::Type(tp) => names.push(tp.ident.to_string()),
-            syn::GenericParam::Lifetime(lt) => errors.spanned(
-                lt.span(),
-                "types with lifetime parameters cannot derive `Script`",
-            ),
+            syn::GenericParam::Lifetime(_) => {}
             syn::GenericParam::Const(cp) => errors.spanned(
                 cp.span(),
                 "types with const generic parameters cannot derive `Script`",
@@ -352,13 +349,6 @@ fn expand_inner(input: DeriveInput) -> syn::Result<TokenStream> {
         self_ty: Some(&self_ty),
     };
 
-    if is_generic && let Some(span) = container.methods {
-        errors.spanned(
-            span,
-            "`#[script(methods)]` is not supported on generic types yet",
-        );
-    }
-
     let id_expr = quote! {
         ::haphe::TypeId::new(::core::concat!(::core::module_path!(), "::", #ident_str))
     };
@@ -418,26 +408,22 @@ fn expand_inner(input: DeriveInput) -> syn::Result<TokenStream> {
     // Methods handshake.
     let (methods, constructors, properties) = match container.methods {
         Some(span) => (
-            quote_spanned! {span=> <#ident as ::haphe::ScriptImpl>::METHODS },
-            quote_spanned! {span=> <#ident as ::haphe::ScriptImpl>::CONSTRUCTORS },
-            quote_spanned! {span=> <#ident as ::haphe::ScriptImpl>::PROPERTIES },
+            quote_spanned! {span=> <#self_ty as ::haphe::ScriptImpl>::METHODS },
+            quote_spanned! {span=> <#self_ty as ::haphe::ScriptImpl>::CONSTRUCTORS },
+            quote_spanned! {span=> <#self_ty as ::haphe::ScriptImpl>::PROPERTIES },
         ),
         None => (quote! { &[] }, quote! { &[] }, quote! { &[] }),
     };
     let mut handshake = TokenStream::new();
-    if let Some(span) = container.methods
-        && !is_generic
-    {
+    if let Some(span) = container.methods {
         handshake.extend(quote_spanned! {span=>
             #[automatically_derived]
-            impl ::haphe::__verify::HasScriptMethods for #ident {}
+            impl #impl_g ::haphe::__verify::HasScriptMethods for #ident #ty_g #where_c {}
         });
-        // Async runtimes may or may not be multithreaded: a type with async
-        // methods must make an explicit thread-safety claim.
         if container.thread_safety.is_none() {
             handshake.extend(quote_spanned! {span=>
                 const _: () = ::core::assert!(
-                    !<#ident as ::haphe::ScriptImpl>::HAS_ASYNC,
+                    !<#self_ty as ::haphe::ScriptImpl>::HAS_ASYNC,
                     "types with async methods must declare #[script(thread_safety = ...)] explicitly"
                 );
             });
@@ -527,11 +513,11 @@ fn expand_inner(input: DeriveInput) -> syn::Result<TokenStream> {
             let enum_asserts = container.methods.map(|span| {
                 quote_spanned! {span=>
                     const _: () = ::core::assert!(
-                        <#ident as ::haphe::ScriptImpl>::CONSTRUCTORS.is_empty(),
+                        <#self_ty as ::haphe::ScriptImpl>::CONSTRUCTORS.is_empty(),
                         "enums cannot declare #[script(constructor)] functions"
                     );
                     const _: () = ::core::assert!(
-                        <#ident as ::haphe::ScriptImpl>::PROPERTIES.is_empty(),
+                        <#self_ty as ::haphe::ScriptImpl>::PROPERTIES.is_empty(),
                         "enums cannot declare #[script(getter)]/#[script(setter)] properties"
                     );
                 }
@@ -563,6 +549,51 @@ fn expand_inner(input: DeriveInput) -> syn::Result<TokenStream> {
 
     errors.finish()?;
 
+    let bind_codegen = if let Data::Struct(data) = &input.data {
+        let bind_fields: Vec<crate::bind::BindField> = match &data.fields {
+            Fields::Named(named) => named
+                .named
+                .iter()
+                .filter_map(|f| {
+                    let args = parse_field_args(&f.attrs, &mut Errors::default());
+                    if args.skip.is_some() {
+                        return None;
+                    }
+                    let field_ident = f.ident.as_ref()?.clone();
+                    let name = args
+                        .rename
+                        .as_ref()
+                        .map(|r| r.value())
+                        .unwrap_or_else(|| field_ident.unraw().to_string());
+                    Some(crate::bind::BindField {
+                        ident: field_ident,
+                        name,
+                        ty: f.ty.clone(),
+                        readonly: args.readonly.is_some(),
+                    })
+                })
+                .collect(),
+            _ => Vec::new(),
+        };
+        crate::bind::gen_derive_bind(
+            ident,
+            &self_ty,
+            &bind_fields,
+            &container.traits,
+            container.methods.is_some(),
+            &input.generics,
+        )
+    } else {
+        crate::bind::gen_derive_bind(
+            ident,
+            &self_ty,
+            &[],
+            &container.traits,
+            container.methods.is_some(),
+            &input.generics,
+        )
+    };
+
     Ok(quote! {
         #[automatically_derived]
         impl #impl_g ::haphe::HapheType for #ident #ty_g #where_c {
@@ -576,6 +607,7 @@ fn expand_inner(input: DeriveInput) -> syn::Result<TokenStream> {
         #body
         #handshake
         #(#probes)*
+        #bind_codegen
     })
 }
 

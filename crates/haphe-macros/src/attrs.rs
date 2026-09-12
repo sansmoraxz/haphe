@@ -267,7 +267,15 @@ pub fn parse_container_args(attrs: &[Attribute], errors: &mut Errors) -> Contain
                             Ok(())
                         })?;
                     }
-                    if args.traits.iter().any(|t| t.name == name) {
+                    // Operator traits (Add, Sub, Mul, Div, Rem) may be
+                    // declared multiple times with different rhs types
+                    // (e.g. `Add, Add(rhs = f64)`). Marker traits must be
+                    // unique.
+                    let is_operator = matches!(
+                        name.to_string().as_str(),
+                        "Add" | "Sub" | "Mul" | "Div" | "Rem"
+                    );
+                    if !is_operator && args.traits.iter().any(|t| t.name == name) {
                         return Err(syn::Error::new(
                             name.span(),
                             format!("trait `{name}` is declared more than once"),

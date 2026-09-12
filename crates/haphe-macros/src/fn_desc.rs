@@ -86,14 +86,10 @@ pub fn build_fn_info(
 
     let mut fatal = false;
     for param in &sig.generics.params {
-        // Lifetimes are fine — descriptors erase them.
-        if matches!(
-            param,
-            syn::GenericParam::Type(_) | syn::GenericParam::Const(_)
-        ) {
+        if let syn::GenericParam::Const(cp) = param {
             errors.spanned(
-                param.span(),
-                "generic functions cannot be exposed to scripts",
+                cp.span(),
+                "const generic parameters cannot be exposed to scripts",
             );
             fatal = true;
         }

@@ -18,6 +18,7 @@
 #[doc(hidden)]
 pub mod __verify;
 pub mod backend;
+pub mod bridge;
 pub mod function;
 pub mod haphe_type;
 pub mod module;
@@ -28,6 +29,10 @@ pub mod types;
 pub use backend::{
     BackendCapabilities, BindingGenerator, CompatibilityError, GeneratedFile, GeneratedOutput,
     RuntimeBinder,
+};
+pub use bridge::{
+    BindTarget, FnBinder, FromScript, IntoScript, OpaqueUserData, ScriptBind, ScriptBindFn,
+    ScriptConvertError, ScriptValue, TypeBinder,
 };
 pub use function::{FunctionDescriptor, Ownership, ParamDescriptor, Receiver, any_async};
 pub use haphe_type::HapheType;
