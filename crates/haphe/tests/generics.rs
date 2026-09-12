@@ -3,11 +3,13 @@
 
 #![cfg(feature = "macros")]
 
-use haphe::{GenericParam, PrimitiveType, Script, ScriptStruct, TypeDescriptor};
+use haphe::{
+    GenericParam, PrimitiveType, Script, ScriptFunction, ScriptStruct, TypeDescriptor,
+};
 
 /// A labeled value.
 #[derive(Script)]
-pub struct Labeled<T: Clone, U = i32> {
+pub struct Labeled<T: Clone, U> {
     pub label: String,
     pub value: T,
     pub items: Vec<T>,
@@ -30,7 +32,7 @@ fn generic_params_recorded() {
             GenericParam {
                 name: "U",
                 bounds: &[],
-                default: Some(&TypeDescriptor::Primitive(PrimitiveType::I32)),
+                default: None,
             },
         ],
     );
@@ -113,6 +115,65 @@ pub struct Pair<T: Clone> {
 fn generic_claims_hold_for_valid_instantiations() {
     static DESC: haphe::StructDescriptor<'static> = <Pair<i32> as ScriptStruct>::DESCRIPTOR;
     assert_eq!(DESC.thread_safety, haphe::ThreadSafety::SEND_SYNC);
+}
+
+// ---------------------------------------------------------------------------
+// Lifetime parameters
+// ---------------------------------------------------------------------------
+
+#[derive(Script)]
+pub struct Borrowed<'a> {
+    pub name: &'a str,
+    pub age: i32,
+}
+
+#[test]
+fn lifetime_struct_descriptor() {
+    let desc = <Borrowed<'_> as ScriptStruct>::DESCRIPTOR;
+    // &'a str erases to &str → String descriptor
+    assert_eq!(*desc.fields[0].ty, TypeDescriptor::String);
+    assert_eq!(
+        *desc.fields[1].ty,
+        TypeDescriptor::Primitive(PrimitiveType::I32)
+    );
+    // Lifetimes are not generic *type* params
+    assert!(desc.generic_params.is_empty());
+}
+
+#[derive(Script)]
+pub struct Mixed<'a, T: Clone> {
+    pub label: &'a str,
+    pub value: T,
+}
+
+#[test]
+fn mixed_lifetime_and_type_param() {
+    let desc = <Mixed<'_, i32> as ScriptStruct>::DESCRIPTOR;
+    assert_eq!(*desc.fields[0].ty, TypeDescriptor::String);
+    assert_eq!(*desc.fields[1].ty, TypeDescriptor::GenericParam("T"));
+    assert_eq!(desc.generic_params.len(), 1);
+    assert_eq!(desc.generic_params[0].name, "T");
+}
+
+// ---------------------------------------------------------------------------
+// Lifetime parameters on free functions
+// ---------------------------------------------------------------------------
+
+#[haphe::script]
+fn first_word(s: &str) -> String {
+    s.split_whitespace()
+        .next()
+        .unwrap_or("")
+        .to_owned()
+}
+
+#[test]
+fn lifetime_free_fn_descriptor() {
+    let desc = <first_word as ScriptFunction>::DESCRIPTOR;
+    assert_eq!(desc.name, "first_word");
+    assert_eq!(desc.params.len(), 1);
+    assert_eq!(*desc.params[0].ty, TypeDescriptor::String);
+    assert_eq!(*desc.return_type, TypeDescriptor::String);
 }
 
 haphe::registry! {

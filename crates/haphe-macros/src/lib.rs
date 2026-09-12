@@ -2,6 +2,7 @@
 
 use proc_macro::TokenStream;
 
+mod bind;
 mod derive;
 mod freefn;
 mod imp;

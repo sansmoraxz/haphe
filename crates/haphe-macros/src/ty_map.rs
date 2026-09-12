@@ -190,12 +190,28 @@ fn generic_fold(ty: &Type, ctx: &TyCtx) -> syn::Result<TokenStream> {
                     let e = generic_fold(e, ctx)?;
                     Ok(quote! { ::haphe::TypeDescriptor::Result(&#t, &#e) })
                 }
-                _ => Err(syn::Error::new(
-                    ty.span(),
-                    "generic parameters may only appear directly or inside built-in containers \
-                     (`Option`, `Vec`, `Box`, slices, arrays, tuples, `HashMap`, `BTreeMap`, \
-                     `Result`, references) in this position",
-                )),
+                _ => {
+                    // Bare user-defined generic type (e.g. `Wrapper<T>` as
+                    // self-type in a constructor return): resolve via
+                    // ScriptType::ID. Namespaced paths (e.g. `mod::Vec<T>`)
+                    // are rejected — they can't be distinguished from std
+                    // containers syntactically.
+                    if ctx.self_ty.is_some() && p.path.segments.len() == 1 {
+                        let id = quote! {
+                            ::haphe::TypeDescriptor::Ref(
+                                <#ty as ::haphe::ScriptType>::ID
+                            )
+                        };
+                        Ok(id)
+                    } else {
+                        Err(syn::Error::new(
+                            ty.span(),
+                            "generic parameters may only appear directly or inside built-in containers \
+                             (`Option`, `Vec`, `Box`, slices, arrays, tuples, `HashMap`, `BTreeMap`, \
+                             `Result`, references) in this position",
+                        ))
+                    }
+                }
             }
         }
         Type::Reference(r) => generic_fold(&r.elem, ctx),

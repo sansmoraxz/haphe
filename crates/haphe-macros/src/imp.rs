@@ -66,12 +66,6 @@ pub fn expand(mut item: ItemImpl) -> TokenStream {
             "`#[script]` goes on inherent impl blocks, not trait impls",
         );
     }
-    if !item.generics.params.is_empty() {
-        errors.spanned(
-            item.generics.span(),
-            "`#[script]` on generic impl blocks is not supported yet",
-        );
-    }
     let self_ty = (*item.self_ty).clone();
     if !matches!(self_ty, Type::Path(_)) {
         errors.spanned(self_ty.span(), "`#[script]` requires a named self type");
@@ -83,8 +77,18 @@ pub fn expand(mut item: ItemImpl) -> TokenStream {
     }
     let mut errors = Errors::default();
 
+    let impl_generic_names: Vec<String> = item
+        .generics
+        .params
+        .iter()
+        .filter_map(|p| match p {
+            syn::GenericParam::Type(tp) => Some(tp.ident.to_string()),
+            _ => None,
+        })
+        .collect();
+    let has_type_params = !impl_generic_names.is_empty();
     let ctx = TyCtx {
-        generic_params: &[],
+        generic_params: &impl_generic_names,
         self_ty: Some(&self_ty),
     };
 
@@ -93,6 +97,10 @@ pub fn expand(mut item: ItemImpl) -> TokenStream {
     let mut getters: BTreeMap<String, Getter> = BTreeMap::new();
     let mut setters: BTreeMap<String, Setter> = BTreeMap::new();
     let mut probes = Vec::new();
+
+    // Bridge: collect method/constructor info for ScriptBind generation.
+    let mut bind_methods: Vec<crate::bind::BindMethod> = Vec::new();
+    let mut bind_constructors: Vec<crate::bind::BindMethod> = Vec::new();
 
     for impl_item in &mut item.items {
         let ImplItem::Fn(func) = impl_item else {
@@ -137,13 +145,28 @@ pub fn expand(mut item: ItemImpl) -> TokenStream {
                 continue;
             };
             let target = constructor_success_type(ret_ty);
-            probes.push(quote_spanned! {target.span()=>
-                const _: () = {
-                    fn __haphe_constructor_returns_self(value: #target) -> #self_ty {
-                        value
-                    }
-                };
+            if !has_type_params {
+                probes.push(quote_spanned! {target.span()=>
+                    const _: () = {
+                        fn __haphe_constructor_returns_self(value: #target) -> #self_ty {
+                            value
+                        }
+                    };
+                });
+            }
+            // Bridge: register non-async, non-cfg-gated, infallible constructors.
+            // Fallible constructors (-> Result<Self, E>) need error mapping
+            // which is deferred to a future iteration.
+            let is_fallible = info.return_ty.as_ref().is_some_and(|ty| {
+                if let Type::Path(p) = ty {
+                    p.path.segments.last().is_some_and(|s| s.ident == "Result")
+                } else {
+                    false
+                }
             });
+            if !info.is_async && cfgs.is_empty() && !is_fallible {
+                bind_constructors.push(extract_bind_method(func, &info));
+            }
             constructors.push(Entry {
                 cfgs,
                 descriptor: info.descriptor,
@@ -242,6 +265,15 @@ pub fn expand(mut item: ItemImpl) -> TokenStream {
                 );
             }
         } else {
+            // Bridge: register non-async, non-cfg-gated methods with
+            // bridge-compatible signatures. Generic impls bypass the
+            // compatibility check — bounds are enforced at monomorphization.
+            if !info.is_async
+                && cfgs.is_empty()
+                && (has_type_params || is_bind_compatible(func, &info))
+            {
+                bind_methods.push(extract_bind_method(func, &info));
+            }
             methods.push(Entry {
                 cfgs,
                 descriptor: info.descriptor,
@@ -290,29 +322,67 @@ pub fn expand(mut item: ItemImpl) -> TokenStream {
     }
     let _ = getters;
 
+    let (impl_g, _ty_g, where_c) = item.generics.split_for_impl();
+
     if let Err(err) = errors.finish() {
         let compile_error = err.to_compile_error();
-        // Best-effort `ScriptImpl` so the real mistake doesn't cascade into a
-        // "no `#[script] impl` block was found" error on the derive.
+        let bind_stub = if let Type::Path(p) = &self_ty
+            && let Some(seg) = p.path.segments.last()
+        {
+            let mod_ident = crate::bind::hidden_mod_ident(&seg.ident);
+            quote! {
+                #[automatically_derived]
+                impl #impl_g #mod_ident::__BindMethods for #self_ty #where_c {
+                    fn __bind_methods<__B: ::haphe::TypeBinder<Self>>(
+                        __b: &mut __B,
+                    ) -> ::core::result::Result<(), __B::Error> {
+                        ::core::result::Result::Ok(())
+                    }
+                }
+            }
+        } else {
+            TokenStream::new()
+        };
         return quote! {
             #item
             #compile_error
             #[automatically_derived]
-            impl ::haphe::ScriptImpl for #self_ty {
+            impl #impl_g ::haphe::ScriptImpl for #self_ty #where_c {
                 const METHODS: &'static [::haphe::FunctionDescriptor<'static>] = &[];
                 const CONSTRUCTORS: &'static [::haphe::FunctionDescriptor<'static>] = &[];
                 const PROPERTIES: &'static [::haphe::PropertyDescriptor<'static>] = &[];
                 const HAS_ASYNC: bool = false;
             }
+            #bind_stub
         };
     }
 
-    let reverse_probe = quote_spanned! {self_ty.span()=>
-        const _: () = {
-            const fn __c<T: ::haphe::__verify::HasScriptMethods + ?Sized>() {}
-            __c::<#self_ty>()
-        };
+    let reverse_probe = if item.generics.params.is_empty() {
+        quote_spanned! {self_ty.span()=>
+            const _: () = {
+                const fn __c<T: ::haphe::__verify::HasScriptMethods + ?Sized>() {}
+                __c::<#self_ty>()
+            };
+        }
+    } else {
+        TokenStream::new()
     };
+
+    // Bridge: emit `impl __BindMethods` with methods + constructors.
+    let bind_codegen = if let Type::Path(p) = &self_ty
+        && let Some(seg) = p.path.segments.last()
+    {
+        crate::bind::gen_impl_bind_methods(
+            &seg.ident,
+            &self_ty,
+            &bind_methods,
+            &bind_constructors,
+            &item.generics,
+        )
+    } else {
+        TokenStream::new()
+    };
+
     let methods = methods.iter().map(Entry::tokens);
     let constructors = constructors.iter().map(Entry::tokens);
 
@@ -320,17 +390,65 @@ pub fn expand(mut item: ItemImpl) -> TokenStream {
         #item
 
         #[automatically_derived]
-        impl ::haphe::ScriptImpl for #self_ty {
+        impl #impl_g ::haphe::ScriptImpl for #self_ty #where_c {
             const METHODS: &'static [::haphe::FunctionDescriptor<'static>] = &[#(#methods),*];
             const CONSTRUCTORS: &'static [::haphe::FunctionDescriptor<'static>] = &[#(#constructors),*];
             const PROPERTIES: &'static [::haphe::PropertyDescriptor<'static>] = &[#(#properties),*];
-            // Derived from the descriptor slices, so `#[cfg]`-gated methods
-            // count only when compiled in.
             const HAS_ASYNC: bool = ::haphe::any_async(Self::METHODS)
                 || ::haphe::any_async(Self::CONSTRUCTORS);
         }
         #reverse_probe
         #(#probes)*
+        #bind_codegen
+    }
+}
+
+/// Checks whether a method's param and return types are all bridge-compatible
+/// (primitives that implement IntoScript/FromScript).
+fn is_bind_compatible(func: &syn::ImplItemFn, info: &crate::fn_desc::FnInfo) -> bool {
+    use crate::bind::is_bridge_compatible_type;
+    for input in &func.sig.inputs {
+        if let syn::FnArg::Typed(pat_ty) = input
+            && !is_bridge_compatible_type(&pat_ty.ty)
+        {
+            return false;
+        }
+    }
+    if let Some(ret) = &info.return_ty
+        && !is_bridge_compatible_type(ret)
+    {
+        return false;
+    }
+    true
+}
+
+/// Extracts bind-relevant info from a processed function.
+fn extract_bind_method(
+    func: &syn::ImplItemFn,
+    info: &crate::fn_desc::FnInfo,
+) -> crate::bind::BindMethod {
+    let params: Vec<(syn::Ident, Type)> = func
+        .sig
+        .inputs
+        .iter()
+        .filter_map(|input| {
+            let syn::FnArg::Typed(pat_ty) = input else {
+                return None;
+            };
+            let syn::Pat::Ident(pi) = pat_ty.pat.as_ref() else {
+                return None;
+            };
+            Some((pi.ident.clone(), (*pat_ty.ty).clone()))
+        })
+        .collect();
+
+    crate::bind::BindMethod {
+        ident: func.sig.ident.clone(),
+        name: info.name.clone(),
+        receiver: info.receiver,
+        params,
+        has_return: info.return_ty.is_some(),
+        return_ty: info.return_ty.clone(),
     }
 }
 

@@ -17,3 +17,18 @@ note: required by a bound in `__c`
 4 | #[script(traits(Display))]
   |                 ------- required by a bound in this function
   = note: this error originates in the derive macro `Script` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0277]: `Silent` doesn't implement `std::fmt::Display`
+ --> tests/ui/false_trait_declaration.rs:3:10
+  |
+3 | #[derive(Script)]
+  |          ^^^^^^ `Silent` cannot be formatted with the default formatter
+  |
+help: the trait `std::fmt::Display` is not implemented for `Silent`
+ --> tests/ui/false_trait_declaration.rs:5:1
+  |
+5 | struct Silent {
+  | ^^^^^^^^^^^^^
+  = note: in format strings you may be able to use `{:?}` (or {:#?} for pretty-print) instead
+  = note: required for `&Silent` to implement `std::fmt::Display`
+  = note: this error originates in the macro `$crate::__export::format_args` which comes from the expansion of the derive macro `Script` (in Nightly builds, run with -Z macro-backtrace for more info)
