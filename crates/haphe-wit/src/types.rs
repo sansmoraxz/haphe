@@ -1,7 +1,7 @@
 use haphe::{Ownership, PrimitiveType, TypeDescriptor};
 
 use crate::WitGenError;
-use crate::model::Plan;
+use crate::model::{Env, Plan};
 
 /// Where a type appears; determines resource handle rendering and whether
 /// Unit is allowed.
@@ -17,18 +17,20 @@ pub(crate) fn render_return(
     ty: &TypeDescriptor<'_>,
     ownership: Ownership,
     plan: &Plan<'_>,
+    env: Option<&Env<'_, '_>>,
     context: &str,
 ) -> Result<Option<String>, WitGenError> {
     if matches!(ty, TypeDescriptor::Unit) {
         return Ok(None);
     }
-    render_type(ty, Pos::Return(ownership), plan, context).map(Some)
+    render_type(ty, Pos::Return(ownership), plan, env, context).map(Some)
 }
 
 pub(crate) fn render_type(
     ty: &TypeDescriptor<'_>,
     pos: Pos,
     plan: &Plan<'_>,
+    env: Option<&Env<'_, '_>>,
     context: &str,
 ) -> Result<String, WitGenError> {
     match ty {
@@ -37,16 +39,16 @@ pub(crate) fn render_type(
         TypeDescriptor::Bytes => Ok("list<u8>".to_string()),
         TypeDescriptor::Option(inner) => Ok(format!(
             "option<{}>",
-            render_type(inner, nested(pos), plan, context)?
+            render_type(inner, nested(pos), plan, env, context)?
         )),
         TypeDescriptor::List(inner) | TypeDescriptor::Array(inner, _) => Ok(format!(
             "list<{}>",
-            render_type(inner, nested(pos), plan, context)?
+            render_type(inner, nested(pos), plan, env, context)?
         )),
         TypeDescriptor::Map(k, v) => Ok(format!(
             "list<tuple<{}, {}>>",
-            render_type(k, nested(pos), plan, context)?,
-            render_type(v, nested(pos), plan, context)?
+            render_type(k, nested(pos), plan, env, context)?,
+            render_type(v, nested(pos), plan, env, context)?
         )),
         TypeDescriptor::Tuple(elems) => {
             if elems.is_empty() {
@@ -57,7 +59,7 @@ pub(crate) fn render_type(
             }
             let rendered: Vec<String> = elems
                 .iter()
-                .map(|e| render_type(e, nested(pos), plan, context))
+                .map(|e| render_type(e, nested(pos), plan, env, context))
                 .collect::<Result<_, _>>()?;
             Ok(format!("tuple<{}>", rendered.join(", ")))
         }
@@ -68,45 +70,103 @@ pub(crate) fn render_type(
                 (true, true) => "result".to_string(),
                 (true, false) => format!(
                     "result<_, {}>",
-                    render_type(err, nested(pos), plan, context)?
+                    render_type(err, nested(pos), plan, env, context)?
                 ),
                 (false, true) => {
-                    format!("result<{}>", render_type(ok, nested(pos), plan, context)?)
+                    format!(
+                        "result<{}>",
+                        render_type(ok, nested(pos), plan, env, context)?
+                    )
                 }
                 (false, false) => format!(
                     "result<{}, {}>",
-                    render_type(ok, nested(pos), plan, context)?,
-                    render_type(err, nested(pos), plan, context)?
+                    render_type(ok, nested(pos), plan, env, context)?,
+                    render_type(err, nested(pos), plan, env, context)?
                 ),
             })
         }
         TypeDescriptor::Ref(id) => {
+            if plan.is_generic(id.as_str()) {
+                // Only self-references inside the instance being emitted are
+                // meaningful for a bare (argument-less) generic ref.
+                return match env {
+                    Some(e) if e.self_id == id.as_str() => {
+                        render_named(e.self_name.to_string(), true, pos, id.as_str(), context)
+                    }
+                    _ => Err(WitGenError::UnrepresentableType {
+                        context: context.to_string(),
+                        detail: format!(
+                            "bare reference to generic type `{}` (missing type arguments)",
+                            id.as_str()
+                        ),
+                    }),
+                };
+            }
             let name = plan.type_name(id.as_str()).to_string();
-            if !plan.is_resource(id.as_str()) {
-                return Ok(name);
-            }
-            match pos {
-                Pos::Param(Ownership::Ref | Ownership::RefMut) => Ok(format!("borrow<{name}>")),
-                Pos::Param(_) | Pos::Field => Ok(name),
-                Pos::Return(Ownership::Owned | Ownership::Clone) => Ok(name),
-                Pos::Return(Ownership::Ref | Ownership::RefMut) => {
-                    Err(WitGenError::BorrowedResourceReturn {
-                        type_id: id.as_str().to_string(),
-                        function: context.to_string(),
-                    })
+            render_named(
+                name,
+                plan.is_resource(id.as_str()),
+                pos,
+                id.as_str(),
+                context,
+            )
+        }
+        TypeDescriptor::Instance { id, args } => {
+            let name = plan.instance_ref_name(id.as_str(), args, env)?;
+            render_named(
+                name,
+                plan.is_resource(id.as_str()),
+                pos,
+                id.as_str(),
+                context,
+            )
+        }
+        TypeDescriptor::GenericParam(name) => {
+            let bound = env.and_then(|e| e.lookup(name)).ok_or_else(|| {
+                WitGenError::UnrepresentableType {
+                    context: context.to_string(),
+                    detail: format!("unbound generic parameter `{name}`"),
                 }
-            }
+            })?;
+            // Instantiation args are concrete, so no further env applies.
+            render_type(bound, pos, plan, None, context)
         }
         TypeDescriptor::Unit => Err(WitGenError::UnrepresentableType {
             context: context.to_string(),
             detail: "unit type is only valid as a bare return type".to_string(),
         }),
-        // Callback, GenericParam, and future variants are rejected by the
-        // capability check before generation; this arm is defensive.
+        // Callback and future variants are rejected by the capability check
+        // before generation; this arm is defensive.
         _ => Err(WitGenError::UnrepresentableType {
             context: context.to_string(),
             detail: format!("unsupported type descriptor: {ty:?}"),
         }),
+    }
+}
+
+/// Position-dependent rendering of a named type: resources become handles
+/// (`borrow<t>` in by-ref params, owned in returns — borrowed returns are
+/// invalid WIT).
+fn render_named(
+    name: String,
+    is_resource: bool,
+    pos: Pos,
+    type_id: &str,
+    context: &str,
+) -> Result<String, WitGenError> {
+    if !is_resource {
+        return Ok(name);
+    }
+    match pos {
+        Pos::Param(Ownership::Ref | Ownership::RefMut) => Ok(format!("borrow<{name}>")),
+        Pos::Param(_) | Pos::Field => Ok(name),
+        Pos::Return(Ownership::Owned | Ownership::Clone) => Ok(name),
+        Pos::Return(Ownership::Ref | Ownership::RefMut) => {
+            Err(WitGenError::BorrowedResourceReturn {
+                type_id: type_id.to_string(),
+                function: context.to_string(),
+            })
+        }
     }
 }
 

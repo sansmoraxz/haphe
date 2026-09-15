@@ -1,0 +1,23 @@
+error[E0277]: `NotScriptable` cannot be exposed to scripting runtimes
+  --> tests/ui/registry_instance_arg_not_haphe_type.rs:15:27
+   |
+15 |         structs: [Labeled<NotScriptable>],
+   |                           ^^^^^^^^^^^^^ no `HapheType` descriptor for `NotScriptable`
+   |
+help: the trait `HapheType` is not implemented for `NotScriptable`
+  --> tests/ui/registry_instance_arg_not_haphe_type.rs:11:1
+   |
+11 | struct NotScriptable;
+   | ^^^^^^^^^^^^^^^^^^^^
+   = note: if `NotScriptable` is your type, add `#[derive(Script)]` to it
+   = note: if `NotScriptable` is a third-party type, wrap it in a newtype and derive `Script` on that
+   = help: the following other types implement trait `HapheType`:
+             &T
+             &mut T
+             ()
+             (A, B, C, D, E, F, G, H, I, J, K, L)
+             (B, C, D, E, F, G, H, I, J, K, L)
+             (C, D, E, F, G, H, I, J, K, L)
+             (D, E, F, G, H, I, J, K, L)
+             (E, F, G, H, I, J, K, L)
+           and $N others

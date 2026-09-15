@@ -45,7 +45,7 @@ const fn module_fn(
 #[test]
 fn duplicate_type_ids_fail_validation() {
     static STRUCTS: [StructDescriptor<'static>; 2] = [plain_struct("Point"), plain_struct("Point")];
-    static REGISTRY: TypeRegistry<'static> = TypeRegistry::new(&STRUCTS, &[], &[], &[]);
+    static REGISTRY: TypeRegistry<'static> = TypeRegistry::new(&STRUCTS, &[], &[], &[], &[]);
     let errors = REGISTRY.validate().unwrap_err();
     assert!(
         errors
@@ -66,7 +66,7 @@ fn dangling_ref_in_module_fn_fails_validation() {
         submodules: &[],
         constants: &[],
     }];
-    static REGISTRY: TypeRegistry<'static> = TypeRegistry::new(&[], &[], &[], &MODULES);
+    static REGISTRY: TypeRegistry<'static> = TypeRegistry::new(&[], &[], &[], &MODULES, &[]);
     let errors = REGISTRY.validate().unwrap_err();
     assert!(
         errors
@@ -94,7 +94,7 @@ fn dangling_type_id_in_nested_module_fails_validation() {
         submodules: &INNER,
         constants: &[],
     }];
-    static REGISTRY: TypeRegistry<'static> = TypeRegistry::new(&[], &[], &[], &MODULES);
+    static REGISTRY: TypeRegistry<'static> = TypeRegistry::new(&[], &[], &[], &MODULES, &[]);
     let errors = REGISTRY.validate().unwrap_err();
     assert!(
         errors.iter().any(|e| matches!(
@@ -122,7 +122,7 @@ fn duplicate_member_names_fail_validation() {
         methods: &METHODS,
         ..plain_struct("Point")
     }];
-    static REGISTRY: TypeRegistry<'static> = TypeRegistry::new(&STRUCTS, &[], &[], &[]);
+    static REGISTRY: TypeRegistry<'static> = TypeRegistry::new(&STRUCTS, &[], &[], &[], &[]);
     let errors = REGISTRY.validate().unwrap_err();
     assert!(
         errors
@@ -149,7 +149,7 @@ fn duplicate_module_entries_fail_validation() {
         submodules: &[],
         constants: &CONSTANTS,
     }];
-    static REGISTRY: TypeRegistry<'static> = TypeRegistry::new(&[], &[], &[], &MODULES);
+    static REGISTRY: TypeRegistry<'static> = TypeRegistry::new(&[], &[], &[], &MODULES, &[]);
     let errors = REGISTRY.validate().unwrap_err();
     assert!(
         errors.iter().any(|e| matches!(
@@ -174,7 +174,7 @@ fn capability_check_covers_module_fns() {
         submodules: &[],
         constants: &[],
     }];
-    static REGISTRY: TypeRegistry<'static> = TypeRegistry::new(&[], &[], &[], &MODULES);
+    static REGISTRY: TypeRegistry<'static> = TypeRegistry::new(&[], &[], &[], &MODULES, &[]);
     let validated = REGISTRY.validate().unwrap();
     let errors = BackendCapabilities::ALL
         .with_async_fns(false)
@@ -200,7 +200,7 @@ fn capability_check_covers_property_callbacks() {
         properties: &PROPS,
         ..plain_struct("Hooked")
     }];
-    static REGISTRY: TypeRegistry<'static> = TypeRegistry::new(&STRUCTS, &[], &[], &[]);
+    static REGISTRY: TypeRegistry<'static> = TypeRegistry::new(&STRUCTS, &[], &[], &[], &[]);
     let validated = REGISTRY.validate().unwrap();
     let errors = BackendCapabilities::ALL
         .with_callbacks(false)

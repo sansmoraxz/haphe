@@ -44,7 +44,7 @@ fn i128_is_unrepresentable() {
         fields: &FIELDS,
         ..plain_struct("test::Big", "Big")
     }];
-    static REGISTRY: TypeRegistry = TypeRegistry::new(&STRUCTS, &[], &[], &[]);
+    static REGISTRY: TypeRegistry = TypeRegistry::new(&STRUCTS, &[], &[], &[], &[]);
 
     let err = generate_err(&REGISTRY);
     assert!(
@@ -70,7 +70,7 @@ fn borrowed_resource_return_rejected() {
         methods: &METHODS,
         ..plain_struct("test::Point", "Point")
     }];
-    static REGISTRY: TypeRegistry = TypeRegistry::new(&STRUCTS, &[], &[], &[]);
+    static REGISTRY: TypeRegistry = TypeRegistry::new(&STRUCTS, &[], &[], &[], &[]);
 
     let err = generate_err(&REGISTRY);
     assert!(
@@ -85,7 +85,7 @@ fn kebab_collision_rejected() {
         plain_struct("test::MyType", "MyType"),
         plain_struct("test::my_type", "my_type"),
     ];
-    static REGISTRY: TypeRegistry = TypeRegistry::new(&STRUCTS, &[], &[], &[]);
+    static REGISTRY: TypeRegistry = TypeRegistry::new(&STRUCTS, &[], &[], &[], &[]);
 
     let err = generate_err(&REGISTRY);
     assert!(
@@ -107,7 +107,7 @@ fn empty_tuple_rejected() {
         fields: &FIELDS,
         ..plain_struct("test::Weird", "Weird")
     }];
-    static REGISTRY: TypeRegistry = TypeRegistry::new(&STRUCTS, &[], &[], &[]);
+    static REGISTRY: TypeRegistry = TypeRegistry::new(&STRUCTS, &[], &[], &[], &[]);
 
     let err = generate_err(&REGISTRY);
     assert!(
@@ -132,7 +132,7 @@ fn callback_rejected_by_capabilities() {
         fields: &FIELDS,
         ..plain_struct("test::Widget", "Widget")
     }];
-    static REGISTRY: TypeRegistry = TypeRegistry::new(&STRUCTS, &[], &[], &[]);
+    static REGISTRY: TypeRegistry = TypeRegistry::new(&STRUCTS, &[], &[], &[], &[]);
 
     match haphe::generate(&WitGenerator::new("haphe:demo"), &REGISTRY) {
         Err(GenerateError::Incompatible(_)) => {}
@@ -168,7 +168,7 @@ fn async_constructor_becomes_static_func() {
         constructors: &CTORS,
         ..plain_struct("test::Client", "Client")
     }];
-    static REGISTRY: TypeRegistry = TypeRegistry::new(&STRUCTS, &[], &[], &[]);
+    static REGISTRY: TypeRegistry = TypeRegistry::new(&STRUCTS, &[], &[], &[], &[]);
 
     let output = haphe::generate(&WitGenerator::new("haphe:demo"), &REGISTRY).unwrap();
     let wit = String::from_utf8(output.files[0].content.clone()).unwrap();
@@ -193,7 +193,7 @@ fn empty_enum_rejected() {
         thread_safety: ThreadSafety::SEND_SYNC,
         generic_params: &[],
     }];
-    static REGISTRY: TypeRegistry = TypeRegistry::new(&[], &ENUMS, &[], &[]);
+    static REGISTRY: TypeRegistry = TypeRegistry::new(&[], &ENUMS, &[], &[], &[]);
 
     let err = generate_err(&REGISTRY);
     assert!(
@@ -216,7 +216,7 @@ fn recursive_record_rejected() {
         fields: &FIELDS,
         ..plain_struct("test::Node", "Node")
     }];
-    static REGISTRY: TypeRegistry = TypeRegistry::new(&STRUCTS, &[], &[], &[]);
+    static REGISTRY: TypeRegistry = TypeRegistry::new(&STRUCTS, &[], &[], &[], &[]);
 
     let err = generate_err(&REGISTRY);
     assert!(
@@ -252,7 +252,7 @@ fn mutually_recursive_records_rejected() {
             ..plain_struct("test::B", "B")
         },
     ];
-    static REGISTRY: TypeRegistry = TypeRegistry::new(&STRUCTS, &[], &[], &[]);
+    static REGISTRY: TypeRegistry = TypeRegistry::new(&STRUCTS, &[], &[], &[], &[]);
 
     let err = generate_err(&REGISTRY);
     assert!(
@@ -313,11 +313,144 @@ fn cyclic_interface_use_rejected() {
             constants: &[],
         },
     ];
-    static REGISTRY: TypeRegistry = TypeRegistry::new(&STRUCTS, &[], &[], &MODULES);
+    static REGISTRY: TypeRegistry = TypeRegistry::new(&STRUCTS, &[], &[], &MODULES, &[]);
 
     let err = generate_err(&REGISTRY);
     assert!(
         matches!(err, WitGenError::InvalidWit { .. }),
         "got: {err:?}"
     );
+}
+
+const fn generic_struct(
+    id: &'static str,
+    name: &'static str,
+    fields: &'static [FieldDescriptor<'static>],
+) -> StructDescriptor<'static> {
+    StructDescriptor {
+        fields,
+        generic_params: &[haphe::GenericParam {
+            name: "T",
+            bounds: &[],
+            default: None,
+        }],
+        ..plain_struct(id, name)
+    }
+}
+
+static T_PARAM: TypeDescriptor = TypeDescriptor::GenericParam("T");
+static GENERIC_FIELDS: [FieldDescriptor; 1] = [FieldDescriptor {
+    name: "value",
+    doc: None,
+    ty: &T_PARAM,
+    readonly: false,
+}];
+
+#[test]
+fn uninstantiated_generic_rejected() {
+    static STRUCTS: [StructDescriptor; 1] =
+        [generic_struct("test::Holder", "Holder", &GENERIC_FIELDS)];
+    static REGISTRY: TypeRegistry = TypeRegistry::new(&STRUCTS, &[], &[], &[], &[]);
+
+    match haphe::generate(&WitGenerator::new("haphe:demo"), &REGISTRY) {
+        Err(GenerateError::Incompatible(errors)) => {
+            assert!(
+                errors
+                    .iter()
+                    .any(|e| matches!(e, haphe::CompatibilityError::UninstantiatedGeneric { .. })),
+                "got: {errors:?}"
+            );
+        }
+        other => panic!("expected Incompatible, got: {other:?}"),
+    }
+}
+
+#[test]
+fn unregistered_instantiation_rejected() {
+    // `User` references Holder<f64>, but only Holder<bool> is registered.
+    static F64_ARGS: [TypeDescriptor; 1] = [F64];
+    static BOOL_ARGS: [TypeDescriptor; 1] = [TypeDescriptor::Primitive(PrimitiveType::Bool)];
+    static HOLDER_F64: TypeDescriptor = TypeDescriptor::Instance {
+        id: TypeId::new("test::Holder"),
+        args: &F64_ARGS,
+    };
+    static USER_FIELDS: [FieldDescriptor; 1] = [FieldDescriptor {
+        name: "holder",
+        doc: None,
+        ty: &HOLDER_F64,
+        readonly: false,
+    }];
+    static STRUCTS: [StructDescriptor; 2] = [
+        generic_struct("test::Holder", "Holder", &GENERIC_FIELDS),
+        StructDescriptor {
+            fields: &USER_FIELDS,
+            ..plain_struct("test::User", "User")
+        },
+    ];
+    static INSTANTIATIONS: [haphe::InstantiationDescriptor; 1] = [haphe::InstantiationDescriptor {
+        id: TypeId::new("test::Holder"),
+        args: &BOOL_ARGS,
+    }];
+    static REGISTRY: TypeRegistry = TypeRegistry::new(&STRUCTS, &[], &[], &[], &INSTANTIATIONS);
+
+    let err = generate_err(&REGISTRY);
+    assert!(
+        matches!(err, WitGenError::UnregisteredInstantiation { ref name } if name == "holder-f64"),
+        "got: {err:?}"
+    );
+}
+
+#[test]
+fn mangled_name_collision_rejected() {
+    // `Holder<bool>` mangles to `holder-bool`, colliding with the concrete
+    // struct `HolderBool`.
+    static BOOL_ARGS: [TypeDescriptor; 1] = [TypeDescriptor::Primitive(PrimitiveType::Bool)];
+    static CONCRETE_FIELDS: [FieldDescriptor; 1] = [FieldDescriptor {
+        name: "flag",
+        doc: None,
+        ty: &TypeDescriptor::Primitive(PrimitiveType::Bool),
+        readonly: false,
+    }];
+    static STRUCTS: [StructDescriptor; 2] = [
+        generic_struct("test::Holder", "Holder", &GENERIC_FIELDS),
+        StructDescriptor {
+            fields: &CONCRETE_FIELDS,
+            ..plain_struct("test::HolderBool", "HolderBool")
+        },
+    ];
+    static INSTANTIATIONS: [haphe::InstantiationDescriptor; 1] = [haphe::InstantiationDescriptor {
+        id: TypeId::new("test::Holder"),
+        args: &BOOL_ARGS,
+    }];
+    static REGISTRY: TypeRegistry = TypeRegistry::new(&STRUCTS, &[], &[], &[], &INSTANTIATIONS);
+
+    let err = generate_err(&REGISTRY);
+    assert!(
+        matches!(err, WitGenError::NameCollision { .. }),
+        "got: {err:?}"
+    );
+}
+
+#[test]
+fn instantiation_arity_mismatch_rejected_at_validation() {
+    static TWO_ARGS: [TypeDescriptor; 2] = [F64, F64];
+    static STRUCTS: [StructDescriptor; 1] =
+        [generic_struct("test::Holder", "Holder", &GENERIC_FIELDS)];
+    static INSTANTIATIONS: [haphe::InstantiationDescriptor; 1] = [haphe::InstantiationDescriptor {
+        id: TypeId::new("test::Holder"),
+        args: &TWO_ARGS,
+    }];
+    static REGISTRY: TypeRegistry = TypeRegistry::new(&STRUCTS, &[], &[], &[], &INSTANTIATIONS);
+
+    match haphe::generate(&WitGenerator::new("haphe:demo"), &REGISTRY) {
+        Err(GenerateError::Invalid(errors)) => {
+            assert!(
+                errors
+                    .iter()
+                    .any(|e| matches!(e, haphe::RegistryError::InstantiationArityMismatch { .. })),
+                "got: {errors:?}"
+            );
+        }
+        other => panic!("expected Invalid, got: {other:?}"),
+    }
 }

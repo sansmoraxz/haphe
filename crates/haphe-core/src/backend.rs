@@ -150,8 +150,12 @@ impl BackendCapabilities {
                     }
                 }
             }
-            if !self.generics && !s.generic_params.is_empty() {
-                errors.push(CompatibilityError::UnsupportedGenerics { type_id: s.id });
+            if !s.generic_params.is_empty() {
+                if !self.generics {
+                    errors.push(CompatibilityError::UnsupportedGenerics { type_id: s.id });
+                } else if !registry.instantiations().iter().any(|i| i.id == s.id) {
+                    errors.push(CompatibilityError::UninstantiatedGeneric { type_id: s.id });
+                }
             }
             if !self.properties && !s.properties.is_empty() {
                 errors.push(CompatibilityError::UnsupportedProperties { type_id: s.id });
@@ -172,8 +176,12 @@ impl BackendCapabilities {
             if !self.callbacks {
                 check_fns_callbacks(e.id, e.methods, &mut errors);
             }
-            if !self.generics && !e.generic_params.is_empty() {
-                errors.push(CompatibilityError::UnsupportedGenerics { type_id: e.id });
+            if !e.generic_params.is_empty() {
+                if !self.generics {
+                    errors.push(CompatibilityError::UnsupportedGenerics { type_id: e.id });
+                } else if !registry.instantiations().iter().any(|i| i.id == e.id) {
+                    errors.push(CompatibilityError::UninstantiatedGeneric { type_id: e.id });
+                }
             }
             if let Some(required) = self.required_thread_safety
                 && !meets_thread_safety(&e.thread_safety, &required)
@@ -294,6 +302,7 @@ fn contains_callback(ty: &TypeDescriptor<'_>) -> bool {
             contains_callback(k) || contains_callback(v)
         }
         TypeDescriptor::Tuple(elems) => elems.iter().any(contains_callback),
+        TypeDescriptor::Instance { args, .. } => args.iter().any(contains_callback),
         TypeDescriptor::Primitive(_)
         | TypeDescriptor::String
         | TypeDescriptor::Bytes
@@ -323,6 +332,9 @@ pub enum CompatibilityError<'a> {
     },
     /// A generic type in a backend that doesn't support generics.
     UnsupportedGenerics { type_id: TypeId<'a> },
+    /// A generic type with no recorded instantiation, in a backend that
+    /// supports generics via monomorphization — there is nothing to emit.
+    UninstantiatedGeneric { type_id: TypeId<'a> },
     /// A computed property in a backend that doesn't support properties.
     UnsupportedProperties { type_id: TypeId<'a> },
     /// A type alias in a backend that doesn't support type aliases.
@@ -359,6 +371,12 @@ impl std::fmt::Display for CompatibilityError<'_> {
                 write!(
                     f,
                     "type {type_id}: generic type parameters are not supported by this backend"
+                )
+            }
+            Self::UninstantiatedGeneric { type_id } => {
+                write!(
+                    f,
+                    "generic type {type_id} has no recorded instantiation; nothing to emit"
                 )
             }
             Self::UnsupportedProperties { type_id } => {

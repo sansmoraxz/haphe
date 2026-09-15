@@ -594,12 +594,47 @@ fn expand_inner(input: DeriveInput) -> syn::Result<TokenStream> {
         )
     };
 
-    Ok(quote! {
-        #[automatically_derived]
-        impl #impl_g ::haphe::HapheType for #ident #ty_g #where_c {
-            const DESCRIPTOR: ::haphe::TypeDescriptor<'static> =
-                ::haphe::TypeDescriptor::Ref(<Self as ::haphe::ScriptType>::ID);
+    // For generic types, `HapheType` references carry the concrete type
+    // arguments so backends can monomorphize; the erased descriptor itself is
+    // unchanged. Requires each type param to be `HapheType` (fresh clone of
+    // the input generics — `desc_generics` carries claim predicates that
+    // would over-constrain field-position uses).
+    let haphe_type_impl = if is_generic {
+        let mut ht_generics = input.generics.clone();
+        let param_idents: Vec<_> = input
+            .generics
+            .type_params()
+            .map(|p| p.ident.clone())
+            .collect();
+        for param in &param_idents {
+            ht_generics
+                .make_where_clause()
+                .predicates
+                .push(syn::parse_quote! { #param: ::haphe::HapheType });
         }
+        let (ht_impl_g, ht_ty_g, ht_where_c) = ht_generics.split_for_impl();
+        quote! {
+            #[automatically_derived]
+            impl #ht_impl_g ::haphe::HapheType for #ident #ht_ty_g #ht_where_c {
+                const DESCRIPTOR: ::haphe::TypeDescriptor<'static> =
+                    ::haphe::TypeDescriptor::Instance {
+                        id: <Self as ::haphe::ScriptType>::ID,
+                        args: &[#( <#param_idents as ::haphe::HapheType>::DESCRIPTOR ),*],
+                    };
+            }
+        }
+    } else {
+        quote! {
+            #[automatically_derived]
+            impl #impl_g ::haphe::HapheType for #ident #ty_g #where_c {
+                const DESCRIPTOR: ::haphe::TypeDescriptor<'static> =
+                    ::haphe::TypeDescriptor::Ref(<Self as ::haphe::ScriptType>::ID);
+            }
+        }
+    };
+
+    Ok(quote! {
+        #haphe_type_impl
         #[automatically_derived]
         impl #impl_g ::haphe::ScriptType for #ident #ty_g #where_c {
             const ID: ::haphe::TypeId<'static> = #id_expr;

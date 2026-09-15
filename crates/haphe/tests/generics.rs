@@ -3,9 +3,7 @@
 
 #![cfg(feature = "macros")]
 
-use haphe::{
-    GenericParam, PrimitiveType, Script, ScriptFunction, ScriptStruct, TypeDescriptor,
-};
+use haphe::{GenericParam, PrimitiveType, Script, ScriptFunction, ScriptStruct, TypeDescriptor};
 
 /// A labeled value.
 #[derive(Script)]
@@ -161,10 +159,7 @@ fn mixed_lifetime_and_type_param() {
 
 #[haphe::script]
 fn first_word(s: &str) -> String {
-    s.split_whitespace()
-        .next()
-        .unwrap_or("")
-        .to_owned()
+    s.split_whitespace().next().unwrap_or("").to_owned()
 }
 
 #[test]
@@ -188,4 +183,56 @@ haphe::registry! {
 fn generic_types_in_registry() {
     let validated = GENERIC_REGISTRY.validate().unwrap();
     assert_eq!(validated.structs()[0].generic_params.len(), 2);
+}
+
+/// `HapheType` references to a generic type carry the concrete arguments so
+/// monomorphizing backends can substitute them.
+#[test]
+fn haphe_type_reference_records_instance_args() {
+    use haphe::HapheType;
+    let desc = <Labeled<String, i32> as HapheType>::DESCRIPTOR;
+    match desc {
+        TypeDescriptor::Instance { id, args } => {
+            assert_eq!(id, <Labeled<String, i32> as haphe::ScriptType>::ID);
+            assert_eq!(
+                args,
+                &[
+                    TypeDescriptor::String,
+                    TypeDescriptor::Primitive(PrimitiveType::I32)
+                ]
+            );
+        }
+        other => panic!("expected Instance, got: {other:?}"),
+    }
+}
+
+// `registry!` records one instantiation per generic entry and dedupes the
+// erased descriptor.
+haphe::registry! {
+    pub static MULTI_INSTANCE_REGISTRY = {
+        structs: [Labeled<String, i32>, Labeled<bool, u8>],
+    };
+}
+
+#[test]
+fn registry_records_instantiations_and_dedupes_erased_descriptor() {
+    let validated = MULTI_INSTANCE_REGISTRY.validate().unwrap();
+    assert_eq!(validated.structs().len(), 1, "erased descriptor deduped");
+    let insts = validated.instantiations();
+    assert_eq!(insts.len(), 2);
+    assert_eq!(insts[0].id, validated.structs()[0].id);
+    assert_eq!(
+        insts[0].args,
+        &[
+            TypeDescriptor::String,
+            TypeDescriptor::Primitive(PrimitiveType::I32)
+        ]
+    );
+    assert_eq!(
+        insts[1].args,
+        &[
+            TypeDescriptor::Primitive(PrimitiveType::Bool),
+            TypeDescriptor::Primitive(PrimitiveType::U8)
+        ]
+    );
 }

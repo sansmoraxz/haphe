@@ -104,6 +104,7 @@ impl<T: 'static> RuntimeBinder for WasmBinder<T> {
 
         for iface in &plan.interfaces {
             let empty = iface.type_ids.is_empty()
+                && iface.instance_indices.is_empty()
                 && iface.functions.is_empty()
                 && (iface.constants.is_empty() || self.config.constants == ConstantMode::Skip);
             if empty {
@@ -119,11 +120,23 @@ impl<T: 'static> RuntimeBinder for WasmBinder<T> {
             for id in &iface.type_ids {
                 match registry.get_type(&haphe::TypeId::new(id)).unwrap() {
                     TypeKind::Struct(s) if plan.is_resource(id) => {
-                        bind_resource(&mut inst, s, &plan)?;
+                        bind_resource(&mut inst, s, plan.type_name(id))?;
                     }
                     // Records, enums, variants, and aliases are type-only in
                     // WIT: nothing to define in a linker.
                     _ => {}
+                }
+            }
+
+            // Monomorphized generic instantiations, same mangled names the
+            // generator emits.
+            for &i in &iface.instance_indices {
+                let planned = &plan.instances[i];
+                if let Some(TypeKind::Struct(s)) =
+                    registry.get_type(&haphe::TypeId::new(planned.erased_id))
+                    && plan.is_resource(planned.erased_id)
+                {
+                    bind_resource(&mut inst, s, &planned.wit_name)?;
                 }
             }
 
@@ -133,6 +146,18 @@ impl<T: 'static> RuntimeBinder for WasmBinder<T> {
                 if let Some(TypeKind::Enum(e)) = registry.get_type(&haphe::TypeId::new(id)) {
                     for m in e.methods {
                         let name = member_names.insert(&format!("{}_{}", e.name, m.name))?;
+                        stub_func(&mut inst, &name)?;
+                    }
+                }
+            }
+            for &i in &iface.instance_indices {
+                let planned = &plan.instances[i];
+                if let Some(TypeKind::Enum(e)) =
+                    registry.get_type(&haphe::TypeId::new(planned.erased_id))
+                {
+                    for m in e.methods {
+                        let name =
+                            member_names.insert(&format!("{}-{}", planned.wit_name, m.name))?;
                         stub_func(&mut inst, &name)?;
                     }
                 }
@@ -164,10 +189,9 @@ impl<T: 'static> RuntimeBinder for WasmBinder<T> {
 fn bind_resource<T: 'static>(
     inst: &mut LinkerInstance<'_, T>,
     s: &haphe::StructDescriptor<'_>,
-    plan: &Plan<'_>,
+    res: &str,
 ) -> Result<(), WasmBindError> {
-    let res = plan.type_name(s.id.as_str()).to_string();
-    inst.resource(&res, ResourceType::host::<StubResource>(), |_, _| Ok(()))?;
+    inst.resource(res, ResourceType::host::<StubResource>(), |_, _| Ok(()))?;
     let mut members = NameMap::new();
 
     for field in s.fields {

@@ -29,7 +29,7 @@ use haphe::{
 };
 
 use emit::Printer;
-use model::Plan;
+use model::{Env, Plan};
 use names::{NameMap, to_kebab};
 use types::{Pos, render_return, render_type};
 
@@ -128,6 +128,12 @@ pub enum WitGenError {
         /// The wit-parser diagnostic.
         message: String,
     },
+    /// A type references a generic instantiation that was never recorded in
+    /// the registry, so no monomorphized definition exists to emit.
+    UnregisteredInstantiation {
+        /// The instantiation's mangled WIT name.
+        name: String,
+    },
 }
 
 impl fmt::Display for WitGenError {
@@ -158,6 +164,10 @@ impl fmt::Display for WitGenError {
             Self::InvalidWit { message } => {
                 write!(f, "generated document is not valid WIT: {message}")
             }
+            Self::UnregisteredInstantiation { name } => write!(
+                f,
+                "generic instantiation `{name}` is referenced but not listed in the registry"
+            ),
         }
     }
 }
@@ -174,7 +184,6 @@ impl BindingGenerator for WitGenerator {
     fn capabilities(&self) -> BackendCapabilities {
         BackendCapabilities::ALL
             .with_callbacks(false)
-            .with_generics(false)
             .with_properties(true)
             .with_type_aliases(true)
             .with_required_thread_safety(None)
@@ -193,6 +202,7 @@ impl BindingGenerator for WitGenerator {
         let mut emitted_ifaces = Vec::new();
         for (index, iface) in plan.interfaces.iter().enumerate() {
             let empty = iface.type_ids.is_empty()
+                && iface.instance_indices.is_empty()
                 && iface.functions.is_empty()
                 && (iface.constants.is_empty() || self.constants == ConstantMode::Skip);
             if empty {
@@ -246,7 +256,8 @@ impl WitGenerator {
         p.doc(iface.doc);
         p.open(&format!("interface {}", iface.name));
 
-        for (owner, names) in plan.uses_for(registry, index) {
+        for (owner, names) in plan.uses_for(registry, index)? {
+            let names: Vec<String> = names.into_iter().collect();
             p.line(&format!("use {owner}.{{{}}};", names.join(", ")));
         }
 
@@ -255,31 +266,71 @@ impl WitGenerator {
         for id in &iface.type_ids {
             match registry.get_type(&haphe::TypeId::new(id)).unwrap() {
                 TypeKind::Struct(s) => {
+                    let name = plan.type_name(id).to_string();
                     if plan.is_resource(id) {
-                        emit_resource(p, s, plan)?;
+                        emit_resource(p, s, &name, plan, None)?;
                     } else {
-                        emit_record(p, s, plan)?;
+                        emit_record(p, s, &name, plan, None)?;
                     }
                 }
-                TypeKind::Enum(e) => emit_enum(p, e, plan, &mut member_names)?,
-                TypeKind::TypeAlias(a) => emit_alias(p, a, plan, &mut member_names)?,
+                TypeKind::Enum(e) => {
+                    let name = plan.type_name(id).to_string();
+                    emit_enum(p, e, &name, plan, None, &mut member_names)?;
+                }
+                TypeKind::TypeAlias(a) => emit_alias(p, a, plan)?,
+            }
+        }
+
+        // Monomorphized generic instantiations, each marked with a
+        // deterministic `haphe:generic-instance` doc line.
+        for &i in &iface.instance_indices {
+            let inst = &plan.instances[i];
+            let env = plan.env_for(registry, inst);
+            let marker = plan.instance_marker(inst)?;
+            p.doc(Some(&format!("haphe:generic-instance = {marker}")));
+            match registry
+                .get_type(&haphe::TypeId::new(inst.erased_id))
+                .unwrap()
+            {
+                TypeKind::Struct(s) => {
+                    if plan.is_resource(inst.erased_id) {
+                        emit_resource(p, s, &inst.wit_name, plan, Some(&env))?;
+                    } else {
+                        emit_record(p, s, &inst.wit_name, plan, Some(&env))?;
+                    }
+                }
+                TypeKind::Enum(e) => {
+                    emit_enum(p, e, &inst.wit_name, plan, Some(&env), &mut member_names)?;
+                }
+                TypeKind::TypeAlias(_) => unreachable!("aliases cannot be generic"),
             }
         }
 
         // Companion functions for enum methods (WIT enums/variants have none).
         for id in &iface.type_ids {
             if let Some(TypeKind::Enum(e)) = registry.get_type(&haphe::TypeId::new(id)) {
-                let enum_name = plan.type_name(id);
+                let enum_name = plan.type_name(id).to_string();
                 for m in e.methods {
                     let fn_name = member_names.insert(&format!("{}_{}", e.name, m.name))?;
-                    emit_function(p, m, Some((enum_name, id)), &fn_name, plan)?;
+                    emit_function(p, m, Some(&enum_name), &fn_name, plan, None)?;
+                }
+            }
+        }
+        for &i in &iface.instance_indices {
+            let inst = &plan.instances[i];
+            if let Some(TypeKind::Enum(e)) = registry.get_type(&haphe::TypeId::new(inst.erased_id))
+            {
+                let env = plan.env_for(registry, inst);
+                for m in e.methods {
+                    let fn_name = member_names.insert(&format!("{}-{}", inst.wit_name, m.name))?;
+                    emit_function(p, m, Some(&inst.wit_name), &fn_name, plan, Some(&env))?;
                 }
             }
         }
 
         for func in iface.functions {
             let name = member_names.insert(func.name)?;
-            emit_function(p, func, None, &name, plan)?;
+            emit_function(p, func, None, &name, plan, None)?;
         }
 
         if self.constants == ConstantMode::Getter {
@@ -314,10 +365,12 @@ fn validate_package_name(package: &str) -> Result<(), WitGenError> {
 fn emit_record(
     p: &mut Printer,
     s: &StructDescriptor<'_>,
+    wit_name: &str,
     plan: &Plan<'_>,
+    env: Option<&Env<'_, '_>>,
 ) -> Result<(), WitGenError> {
     p.doc(s.doc);
-    p.open(&format!("record {}", plan.type_name(s.id.as_str())));
+    p.open(&format!("record {wit_name}"));
     let mut field_names = NameMap::new();
     for field in s.fields {
         let context = format!("{}.{}", s.name, field.name);
@@ -326,7 +379,7 @@ fn emit_record(
             p.doc(Some("Readonly in the source API."));
         }
         let name = field_names.insert(field.name)?;
-        let ty = render_type(field.ty, Pos::Field, plan, &context)?;
+        let ty = render_type(field.ty, Pos::Field, plan, env, &context)?;
         p.line(&format!("{name}: {ty},"));
     }
     p.close();
@@ -336,35 +389,36 @@ fn emit_record(
 fn emit_resource(
     p: &mut Printer,
     s: &StructDescriptor<'_>,
+    wit_name: &str,
     plan: &Plan<'_>,
+    env: Option<&Env<'_, '_>>,
 ) -> Result<(), WitGenError> {
-    let res_name = plan.type_name(s.id.as_str()).to_string();
     p.doc(s.doc);
-    p.open(&format!("resource {res_name}"));
+    p.open(&format!("resource {wit_name}"));
     let mut members = NameMap::new();
 
     for field in s.fields {
         let context = format!("{}.{}", s.name, field.name);
-        let ty = render_type(field.ty, Pos::Return(Ownership::Owned), plan, &context)?;
+        let ty = render_type(field.ty, Pos::Return(Ownership::Owned), plan, env, &context)?;
         p.doc(field.doc);
         let getter = members.insert(field.name)?;
         p.line(&format!("{getter}: func() -> {ty};"));
         if !field.readonly {
             let setter = members.insert(&format!("set_{}", field.name))?;
-            let vty = render_type(field.ty, Pos::Param(Ownership::Owned), plan, &context)?;
+            let vty = render_type(field.ty, Pos::Param(Ownership::Owned), plan, env, &context)?;
             p.line(&format!("{setter}: func(value: {vty});"));
         }
     }
 
     for prop in s.properties {
         let context = format!("{}.{}", s.name, prop.name);
-        let ty = render_type(prop.ty, Pos::Return(Ownership::Owned), plan, &context)?;
+        let ty = render_type(prop.ty, Pos::Return(Ownership::Owned), plan, env, &context)?;
         p.doc(prop.doc);
         let getter = members.insert(prop.name)?;
         p.line(&format!("{getter}: func() -> {ty};"));
         if !prop.readonly {
             let setter = members.insert(&format!("set_{}", prop.name))?;
-            let vty = render_type(prop.ty, Pos::Param(Ownership::Owned), plan, &context)?;
+            let vty = render_type(prop.ty, Pos::Param(Ownership::Owned), plan, env, &context)?;
             p.line(&format!("{setter}: func(value: {vty});"));
         }
     }
@@ -375,14 +429,14 @@ fn emit_resource(
     for ctor in s.constructors {
         let context = format!("{}::{}", s.name, ctor.name);
         p.doc(ctor.doc);
-        let params = render_params(ctor, plan, &context)?;
+        let params = render_params(ctor, plan, env, &context)?;
         if ctor_slot_free && !ctor.is_async {
             ctor_slot_free = false;
             p.line(&format!("constructor({params});"));
         } else {
             let name = members.insert(ctor.name)?;
             let kw = fn_keyword(ctor);
-            p.line(&format!("{name}: static {kw}({params}) -> {res_name};"));
+            p.line(&format!("{name}: static {kw}({params}) -> {wit_name};"));
         }
     }
 
@@ -393,8 +447,8 @@ fn emit_resource(
             p.doc(Some(&format!("Errors: {kind}")));
         }
         let name = members.insert(m.name)?;
-        let params = render_params(m, plan, &context)?;
-        let ret = render_fn_return(m, plan, &context)?;
+        let params = render_params(m, plan, env, &context)?;
+        let ret = render_fn_return(m, plan, env, &context)?;
         let kw = fn_keyword(m);
         match m.receiver {
             Some(Receiver::Ref | Receiver::RefMut) => {
@@ -403,7 +457,7 @@ fn emit_resource(
             Some(Receiver::Owned) => {
                 let sep = if params.is_empty() { "" } else { ", " };
                 p.line(&format!(
-                    "{name}: static {kw}(this: {res_name}{sep}{params}){ret};"
+                    "{name}: static {kw}(this: {wit_name}{sep}{params}){ret};"
                 ));
             }
             None => {
@@ -419,10 +473,11 @@ fn emit_resource(
 fn emit_enum(
     p: &mut Printer,
     e: &EnumDescriptor<'_>,
+    wit_name: &str,
     plan: &Plan<'_>,
+    env: Option<&Env<'_, '_>>,
     names: &mut NameMap,
 ) -> Result<(), WitGenError> {
-    let enum_name = plan.type_name(e.id.as_str()).to_string();
     let unit_only = e
         .variants
         .iter()
@@ -432,7 +487,7 @@ fn emit_enum(
     if !unit_only {
         for v in e.variants {
             if let VariantKind::Struct(fields) = v.kind {
-                let rec_name = names.insert(&format!("{}_{}", e.name, v.name))?;
+                let rec_name = names.insert(&format!("{wit_name}-{}", v.name))?;
                 p.doc(Some(&format!("Payload of `{}.{}`.", e.name, v.name)));
                 p.open(&format!("record {rec_name}"));
                 let mut field_names = NameMap::new();
@@ -440,7 +495,7 @@ fn emit_enum(
                     let context = format!("{}.{}.{}", e.name, v.name, field.name);
                     p.doc(field.doc);
                     let fname = field_names.insert(field.name)?;
-                    let ty = render_type(field.ty, Pos::Field, plan, &context)?;
+                    let ty = render_type(field.ty, Pos::Field, plan, env, &context)?;
                     p.line(&format!("{fname}: {ty},"));
                 }
                 p.close();
@@ -451,13 +506,13 @@ fn emit_enum(
     p.doc(e.doc);
     let mut case_names = NameMap::new();
     if unit_only {
-        p.open(&format!("enum {enum_name}"));
+        p.open(&format!("enum {wit_name}"));
         for v in e.variants {
             p.doc(v.doc);
             p.line(&format!("{},", case_names.insert(v.name)?));
         }
     } else {
-        p.open(&format!("variant {enum_name}"));
+        p.open(&format!("variant {wit_name}"));
         for v in e.variants {
             p.doc(v.doc);
             let case = case_names.insert(v.name)?;
@@ -466,16 +521,22 @@ fn emit_enum(
                 VariantKind::Tuple(elems) => {
                     let context = format!("{}.{}", e.name, v.name);
                     let payload = if elems.len() == 1 {
-                        render_type(&elems[0], Pos::Field, plan, &context)?
+                        render_type(&elems[0], Pos::Field, plan, env, &context)?
                     } else {
-                        render_type(&TypeDescriptor::Tuple(elems), Pos::Field, plan, &context)?
+                        render_type(
+                            &TypeDescriptor::Tuple(elems),
+                            Pos::Field,
+                            plan,
+                            env,
+                            &context,
+                        )?
                     };
                     p.line(&format!("{case}({payload}),"));
                 }
                 VariantKind::Struct(_) => {
                     p.line(&format!(
                         "{case}({}),",
-                        to_kebab(&format!("{}_{}", e.name, v.name))
+                        to_kebab(&format!("{wit_name}-{}", v.name))
                     ));
                 }
             }
@@ -489,11 +550,10 @@ fn emit_alias(
     p: &mut Printer,
     a: &TypeAliasDescriptor<'_>,
     plan: &Plan<'_>,
-    _names: &mut NameMap,
 ) -> Result<(), WitGenError> {
     let context = format!("type alias {}", a.name);
     p.doc(a.doc);
-    let ty = render_type(a.inner, Pos::Field, plan, &context)?;
+    let ty = render_type(a.inner, Pos::Field, plan, None, &context)?;
     p.line(&format!("type {} = {ty};", plan.type_name(a.id.as_str())));
     Ok(())
 }
@@ -501,28 +561,29 @@ fn emit_alias(
 fn emit_function(
     p: &mut Printer,
     f: &FunctionDescriptor<'_>,
-    enum_receiver: Option<(&str, &str)>,
+    enum_receiver: Option<&str>,
     name: &str,
     plan: &Plan<'_>,
+    env: Option<&Env<'_, '_>>,
 ) -> Result<(), WitGenError> {
     let context = f.name.to_string();
     p.doc(f.doc);
 
     let mut params = Vec::new();
-    if let Some((enum_name, _)) = enum_receiver {
+    if let Some(enum_name) = enum_receiver {
         params.push(format!("this: {enum_name}"));
     }
     let mut param_names = NameMap::new();
     for param in f.params {
         let pname = param_names.insert(param.name)?;
-        let ty = render_type(param.ty, Pos::Param(param.ownership), plan, &context)?;
+        let ty = render_type(param.ty, Pos::Param(param.ownership), plan, env, &context)?;
         params.push(format!("{pname}: {ty}"));
     }
 
     if let Some(kind) = f.error_kind {
         p.doc(Some(&format!("Errors: {kind}")));
     }
-    let arrow = render_fn_return(f, plan, &context)?;
+    let arrow = render_fn_return(f, plan, env, &context)?;
     let kw = fn_keyword(f);
     p.line(&format!("{name}: {kw}({}){arrow};", params.join(", ")));
     Ok(())
@@ -541,7 +602,7 @@ fn emit_constant(
     let context = format!("constant {}", c.name);
     p.doc(c.doc);
     p.doc(Some(&format!("Constant value: {}", c.value)));
-    let ty = render_type(c.ty, Pos::Return(Ownership::Owned), plan, &context)?;
+    let ty = render_type(c.ty, Pos::Return(Ownership::Owned), plan, None, &context)?;
     p.line(&format!("{name}: func() -> {ty};"));
     Ok(())
 }
@@ -549,13 +610,14 @@ fn emit_constant(
 fn render_params(
     f: &FunctionDescriptor<'_>,
     plan: &Plan<'_>,
+    env: Option<&Env<'_, '_>>,
     context: &str,
 ) -> Result<String, WitGenError> {
     let mut names = NameMap::new();
     let mut out = Vec::new();
     for param in f.params {
         let name = names.insert(param.name)?;
-        let ty = render_type(param.ty, Pos::Param(param.ownership), plan, context)?;
+        let ty = render_type(param.ty, Pos::Param(param.ownership), plan, env, context)?;
         out.push(format!("{name}: {ty}"));
     }
     Ok(out.join(", "))
@@ -564,9 +626,10 @@ fn render_params(
 fn render_fn_return(
     f: &FunctionDescriptor<'_>,
     plan: &Plan<'_>,
+    env: Option<&Env<'_, '_>>,
     context: &str,
 ) -> Result<String, WitGenError> {
-    let mut ret = render_return(f.return_type, f.return_ownership, plan, context)?;
+    let mut ret = render_return(f.return_type, f.return_ownership, plan, env, context)?;
     if f.error_kind.is_some() && !matches!(f.return_type, TypeDescriptor::Result(_, _)) {
         ret = Some(match ret {
             Some(t) => format!("result<{t}>"),

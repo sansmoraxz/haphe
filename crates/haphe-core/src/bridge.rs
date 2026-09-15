@@ -42,9 +42,7 @@ impl OpaqueUserData {
 
 impl std::fmt::Debug for OpaqueUserData {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_tuple("UserData")
-            .field(&self.0.type_id())
-            .finish()
+        f.debug_tuple("UserData").field(&self.0.type_id()).finish()
     }
 }
 
@@ -291,7 +289,11 @@ where
     ScriptValue: From<V>,
 {
     fn from(m: HashMap<String, V>) -> Self {
-        Self::Map(m.into_iter().map(|(k, v)| (k, ScriptValue::from(v))).collect())
+        Self::Map(
+            m.into_iter()
+                .map(|(k, v)| (k, ScriptValue::from(v)))
+                .collect(),
+        )
     }
 }
 
@@ -410,11 +412,7 @@ pub trait TypeBinder<T>: Sized {
     fn meta_unm(&mut self, f: fn(&T) -> T) -> Result<(), Self::Error>;
 
     /// Register a binary arithmetic metamethod where both operands are `T`.
-    fn meta_arith_self(
-        &mut self,
-        op: &'static str,
-        f: fn(T, T) -> T,
-    ) -> Result<(), Self::Error>;
+    fn meta_arith_self(&mut self, op: &'static str, f: fn(T, T) -> T) -> Result<(), Self::Error>;
 
     /// Register a binary arithmetic metamethod where the rhs is a primitive.
     /// The backend handles commutativity (tries `T op rhs` then `rhs op T`).

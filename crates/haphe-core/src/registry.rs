@@ -30,6 +30,22 @@ pub enum RegistryError<'a> {
     /// Two entries in a module (functions, constants, or submodules) share an
     /// exposed name.
     DuplicateModuleEntry { module: &'a str, name: &'a str },
+    /// An [`InstantiationDescriptor`] targets a [`TypeId`] that is not a
+    /// registered generic struct or enum.
+    DanglingInstantiation { to: TypeId<'a> },
+    /// An [`InstantiationDescriptor`]'s argument count does not match the
+    /// target's declared generic parameters.
+    InstantiationArityMismatch {
+        target: TypeId<'a>,
+        expected: usize,
+        found: usize,
+    },
+    /// An [`InstantiationDescriptor`] argument contains a
+    /// [`TypeDescriptor::GenericParam`]; instantiations must be concrete.
+    NonConcreteInstantiation {
+        target: TypeId<'a>,
+        param_name: &'a str,
+    },
 }
 
 impl std::fmt::Display for RegistryError<'_> {
@@ -57,11 +73,41 @@ impl std::fmt::Display for RegistryError<'_> {
                     "module `{module}` exposes the name `{name}` more than once"
                 )
             }
+            Self::DanglingInstantiation { to } => {
+                write!(f, "instantiation targets unregistered generic type {to}")
+            }
+            Self::InstantiationArityMismatch {
+                target,
+                expected,
+                found,
+            } => write!(
+                f,
+                "instantiation of {target} has {found} type argument(s), expected {expected}"
+            ),
+            Self::NonConcreteInstantiation { target, param_name } => write!(
+                f,
+                "instantiation of {target} contains generic parameter `{param_name}`; instantiations must be concrete"
+            ),
         }
     }
 }
 
 impl std::error::Error for RegistryError<'_> {}
+
+/// A concrete instantiation of a registered generic type, e.g.
+/// `Labeled<String, i32>`.
+///
+/// Recorded by [`registry!`](https://docs.rs/haphe) entries that carry type
+/// arguments. Backends that monomorphize (e.g. WIT) emit one concrete type
+/// per instantiation by substituting `args` for the target's
+/// `generic_params`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InstantiationDescriptor<'a> {
+    /// The generic type's erased [`TypeId`].
+    pub id: TypeId<'a>,
+    /// Concrete type arguments, in declaration order.
+    pub args: &'a [TypeDescriptor<'a>],
+}
 
 /// A reference to a struct, enum, or type alias in the registry.
 #[derive(Debug)]
@@ -85,6 +131,7 @@ pub struct TypeRegistry<'a> {
     enums: &'a [EnumDescriptor<'a>],
     type_aliases: &'a [TypeAliasDescriptor<'a>],
     modules: &'a [ModuleDescriptor<'a>],
+    instantiations: &'a [InstantiationDescriptor<'a>],
 }
 
 impl<'a> TypeRegistry<'a> {
@@ -94,12 +141,14 @@ impl<'a> TypeRegistry<'a> {
         enums: &'a [EnumDescriptor<'a>],
         type_aliases: &'a [TypeAliasDescriptor<'a>],
         modules: &'a [ModuleDescriptor<'a>],
+        instantiations: &'a [InstantiationDescriptor<'a>],
     ) -> Self {
         Self {
             structs,
             enums,
             type_aliases,
             modules,
+            instantiations,
         }
     }
 
@@ -151,6 +200,11 @@ impl<'a> TypeRegistry<'a> {
     /// Returns all top-level modules.
     pub const fn modules(&self) -> &[ModuleDescriptor<'a>] {
         self.modules
+    }
+
+    /// Returns all recorded generic instantiations.
+    pub const fn instantiations(&self) -> &[InstantiationDescriptor<'a>] {
+        self.instantiations
     }
 
     /// Validates structural integrity and returns a [`ValidatedRegistry`] that
@@ -256,6 +310,36 @@ impl<'a> TypeRegistry<'a> {
 
         for alias in self.type_aliases {
             collect_dangling_refs(alias.id, alias.inner, &known, &mut errors);
+        }
+
+        for inst in self.instantiations {
+            let generic_params = match (
+                self.structs.iter().find(|s| s.id == inst.id),
+                self.enums.iter().find(|e| e.id == inst.id),
+            ) {
+                (Some(s), _) => s.generic_params,
+                (_, Some(e)) => e.generic_params,
+                (None, None) => {
+                    errors.push(RegistryError::DanglingInstantiation { to: inst.id });
+                    continue;
+                }
+            };
+            if inst.args.len() != generic_params.len() {
+                errors.push(RegistryError::InstantiationArityMismatch {
+                    target: inst.id,
+                    expected: generic_params.len(),
+                    found: inst.args.len(),
+                });
+            }
+            for arg in inst.args {
+                collect_dangling_refs(inst.id, arg, &known, &mut errors);
+                walk_generic_params(arg, &mut |name| {
+                    errors.push(RegistryError::NonConcreteInstantiation {
+                        target: inst.id,
+                        param_name: name,
+                    });
+                });
+            }
         }
 
         let mut top_level_names = HashSet::new();
@@ -475,6 +559,12 @@ where
 {
     match ty {
         TypeDescriptor::Ref(id) => visitor(id),
+        TypeDescriptor::Instance { id, args } => {
+            visitor(id);
+            for arg in *args {
+                walk_type_refs(arg, visitor);
+            }
+        }
         TypeDescriptor::Option(inner) | TypeDescriptor::List(inner) => {
             walk_type_refs(inner, visitor)
         }
@@ -511,6 +601,11 @@ where
 {
     match ty {
         TypeDescriptor::GenericParam(name) => visitor(name),
+        TypeDescriptor::Instance { args, .. } => {
+            for arg in *args {
+                walk_generic_params(arg, visitor);
+            }
+        }
         TypeDescriptor::Option(inner) | TypeDescriptor::List(inner) => {
             walk_generic_params(inner, visitor)
         }
@@ -551,6 +646,7 @@ pub struct TypeRegistryBuilder<'a> {
     enums: Vec<EnumDescriptor<'a>>,
     type_aliases: Vec<TypeAliasDescriptor<'a>>,
     modules: Vec<ModuleDescriptor<'a>>,
+    instantiations: Vec<InstantiationDescriptor<'a>>,
 }
 
 impl<'a> TypeRegistryBuilder<'a> {
@@ -561,6 +657,7 @@ impl<'a> TypeRegistryBuilder<'a> {
             enums: Vec::new(),
             type_aliases: Vec::new(),
             modules: Vec::new(),
+            instantiations: Vec::new(),
         }
     }
 
@@ -608,6 +705,11 @@ impl<'a> TypeRegistryBuilder<'a> {
         self.modules.push(module);
     }
 
+    /// Records a concrete instantiation of a registered generic type.
+    pub fn register_instantiation(&mut self, inst: InstantiationDescriptor<'a>) {
+        self.instantiations.push(inst);
+    }
+
     /// Borrows the builder's contents as a [`TypeRegistry`].
     pub fn as_registry(&self) -> TypeRegistry<'_> {
         TypeRegistry {
@@ -615,6 +717,7 @@ impl<'a> TypeRegistryBuilder<'a> {
             enums: &self.enums,
             type_aliases: &self.type_aliases,
             modules: &self.modules,
+            instantiations: &self.instantiations,
         }
     }
 

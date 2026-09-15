@@ -38,7 +38,8 @@ pub use function::{FunctionDescriptor, Ownership, ParamDescriptor, Receiver, any
 pub use haphe_type::HapheType;
 pub use module::{ConstantDescriptor, ModuleDescriptor};
 pub use registry::{
-    Describe, RegistryError, TypeKind, TypeRegistry, TypeRegistryBuilder, ValidatedRegistry,
+    Describe, InstantiationDescriptor, RegistryError, TypeKind, TypeRegistry, TypeRegistryBuilder,
+    ValidatedRegistry,
 };
 pub use script::{ScriptAlias, ScriptEnum, ScriptFunction, ScriptImpl, ScriptStruct, ScriptType};
 pub use types::{

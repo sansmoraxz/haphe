@@ -327,3 +327,93 @@ fn invalid_package_name_rejected() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Generics (monomorphization)
+// ---------------------------------------------------------------------------
+
+/// A labeled value.
+#[derive(Script)]
+struct Labeled<T, U> {
+    label: String,
+    value: T,
+    extra: U,
+}
+
+/// Tags a labeled string.
+#[script]
+fn tag(l: Labeled<String, i32>) -> String {
+    l.label
+}
+
+haphe::registry! {
+    pub static GENERIC_REGISTRY = {
+        structs: [Labeled<String, i32>, Labeled<bool, u8>],
+        modules: [
+            mod tags {
+                doc: "Tagging",
+                functions: [tag],
+                types: [Labeled<String, i32>],
+            },
+        ],
+    };
+}
+
+fn generate_generic() -> String {
+    let output =
+        haphe::generate(&WitGenerator::new("haphe:demo"), &GENERIC_REGISTRY).expect("generates");
+    String::from_utf8(output.files[0].content.clone()).unwrap()
+}
+
+#[test]
+fn generic_instantiations_are_monomorphized() {
+    let wit = generate_generic();
+    assert!(wit.contains("record labeled-string-s32 {"), "got:\n{wit}");
+    assert!(wit.contains("record labeled-bool-u8 {"), "got:\n{wit}");
+    // Substituted fields.
+    assert!(wit.contains("value: string,"), "got:\n{wit}");
+    assert!(wit.contains("extra: u8,"), "got:\n{wit}");
+    // No erased/general emission.
+    assert!(!wit.contains("record labeled {"), "got:\n{wit}");
+    // Function references use the mangled name.
+    assert!(
+        wit.contains("tag: func(l: labeled-string-s32) -> string;"),
+        "got:\n{wit}"
+    );
+}
+
+#[test]
+fn generic_instances_carry_marker_comments() {
+    let wit = generate_generic();
+    assert!(
+        wit.contains("/// haphe:generic-instance = labeled<string, s32>"),
+        "got:\n{wit}"
+    );
+    assert!(
+        wit.contains("/// haphe:generic-instance = labeled<bool, u8>"),
+        "got:\n{wit}"
+    );
+}
+
+#[test]
+fn generic_instances_owned_by_claiming_module() {
+    let wit = generate_generic();
+    // The `tags` module claims the erased `Labeled` type, so every
+    // instantiation of it is emitted inside `interface tags`.
+    let tags_pos = wit.find("interface tags {").unwrap();
+    assert!(
+        wit.find("record labeled-string-s32 {").unwrap() > tags_pos,
+        "got:\n{wit}"
+    );
+    assert!(
+        wit.find("record labeled-bool-u8 {").unwrap() > tags_pos,
+        "got:\n{wit}"
+    );
+    // Nothing else is registered, so no default interface is emitted.
+    assert!(!wit.contains("interface types {"), "got:\n{wit}");
+}
+
+#[test]
+fn generation_is_reproducible() {
+    assert_eq!(generate_generic(), generate_generic());
+}

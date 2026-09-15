@@ -80,6 +80,20 @@ pub enum TypeDescriptor<'a> {
     },
     /// Reference to a user-defined type registered in the [`crate::TypeRegistry`].
     Ref(TypeId<'a>),
+    /// Reference to a concrete instantiation of a registered *generic* type,
+    /// e.g. `Labeled<String, i32>`.
+    ///
+    /// `id` is the generic type's (erased) [`TypeId`]; `args` are the
+    /// concrete type arguments in declaration order. Backends that
+    /// monomorphize (e.g. WIT) pair `args` with the target's
+    /// `generic_params` to substitute [`TypeDescriptor::GenericParam`]
+    /// occurrences.
+    Instance {
+        /// The generic type's erased id.
+        id: TypeId<'a>,
+        /// Concrete type arguments, in declaration order.
+        args: &'a [TypeDescriptor<'a>],
+    },
     /// The unit type `()`.
     Unit,
     /// A reference to a generic type parameter by name (e.g. `"T"`).
@@ -116,6 +130,9 @@ impl TypeDescriptor<'_> {
                 },
             ) => const_slice_eq(pa, pb) && ra.const_eq(rb),
             (T::Ref(a), T::Ref(b)) => a.const_eq(b),
+            (T::Instance { id: ia, args: aa }, T::Instance { id: ib, args: ab }) => {
+                ia.const_eq(ib) && const_slice_eq(aa, ab)
+            }
             (T::GenericParam(a), T::GenericParam(b)) => const_str_eq(a, b),
             _ => false,
         }

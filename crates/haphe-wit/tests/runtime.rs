@@ -286,7 +286,8 @@ fn name_collision_propagates() {
         empty_struct("t::MyType", "MyType"),
         empty_struct("t::my_type", "my_type"),
     ];
-    static REGISTRY_BAD: haphe::TypeRegistry = haphe::TypeRegistry::new(&STRUCTS, &[], &[], &[]);
+    static REGISTRY_BAD: haphe::TypeRegistry =
+        haphe::TypeRegistry::new(&STRUCTS, &[], &[], &[], &[]);
 
     let engine = Engine::default();
     let mut linker = Linker::<()>::new(&engine);
@@ -296,4 +297,70 @@ fn name_collision_propagates() {
         ))) => {}
         other => panic!("expected NameCollision, got: {other:?}"),
     }
+}
+
+/// Guest importing a monomorphized generic resource (`Holder<f64>` →
+/// `holder-f64`) and calling its stubbed getter.
+const GENERIC_GUEST: &str = r#"
+(component
+  (import "haphe:demo/types" (instance $t
+    (export "holder-f64" (type $h (sub resource)))
+    (export "[method]holder-f64.get" (func (param "self" (borrow $h)) (result f64)))
+  ))
+  (core module $m
+    (func (export "run") (result f64) (f64.const 0))
+  )
+  (core instance $mi (instantiate $m))
+  (func (export "run") (result f64) (canon lift (core func $mi "run")))
+)
+"#;
+
+/// Generic instantiations are bound under their mangled names: the guest's
+/// typed imports (resource + method) link against the binder's definitions.
+#[test]
+fn generic_instance_resource_links() {
+    static T_PARAM: haphe::TypeDescriptor = haphe::TypeDescriptor::GenericParam("T");
+    static GET: [haphe::FunctionDescriptor; 1] = [haphe::FunctionDescriptor {
+        name: "get",
+        doc: None,
+        receiver: Some(haphe::Receiver::Ref),
+        params: &[],
+        return_type: &T_PARAM,
+        return_ownership: haphe::Ownership::Owned,
+        is_async: false,
+        error_kind: None,
+    }];
+    static STRUCTS: [haphe::StructDescriptor; 1] = [haphe::StructDescriptor {
+        id: haphe::TypeId::new("test::Holder"),
+        name: "Holder",
+        doc: None,
+        fields: &[],
+        methods: &GET,
+        constructors: &[],
+        properties: &[],
+        trait_impls: &[],
+        thread_safety: haphe::ThreadSafety::SEND_SYNC,
+        generic_params: &[haphe::GenericParam {
+            name: "T",
+            bounds: &[],
+            default: None,
+        }],
+    }];
+    static F64_ARGS: [haphe::TypeDescriptor; 1] =
+        [haphe::TypeDescriptor::Primitive(haphe::PrimitiveType::F64)];
+    static INSTANTIATIONS: [haphe::InstantiationDescriptor; 1] = [haphe::InstantiationDescriptor {
+        id: haphe::TypeId::new("test::Holder"),
+        args: &F64_ARGS,
+    }];
+    static GENERIC_REGISTRY: haphe::TypeRegistry =
+        haphe::TypeRegistry::new(&STRUCTS, &[], &[], &[], &INSTANTIATIONS);
+
+    let engine = Engine::default();
+    let mut linker = Linker::new(&engine);
+    haphe::bind(&binder(), &GENERIC_REGISTRY, &mut linker).expect("binding succeeds");
+
+    // Instantiation succeeding proves `holder-f64` and its method stub are
+    // defined with compatible shapes.
+    let result = run_guest(&engine, &linker, GENERIC_GUEST).expect("guest instantiates");
+    assert!(matches!(result, Val::Float64(_)));
 }
