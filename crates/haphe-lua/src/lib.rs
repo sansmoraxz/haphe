@@ -132,9 +132,7 @@ impl RuntimeBinder for LuaBinder {
 
         for module in registry.modules() {
             let table = module::bind_module(runtime, registry, module)?;
-            globals
-                .set(module.name, table)
-                .map_err(LuaBindError::Lua)?;
+            globals.set(module.name, table).map_err(LuaBindError::Lua)?;
         }
 
         Ok(())
@@ -174,10 +172,7 @@ pub fn bind_type<T: ScriptBind + Clone + mlua::MaybeSend + mlua::MaybeSync + 'st
 /// bind_fn::<add>(&lua, &math).unwrap();
 /// // Now lua code can call math.add(1, 2)
 /// ```
-pub fn bind_fn<F: ScriptBindFn>(
-    lua: &mlua::Lua,
-    table: &mlua::Table,
-) -> Result<(), LuaBindError> {
+pub fn bind_fn<F: ScriptBindFn>(lua: &mlua::Lua, table: &mlua::Table) -> Result<(), LuaBindError> {
     let mut binder = binder::LuaFnBinder::new();
     F::bind(&mut binder)?;
     binder.apply(lua, table)

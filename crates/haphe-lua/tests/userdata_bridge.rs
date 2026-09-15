@@ -42,28 +42,40 @@ impl PartialEq for Vec2 {
 impl std::ops::Add for Vec2 {
     type Output = Vec2;
     fn add(self, rhs: Vec2) -> Vec2 {
-        Vec2 { x: self.x + rhs.x, y: self.y + rhs.y }
+        Vec2 {
+            x: self.x + rhs.x,
+            y: self.y + rhs.y,
+        }
     }
 }
 
 impl std::ops::Add<f64> for Vec2 {
     type Output = Vec2;
     fn add(self, rhs: f64) -> Vec2 {
-        Vec2 { x: self.x + rhs, y: self.y + rhs }
+        Vec2 {
+            x: self.x + rhs,
+            y: self.y + rhs,
+        }
     }
 }
 
 impl std::ops::Mul<f64> for Vec2 {
     type Output = Vec2;
     fn mul(self, rhs: f64) -> Vec2 {
-        Vec2 { x: self.x * rhs, y: self.y * rhs }
+        Vec2 {
+            x: self.x * rhs,
+            y: self.y * rhs,
+        }
     }
 }
 
 impl std::ops::Div<f64> for Vec2 {
     type Output = Vec2;
     fn div(self, rhs: f64) -> Vec2 {
-        Vec2 { x: self.x / rhs, y: self.y / rhs }
+        Vec2 {
+            x: self.x / rhs,
+            y: self.y / rhs,
+        }
     }
 }
 
@@ -147,10 +159,7 @@ fn constructor_works() {
 #[test]
 fn field_read() {
     let lua = setup_lua();
-    let x: f64 = lua
-        .load("return vectors.Vec2.new(3, 4).x")
-        .eval()
-        .unwrap();
+    let x: f64 = lua.load("return vectors.Vec2.new(3, 4).x").eval().unwrap();
     assert!((x - 3.0).abs() < 1e-12);
 }
 
@@ -370,9 +379,7 @@ fn generic_struct_field_read() {
 // ---------------------------------------------------------------------------
 
 #[script]
-fn double<T: Clone + std::ops::Add<Output = T> + haphe::FromScript + haphe::IntoScript>(
-    x: T,
-) -> T
+fn double<T: Clone + std::ops::Add<Output = T> + haphe::FromScript + haphe::IntoScript>(x: T) -> T
 where
     haphe::ScriptValue: From<T>,
 {
