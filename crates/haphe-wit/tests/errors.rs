@@ -141,25 +141,183 @@ fn callback_rejected_by_capabilities() {
 }
 
 #[test]
-fn async_fn_rejected_by_capabilities() {
-    static METHODS: [FunctionDescriptor; 1] = [FunctionDescriptor {
-        name: "fetch",
-        doc: None,
-        receiver: Some(Receiver::Ref),
-        params: &[],
-        return_type: &F64,
-        return_ownership: Ownership::Owned,
-        is_async: true,
-        error_kind: None,
-    }];
+fn async_constructor_becomes_static_func() {
+    static CTORS: [FunctionDescriptor; 2] = [
+        FunctionDescriptor {
+            name: "connect",
+            doc: None,
+            receiver: None,
+            params: &[],
+            return_type: &UNIT,
+            return_ownership: Ownership::Owned,
+            is_async: true,
+            error_kind: None,
+        },
+        FunctionDescriptor {
+            name: "new",
+            doc: None,
+            receiver: None,
+            params: &[],
+            return_type: &UNIT,
+            return_ownership: Ownership::Owned,
+            is_async: false,
+            error_kind: None,
+        },
+    ];
     static STRUCTS: [StructDescriptor; 1] = [StructDescriptor {
-        methods: &METHODS,
+        constructors: &CTORS,
         ..plain_struct("test::Client", "Client")
     }];
     static REGISTRY: TypeRegistry = TypeRegistry::new(&STRUCTS, &[], &[], &[]);
 
-    match haphe::generate(&WitGenerator::new("haphe:demo"), &REGISTRY) {
-        Err(GenerateError::Incompatible(_)) => {}
-        other => panic!("expected Incompatible, got: {other:?}"),
+    let output = haphe::generate(&WitGenerator::new("haphe:demo"), &REGISTRY).unwrap();
+    let wit = String::from_utf8(output.files[0].content.clone()).unwrap();
+    // WIT constructors cannot be async: the async one becomes a static func
+    // and the first sync one takes the constructor slot.
+    assert!(
+        wit.contains("connect: static async func() -> client;"),
+        "got:\n{wit}"
+    );
+    assert!(wit.contains("constructor();"), "got:\n{wit}");
+}
+
+#[test]
+fn empty_enum_rejected() {
+    static ENUMS: [haphe::EnumDescriptor; 1] = [haphe::EnumDescriptor {
+        id: TypeId::new("test::Never"),
+        name: "Never",
+        doc: None,
+        variants: &[],
+        methods: &[],
+        trait_impls: &[],
+        thread_safety: ThreadSafety::SEND_SYNC,
+        generic_params: &[],
+    }];
+    static REGISTRY: TypeRegistry = TypeRegistry::new(&[], &ENUMS, &[], &[]);
+
+    let err = generate_err(&REGISTRY);
+    assert!(
+        matches!(err, WitGenError::InvalidWit { .. }),
+        "got: {err:?}"
+    );
+}
+
+#[test]
+fn recursive_record_rejected() {
+    static NODE_REF: TypeDescriptor = TypeDescriptor::Ref(TypeId::new("test::Node"));
+    static NODE_OPT: TypeDescriptor = TypeDescriptor::Option(&NODE_REF);
+    static FIELDS: [FieldDescriptor; 1] = [FieldDescriptor {
+        name: "next",
+        doc: None,
+        ty: &NODE_OPT,
+        readonly: false,
+    }];
+    static STRUCTS: [StructDescriptor; 1] = [StructDescriptor {
+        fields: &FIELDS,
+        ..plain_struct("test::Node", "Node")
+    }];
+    static REGISTRY: TypeRegistry = TypeRegistry::new(&STRUCTS, &[], &[], &[]);
+
+    let err = generate_err(&REGISTRY);
+    assert!(
+        matches!(err, WitGenError::InvalidWit { .. }),
+        "got: {err:?}"
+    );
+}
+
+#[test]
+fn mutually_recursive_records_rejected() {
+    static A_REF: TypeDescriptor = TypeDescriptor::Ref(TypeId::new("test::A"));
+    static B_REF: TypeDescriptor = TypeDescriptor::Ref(TypeId::new("test::B"));
+    static B_LIST: TypeDescriptor = TypeDescriptor::List(&B_REF);
+    static A_FIELDS: [FieldDescriptor; 1] = [FieldDescriptor {
+        name: "children",
+        doc: None,
+        ty: &B_LIST,
+        readonly: false,
+    }];
+    static B_FIELDS: [FieldDescriptor; 1] = [FieldDescriptor {
+        name: "parent",
+        doc: None,
+        ty: &A_REF,
+        readonly: false,
+    }];
+    static STRUCTS: [StructDescriptor; 2] = [
+        StructDescriptor {
+            fields: &A_FIELDS,
+            ..plain_struct("test::A", "A")
+        },
+        StructDescriptor {
+            fields: &B_FIELDS,
+            ..plain_struct("test::B", "B")
+        },
+    ];
+    static REGISTRY: TypeRegistry = TypeRegistry::new(&STRUCTS, &[], &[], &[]);
+
+    let err = generate_err(&REGISTRY);
+    assert!(
+        matches!(err, WitGenError::InvalidWit { .. }),
+        "got: {err:?}"
+    );
+}
+
+#[test]
+fn cyclic_interface_use_rejected() {
+    // Two resources in different modules whose methods reference each other:
+    // no value-type recursion (handles break it), but the interfaces `use`
+    // each other cyclically.
+    static R1_REF: TypeDescriptor = TypeDescriptor::Ref(TypeId::new("test::R1"));
+    static R2_REF: TypeDescriptor = TypeDescriptor::Ref(TypeId::new("test::R2"));
+    const fn method(
+        name: &'static str,
+        param_ty: &'static TypeDescriptor<'static>,
+    ) -> FunctionDescriptor<'static> {
+        FunctionDescriptor {
+            name,
+            doc: None,
+            receiver: Some(Receiver::Ref),
+            params: &[],
+            return_type: param_ty,
+            return_ownership: Ownership::Owned,
+            is_async: false,
+            error_kind: None,
+        }
     }
+    static R1_METHODS: [FunctionDescriptor; 1] = [method("other", &R2_REF)];
+    static R2_METHODS: [FunctionDescriptor; 1] = [method("other", &R1_REF)];
+    static STRUCTS: [StructDescriptor; 2] = [
+        StructDescriptor {
+            methods: &R1_METHODS,
+            ..plain_struct("test::R1", "R1")
+        },
+        StructDescriptor {
+            methods: &R2_METHODS,
+            ..plain_struct("test::R2", "R2")
+        },
+    ];
+    static MODULES: [haphe::ModuleDescriptor; 2] = [
+        haphe::ModuleDescriptor {
+            name: "alpha",
+            doc: None,
+            functions: &[],
+            type_ids: &[TypeId::new("test::R1")],
+            submodules: &[],
+            constants: &[],
+        },
+        haphe::ModuleDescriptor {
+            name: "beta",
+            doc: None,
+            functions: &[],
+            type_ids: &[TypeId::new("test::R2")],
+            submodules: &[],
+            constants: &[],
+        },
+    ];
+    static REGISTRY: TypeRegistry = TypeRegistry::new(&STRUCTS, &[], &[], &MODULES);
+
+    let err = generate_err(&REGISTRY);
+    assert!(
+        matches!(err, WitGenError::InvalidWit { .. }),
+        "got: {err:?}"
+    );
 }

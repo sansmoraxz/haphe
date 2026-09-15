@@ -5,9 +5,22 @@ edition = "2024"
 description = "WIT (WebAssembly Component Model) binding generator for haphe"
 license = "Apache-2.0"
 
+[features]
+runtime = ["dep:wasmtime"]
+
 [dependencies]
 haphe = { path = "../haphe", default-features = false }
+wit-parser = "0.259"
+wasmtime = { version = "48", optional = true, default-features = false, features = [
+    "runtime",
+    "component-model",
+    "cranelift",
+] }
 
 [dev-dependencies]
 haphe = { path = "../haphe", features = ["macros"] }
-wit-parser = "0.259"
+wat = "1"
+
+[[test]]
+name = "runtime"
+required-features = ["runtime"]

@@ -101,6 +101,12 @@ fn midpoint(a: &Point, b: &Point) -> Point {
     }
 }
 
+/// Fetches remote data.
+#[script]
+async fn fetch_data(url: String) -> String {
+    url
+}
+
 /// Parses a point from text.
 #[script]
 fn parse_point(text: String) -> Result<Point, String> {
@@ -122,7 +128,7 @@ haphe::registry! {
         modules: [
             mod geometry {
                 doc: "Geometry types and utilities",
-                functions: [add, mul, midpoint, parse_point],
+                functions: [add, mul, midpoint, parse_point, fetch_data],
                 types: [Point, Color],
                 constants: [
                     /// The ratio of a circle's circumference to its diameter.
@@ -165,7 +171,7 @@ fn language_name_and_capabilities() {
     generator
         .capabilities()
         .check(&validated)
-        .expect("registry has no async/callbacks/generics");
+        .expect("registry has no callbacks/generics");
 }
 
 #[test]
@@ -237,6 +243,10 @@ fn free_functions() {
     );
     assert!(
         wit.contains("parse-point: func(text: string) -> result<point, string>;"),
+        "got:\n{wit}"
+    );
+    assert!(
+        wit.contains("fetch-data: async func(url: string) -> string;"),
         "got:\n{wit}"
     );
 }

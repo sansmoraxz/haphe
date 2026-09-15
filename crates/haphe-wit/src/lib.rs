@@ -13,7 +13,12 @@
 mod emit;
 mod model;
 pub mod names;
+#[cfg(feature = "runtime")]
+mod runtime;
 mod types;
+
+#[cfg(feature = "runtime")]
+pub use runtime::{WasmBindError, WasmBinder};
 
 use std::fmt;
 
@@ -116,6 +121,13 @@ pub enum WitGenError {
         /// The second source identifier.
         second: String,
     },
+    /// The generated document failed WIT resolution (e.g. recursive value
+    /// types, cyclic interface `use`s, empty enums or records). Caught at
+    /// generation time by validating the output through `wit-parser`.
+    InvalidWit {
+        /// The wit-parser diagnostic.
+        message: String,
+    },
 }
 
 impl fmt::Display for WitGenError {
@@ -143,6 +155,9 @@ impl fmt::Display for WitGenError {
                 f,
                 "identifiers `{first}` and `{second}` both map to WIT name `{kebab}`"
             ),
+            Self::InvalidWit { message } => {
+                write!(f, "generated document is not valid WIT: {message}")
+            }
         }
     }
 }
@@ -158,7 +173,6 @@ impl BindingGenerator for WitGenerator {
 
     fn capabilities(&self) -> BackendCapabilities {
         BackendCapabilities::ALL
-            .with_async_fns(false)
             .with_callbacks(false)
             .with_generics(false)
             .with_properties(true)
@@ -196,10 +210,24 @@ impl BindingGenerator for WitGenerator {
         }
         p.close();
 
+        let path = format!("wit/{}.wit", to_kebab(&self.world));
+        let content = p.finish();
+
+        // Validate through the reference WIT implementation so structural
+        // rules the emitter cannot express locally (no recursive value types,
+        // acyclic interface `use`s, non-empty enums/records, ...) become
+        // generation-time errors instead of broken output.
+        let mut resolve = wit_parser::Resolve::new();
+        resolve
+            .push_str(&path, &content)
+            .map_err(|e| WitGenError::InvalidWit {
+                message: format!("{e:?}"),
+            })?;
+
         Ok(GeneratedOutput {
             files: vec![GeneratedFile {
-                path: format!("wit/{}.wit", to_kebab(&self.world)),
-                content: p.finish().into_bytes(),
+                path,
+                content: content.into_bytes(),
                 encoding: Some("utf-8".to_string()),
             }],
         })
@@ -341,15 +369,20 @@ fn emit_resource(
         }
     }
 
-    for (i, ctor) in s.constructors.iter().enumerate() {
+    // WIT `constructor` cannot be async: the first sync constructor gets the
+    // slot, every other constructor becomes a static function.
+    let mut ctor_slot_free = true;
+    for ctor in s.constructors {
         let context = format!("{}::{}", s.name, ctor.name);
         p.doc(ctor.doc);
         let params = render_params(ctor, plan, &context)?;
-        if i == 0 {
+        if ctor_slot_free && !ctor.is_async {
+            ctor_slot_free = false;
             p.line(&format!("constructor({params});"));
         } else {
             let name = members.insert(ctor.name)?;
-            p.line(&format!("{name}: static func({params}) -> {res_name};"));
+            let kw = fn_keyword(ctor);
+            p.line(&format!("{name}: static {kw}({params}) -> {res_name};"));
         }
     }
 
@@ -362,18 +395,19 @@ fn emit_resource(
         let name = members.insert(m.name)?;
         let params = render_params(m, plan, &context)?;
         let ret = render_fn_return(m, plan, &context)?;
+        let kw = fn_keyword(m);
         match m.receiver {
             Some(Receiver::Ref | Receiver::RefMut) => {
-                p.line(&format!("{name}: func({params}){ret};"));
+                p.line(&format!("{name}: {kw}({params}){ret};"));
             }
             Some(Receiver::Owned) => {
                 let sep = if params.is_empty() { "" } else { ", " };
                 p.line(&format!(
-                    "{name}: static func(this: {res_name}{sep}{params}){ret};"
+                    "{name}: static {kw}(this: {res_name}{sep}{params}){ret};"
                 ));
             }
             None => {
-                p.line(&format!("{name}: static func({params}){ret};"));
+                p.line(&format!("{name}: static {kw}({params}){ret};"));
             }
         }
     }
@@ -489,8 +523,13 @@ fn emit_function(
         p.doc(Some(&format!("Errors: {kind}")));
     }
     let arrow = render_fn_return(f, plan, &context)?;
-    p.line(&format!("{name}: func({}){arrow};", params.join(", ")));
+    let kw = fn_keyword(f);
+    p.line(&format!("{name}: {kw}({}){arrow};", params.join(", ")));
     Ok(())
+}
+
+fn fn_keyword(f: &FunctionDescriptor<'_>) -> &'static str {
+    if f.is_async { "async func" } else { "func" }
 }
 
 fn emit_constant(
