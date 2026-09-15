@@ -51,10 +51,17 @@ pub mod math {
     }
 }
 
+/// Host-side callbacks.
+#[script(foreign)]
+pub trait Notifier {
+    fn notify(&self, message: String);
+}
+
 haphe::registry! {
     pub static REGISTRY = {
         structs: [Point],
         enums: [Color],
+        foreign: [NotifierHandle],
         modules: [
             mod geometry {
                 doc: "Geometry utilities",
@@ -115,6 +122,11 @@ fn registry_contents() {
     assert_eq!(scale.doc, Some("Default scale factor."));
     assert_eq!(*scale.ty, TypeDescriptor::Primitive(PrimitiveType::F64));
     assert_eq!(scale.value, "2.5");
+
+    let notifier = &REGISTRY.foreign_interfaces()[0];
+    assert_eq!(notifier.name, "Notifier");
+    assert_eq!(notifier.doc, Some("Host-side callbacks."));
+    assert_eq!(notifier.functions[0].name, "notify");
 }
 
 /// A backend that can't do properties still accepts this registry (none used
@@ -127,7 +139,7 @@ fn capability_check_catches_thread_safety() {
     let errors = strict.check(&validated).unwrap_err();
     assert_eq!(
         errors.len(),
-        1,
-        "only Color (default `none`) should fail: {errors:?}"
+        2,
+        "only Color and Notifier (both `none`) should fail: {errors:?}"
     );
 }

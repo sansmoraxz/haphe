@@ -69,6 +69,8 @@ pub struct BackendCapabilities {
     pub properties: bool,
     /// Supports `TypeAliasDescriptor` entries in the registry.
     pub type_aliases: bool,
+    /// Supports `ForeignInterfaceDescriptor` entries in the registry.
+    pub foreign_fns: bool,
     /// Minimum thread safety required for all registered types.
     /// `None` = no constraint.
     pub required_thread_safety: Option<ThreadSafety>,
@@ -84,6 +86,7 @@ impl BackendCapabilities {
         generics: true,
         properties: true,
         type_aliases: true,
+        foreign_fns: true,
         required_thread_safety: None,
     };
 
@@ -126,6 +129,12 @@ impl BackendCapabilities {
     /// Sets whether type aliases are supported.
     pub const fn with_type_aliases(mut self, v: bool) -> Self {
         self.type_aliases = v;
+        self
+    }
+
+    /// Sets whether foreign interfaces are supported.
+    pub const fn with_foreign_fns(mut self, v: bool) -> Self {
+        self.foreign_fns = v;
         self
     }
 
@@ -277,6 +286,32 @@ impl BackendCapabilities {
         if !self.type_aliases {
             for a in registry.type_aliases() {
                 errors.push(CompatibilityError::UnsupportedTypeAlias { type_id: a.id });
+            }
+        }
+
+        for fi in registry.foreign_interfaces() {
+            if !self.foreign_fns {
+                errors.push(CompatibilityError::UnsupportedForeignInterface { type_id: fi.id });
+                continue;
+            }
+            check_fns_async(fi.id, fi.functions, self.async_fns, &mut errors);
+            if !self.callbacks {
+                check_fns_callbacks(fi.id, fi.functions, &mut errors);
+            }
+            if !self.streams {
+                check_fns_streams(fi.id, fi.functions, &mut errors);
+            }
+            if !self.futures {
+                check_fns_futures(fi.id, fi.functions, &mut errors);
+            }
+            if let Some(required) = self.required_thread_safety
+                && !meets_thread_safety(&fi.thread_safety, &required)
+            {
+                errors.push(CompatibilityError::InsufficientThreadSafety {
+                    type_id: fi.id,
+                    required,
+                    actual: fi.thread_safety,
+                });
             }
         }
 
@@ -585,6 +620,9 @@ pub enum CompatibilityError<'a> {
     UnsupportedProperties { type_id: TypeId<'a> },
     /// A type alias in a backend that doesn't support type aliases.
     UnsupportedTypeAlias { type_id: TypeId<'a> },
+    /// A foreign interface in a backend that doesn't support foreign
+    /// interfaces.
+    UnsupportedForeignInterface { type_id: TypeId<'a> },
     /// A type doesn't meet the backend's thread-safety requirement.
     InsufficientThreadSafety {
         type_id: TypeId<'a>,
@@ -657,6 +695,12 @@ impl std::fmt::Display for CompatibilityError<'_> {
             }
             Self::UnsupportedTypeAlias { type_id } => {
                 write!(f, "type alias {type_id} is not supported by this backend")
+            }
+            Self::UnsupportedForeignInterface { type_id } => {
+                write!(
+                    f,
+                    "foreign interface {type_id} is not supported by this backend"
+                )
             }
             Self::InsufficientThreadSafety {
                 type_id,

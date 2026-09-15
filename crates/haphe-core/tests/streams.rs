@@ -26,7 +26,7 @@ static STRUCTS: [StructDescriptor; 1] = [StructDescriptor {
     thread_safety: ThreadSafety::SEND_SYNC,
     generic_params: &[],
 }];
-static REGISTRY: TypeRegistry = TypeRegistry::new(&STRUCTS, &[], &[], &[], &[]);
+static REGISTRY: TypeRegistry = TypeRegistry::new(&STRUCTS, &[], &[], &[], &[], &[]);
 
 #[test]
 fn streams_capability_accepts_and_rejects() {
@@ -76,7 +76,7 @@ fn module_stream_fn_rejected_without_capability() {
         submodules: &[],
         constants: &[],
     }];
-    static REGISTRY: TypeRegistry = TypeRegistry::new(&[], &[], &[], &MODULES, &[]);
+    static REGISTRY: TypeRegistry = TypeRegistry::new(&[], &[], &[], &MODULES, &[], &[]);
 
     let validated = REGISTRY.validate().unwrap();
     let errors = BackendCapabilities::ALL
@@ -114,7 +114,7 @@ static FUT_STRUCTS: [StructDescriptor; 1] = [StructDescriptor {
     thread_safety: ThreadSafety::SEND_SYNC,
     generic_params: &[],
 }];
-static FUT_REGISTRY: TypeRegistry = TypeRegistry::new(&FUT_STRUCTS, &[], &[], &[], &[]);
+static FUT_REGISTRY: TypeRegistry = TypeRegistry::new(&FUT_STRUCTS, &[], &[], &[], &[], &[]);
 
 /// Streams and futures are independent capabilities: disabling one leaves
 /// the other accepted.

@@ -489,7 +489,7 @@ fn name_collision_propagates() {
         empty_struct("t::my_type", "my_type"),
     ];
     static REGISTRY_BAD: haphe::TypeRegistry =
-        haphe::TypeRegistry::new(&STRUCTS, &[], &[], &[], &[]);
+        haphe::TypeRegistry::new(&STRUCTS, &[], &[], &[], &[], &[]);
 
     let engine = Engine::default();
     let mut linker = Linker::<()>::new(&engine);
@@ -555,7 +555,7 @@ fn generic_instance_resource_links() {
         args: &F64_ARGS,
     }];
     static GENERIC_REGISTRY: haphe::TypeRegistry =
-        haphe::TypeRegistry::new(&STRUCTS, &[], &[], &[], &INSTANTIATIONS);
+        haphe::TypeRegistry::new(&STRUCTS, &[], &[], &[], &INSTANTIATIONS, &[]);
 
     let engine = Engine::default();
     let mut linker = Linker::new(&engine);

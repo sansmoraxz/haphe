@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 
+use crate::foreign::ForeignInterfaceDescriptor;
 use crate::function::FunctionDescriptor;
 use crate::module::ModuleDescriptor;
 use crate::types::{
@@ -138,6 +139,7 @@ pub struct TypeRegistry<'a> {
     type_aliases: &'a [TypeAliasDescriptor<'a>],
     modules: &'a [ModuleDescriptor<'a>],
     instantiations: &'a [InstantiationDescriptor<'a>],
+    foreign_interfaces: &'a [ForeignInterfaceDescriptor<'a>],
 }
 
 impl<'a> TypeRegistry<'a> {
@@ -148,6 +150,7 @@ impl<'a> TypeRegistry<'a> {
         type_aliases: &'a [TypeAliasDescriptor<'a>],
         modules: &'a [ModuleDescriptor<'a>],
         instantiations: &'a [InstantiationDescriptor<'a>],
+        foreign_interfaces: &'a [ForeignInterfaceDescriptor<'a>],
     ) -> Self {
         Self {
             structs,
@@ -155,6 +158,7 @@ impl<'a> TypeRegistry<'a> {
             type_aliases,
             modules,
             instantiations,
+            foreign_interfaces,
         }
     }
 
@@ -213,6 +217,19 @@ impl<'a> TypeRegistry<'a> {
         self.instantiations
     }
 
+    /// Returns all registered foreign interfaces.
+    pub const fn foreign_interfaces(&self) -> &[ForeignInterfaceDescriptor<'a>] {
+        self.foreign_interfaces
+    }
+
+    /// Looks up a foreign interface by its [`TypeId`].
+    pub fn get_foreign_interface(
+        &self,
+        id: &TypeId<'_>,
+    ) -> Option<&ForeignInterfaceDescriptor<'a>> {
+        self.foreign_interfaces.iter().find(|f| f.id == *id)
+    }
+
     /// Validates structural integrity and returns a [`ValidatedRegistry`] that
     /// can be passed to [`crate::RuntimeBinder::bind`].
     ///
@@ -231,6 +248,24 @@ impl<'a> TypeRegistry<'a> {
             if !known.insert(id) {
                 errors.push(RegistryError::DuplicateType { id });
             }
+        }
+
+        // Foreign interfaces share the id namespace but are not value types:
+        // their ids do not join `known`, so a `TypeDescriptor::Ref` to one is
+        // a dangling reference.
+        {
+            let mut foreign_ids = HashSet::new();
+            for f in self.foreign_interfaces {
+                if known.contains(&f.id) || !foreign_ids.insert(f.id) {
+                    errors.push(RegistryError::DuplicateType { id: f.id });
+                }
+            }
+        }
+
+        for f in self.foreign_interfaces {
+            collect_dangling_refs_in_methods(f.id, f.functions, &known, &mut errors);
+            collect_undeclared_generics_in_methods(f.id, f.functions, &HashSet::new(), &mut errors);
+            collect_duplicate_members(f.id, f.functions.iter().map(|m| m.name), &mut errors);
         }
 
         for s in self.structs {
@@ -661,6 +696,7 @@ pub struct TypeRegistryBuilder<'a> {
     type_aliases: Vec<TypeAliasDescriptor<'a>>,
     modules: Vec<ModuleDescriptor<'a>>,
     instantiations: Vec<InstantiationDescriptor<'a>>,
+    foreign_interfaces: Vec<ForeignInterfaceDescriptor<'a>>,
 }
 
 impl<'a> TypeRegistryBuilder<'a> {
@@ -672,6 +708,7 @@ impl<'a> TypeRegistryBuilder<'a> {
             type_aliases: Vec::new(),
             modules: Vec::new(),
             instantiations: Vec::new(),
+            foreign_interfaces: Vec::new(),
         }
     }
 
@@ -724,6 +761,21 @@ impl<'a> TypeRegistryBuilder<'a> {
         self.instantiations.push(inst);
     }
 
+    /// Registers a foreign interface descriptor.
+    ///
+    /// Returns an error if any registered type or foreign interface already
+    /// uses the same id.
+    pub fn register_foreign_interface(
+        &mut self,
+        desc: ForeignInterfaceDescriptor<'a>,
+    ) -> Result<(), RegistryError<'a>> {
+        if self.has_type(&desc.id) {
+            return Err(RegistryError::DuplicateType { id: desc.id });
+        }
+        self.foreign_interfaces.push(desc);
+        Ok(())
+    }
+
     /// Borrows the builder's contents as a [`TypeRegistry`].
     pub fn as_registry(&self) -> TypeRegistry<'_> {
         TypeRegistry {
@@ -732,6 +784,7 @@ impl<'a> TypeRegistryBuilder<'a> {
             type_aliases: &self.type_aliases,
             modules: &self.modules,
             instantiations: &self.instantiations,
+            foreign_interfaces: &self.foreign_interfaces,
         }
     }
 
@@ -739,6 +792,7 @@ impl<'a> TypeRegistryBuilder<'a> {
         self.structs.iter().any(|s| s.id == *id)
             || self.enums.iter().any(|e| e.id == *id)
             || self.type_aliases.iter().any(|a| a.id == *id)
+            || self.foreign_interfaces.iter().any(|f| f.id == *id)
     }
 }
 

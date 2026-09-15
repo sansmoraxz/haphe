@@ -1,0 +1,5 @@
+error: foreign methods take owned parameters — values cross into the host runtime and cannot be lent (e.g. take `String` rather than `&str`)
+ --> tests/ui/foreign_ref_param.rs:5:28
+  |
+5 |     fn log(&self, message: &str);
+  |                            ^

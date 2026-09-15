@@ -73,6 +73,14 @@ pub struct ParamArgs {
     pub bytes: Option<Span>,
 }
 
+/// Arguments accepted on a foreign trait.
+#[derive(Default)]
+pub struct ForeignArgs {
+    pub foreign: Option<Span>,
+    pub rename: Option<LitStr>,
+    pub thread_safety: Option<(ThreadSafetyKind, Span)>,
+}
+
 /// Accumulates errors so every mistake on an item is reported at once.
 #[derive(Default)]
 pub struct Errors(Option<syn::Error>);
@@ -441,6 +449,48 @@ pub fn parse_fn_args(attrs: &[Attribute], errors: &mut Errors, site: &str) -> Fn
                 second.0, first.0
             ),
         );
+    }
+    args
+}
+
+pub fn parse_foreign_args(attrs: &[Attribute], errors: &mut Errors) -> ForeignArgs {
+    const ALLOWED: &[&str] = &["foreign", "rename", "thread_safety"];
+    let mut args = ForeignArgs::default();
+    let parse_errors = parse_script_attrs(
+        attrs,
+        |meta| {
+            let key = meta.path.get_ident().cloned().expect("checked by caller");
+            if key == "foreign" {
+                set_once!(errors, args.foreign, &key, key.span());
+            } else if key == "rename" {
+                let value: LitStr = meta.value()?.parse()?;
+                set_once!(errors, args.rename, &key, value);
+            } else if key == "thread_safety" {
+                let value: Ident = meta.value()?.parse()?;
+                let kind = match value.to_string().as_str() {
+                    "none" => ThreadSafetyKind::None,
+                    "send" => ThreadSafetyKind::Send,
+                    "send_sync" => ThreadSafetyKind::SendSync,
+                    other => {
+                        return Err(syn::Error::new(
+                            value.span(),
+                            format!(
+                                "invalid thread_safety `{other}` (expected `none`, `send`, or `send_sync`)"
+                            ),
+                        ));
+                    }
+                };
+                set_once!(errors, args.thread_safety, &key, (kind, value.span()));
+            } else {
+                return Ok(false);
+            }
+            Ok(true)
+        },
+        ALLOWED,
+        "a trait",
+    );
+    for err in parse_errors {
+        errors.push(err);
     }
     args
 }

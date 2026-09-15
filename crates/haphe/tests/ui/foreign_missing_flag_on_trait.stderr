@@ -1,0 +1,5 @@
+error: `#[script]` on a trait requires the `foreign` flag (`#[script(foreign)]`): traits describe host-supplied functions
+ --> tests/ui/foreign_missing_flag_on_trait.rs:4:7
+  |
+4 | trait Hooks {
+  |       ^^^^^

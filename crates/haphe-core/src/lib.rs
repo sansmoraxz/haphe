@@ -25,6 +25,7 @@ mod bitflags_support;
 #[cfg(feature = "bitflags")]
 pub use bitflags;
 pub mod bridge;
+pub mod foreign;
 pub mod function;
 pub mod haphe_type;
 pub mod module;
@@ -48,9 +49,11 @@ pub use backend::{
     RuntimeBinder,
 };
 pub use bridge::{
-    BindTarget, FnBinder, FromScript, IntoScript, OpaqueUserData, ScriptBind, ScriptBindFn,
-    ScriptConvertError, ScriptValue, TypeBinder,
+    BindTarget, FnBinder, ForeignCaller, ForeignError, ForeignErrorKind, ForeignHandle, FromScript,
+    IntoScript, OpaqueUserData, ScriptBind, ScriptBindFn, ScriptConvertError, ScriptValue,
+    TypeBinder,
 };
+pub use foreign::ForeignInterfaceDescriptor;
 pub use function::{FunctionDescriptor, Ownership, ParamDescriptor, Receiver, any_async};
 pub use haphe_type::HapheType;
 pub use module::{ConstantDescriptor, ModuleDescriptor};
@@ -58,7 +61,9 @@ pub use registry::{
     Describe, InstantiationDescriptor, RegistryError, TypeKind, TypeRegistry, TypeRegistryBuilder,
     ValidatedRegistry,
 };
-pub use script::{ScriptAlias, ScriptEnum, ScriptFunction, ScriptImpl, ScriptStruct, ScriptType};
+pub use script::{
+    ScriptAlias, ScriptEnum, ScriptForeign, ScriptFunction, ScriptImpl, ScriptStruct, ScriptType,
+};
 pub use types::{
     EnumDescriptor, EnumVariant, FieldDescriptor, GenericParam, PrimitiveType, PropertyDescriptor,
     StructDescriptor, ThreadSafety, TraitImpl, TypeAliasDescriptor, TypeDescriptor, TypeId,

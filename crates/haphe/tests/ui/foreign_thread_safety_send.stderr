@@ -1,0 +1,5 @@
+error: foreign handles are not thread-safe; only `thread_safety = none` is supported
+ --> tests/ui/foreign_thread_safety_send.rs:3:35
+  |
+3 | #[script(foreign, thread_safety = send_sync)]
+  |                                   ^^^^^^^^^

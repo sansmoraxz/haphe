@@ -1,0 +1,8 @@
+error: foreign methods cannot have default bodies — the host supplies the implementation
+ --> tests/ui/foreign_default_body.rs:5:27
+  |
+5 |       fn ping(&self) -> i64 {
+  |  ___________________________^
+6 | |         0
+7 | |     }
+  | |_____^

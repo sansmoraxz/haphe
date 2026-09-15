@@ -4,6 +4,7 @@ use proc_macro::TokenStream;
 
 mod bind;
 mod derive;
+mod foreign;
 mod freefn;
 mod imp;
 mod registry;
@@ -113,6 +114,37 @@ pub fn derive_script(input: TokenStream) -> TokenStream {
 /// On a free function, the same options are given on the attribute itself
 /// (e.g. `#[script(rename = "name")]`).
 ///
+/// # Foreign traits
+///
+/// `#[script(foreign)]` on a trait declares functions Rust calls *out* to,
+/// with bodies supplied by the embedding host. The macro re-emits the trait
+/// and generates a `{Trait}Handle` struct implementing it: each method
+/// converts its arguments, dispatches through a boxed `ForeignCaller`
+/// (constructed via `ForeignHandle::from_caller`), and converts the result
+/// back. The handle carries the interface descriptor via `ScriptForeign` and
+/// is what `foreign:` entries in [`registry!`] name.
+///
+/// Attribute options: `rename = "Name"` and `thread_safety = none` (the only
+/// supported value — handles are not thread-safe). Traits with `async`
+/// methods must declare `thread_safety` explicitly. Method attributes accept
+/// `rename` and `error_kind`.
+///
+/// Methods take `&self` and owned parameters. A `Result<T, E>` return
+/// surfaces host failures through `E: From<ForeignError>` and is described
+/// to the host as returning `T`; a non-`Result` method panics if the host
+/// call fails.
+///
+/// ```
+/// use haphe::{ForeignHandle, ScriptForeign, script};
+///
+/// #[script(foreign)]
+/// pub trait HostHooks {
+///     fn log(&self, message: String);
+/// }
+///
+/// assert_eq!(<HostHooksHandle as ScriptForeign>::DESCRIPTOR.name, "HostHooks");
+/// ```
+///
 /// # Example
 ///
 /// ```
@@ -173,9 +205,17 @@ pub fn script(args: TokenStream, item: TokenStream) -> TokenStream {
             }
             freefn::expand(item).into()
         }
+        syn::Item::Trait(mut item) => {
+            // Same re-injection as free functions: the outer attribute is
+            // where `foreign`, `rename`, and `thread_safety` live.
+            if !args.is_empty() {
+                item.attrs.push(syn::parse_quote! { #[script(#args)] });
+            }
+            foreign::expand(item).into()
+        }
         other => syn::Error::new_spanned(
             &other,
-            "`#[script]` applies to `impl` blocks and free functions",
+            "`#[script]` applies to `impl` blocks, free functions, and traits",
         )
         .to_compile_error()
         .into(),
@@ -186,7 +226,8 @@ pub fn script(args: TokenStream, item: TokenStream) -> TokenStream {
 /// functions.
 ///
 /// All sections are optional: `structs`, `enums`, `type_aliases` (newtypes
-/// derived with `Script`), and `modules`. A module block accepts `doc`,
+/// derived with `Script`), `modules`, and `foreign` (handle types generated
+/// by `#[script(foreign)]` on traits). A module block accepts `doc`,
 /// `functions`, `types`, `constants` (`NAME: Type = literal`, with optional
 /// doc comments; literal values are checked against the declared type), and
 /// nested `modules`. Functions and types are resolved through their traits,

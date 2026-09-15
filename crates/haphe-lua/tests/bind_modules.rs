@@ -109,7 +109,8 @@ static MATH_MODULE: ModuleDescriptor<'static> = ModuleDescriptor {
     constants: &[PI_CONST, MAX_CONST, ENABLED_CONST, NAME_CONST],
 };
 
-static REGISTRY: TypeRegistry<'static> = TypeRegistry::new(&[POINT], &[], &[], &[MATH_MODULE], &[]);
+static REGISTRY: TypeRegistry<'static> =
+    TypeRegistry::new(&[POINT], &[], &[], &[MATH_MODULE], &[], &[]);
 
 #[test]
 fn module_table_is_registered_as_global() {

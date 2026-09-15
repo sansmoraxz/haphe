@@ -19,6 +19,7 @@ pub struct RegistryInput {
     enums: Option<Vec<Type>>,
     type_aliases: Option<Vec<Type>>,
     modules: Option<Vec<ModuleInput>>,
+    foreign: Option<Vec<Type>>,
 }
 
 struct ModuleInput {
@@ -159,6 +160,7 @@ impl Parse for RegistryInput {
             enums: None,
             type_aliases: None,
             modules: None,
+            foreign: None,
         };
         while !content.is_empty() {
             let key: Ident = content.parse()?;
@@ -196,12 +198,21 @@ impl Parse for RegistryInput {
                         return Err(duplicate_section(&key));
                     }
                 }
+                "foreign" => {
+                    if registry
+                        .foreign
+                        .replace(bracketed_list(&content)?)
+                        .is_some()
+                    {
+                        return Err(duplicate_section(&key));
+                    }
+                }
                 other => {
                     return Err(syn::Error::new(
                         key.span(),
                         format!(
                             "unknown registry section `{other}` (expected: structs, enums, \
-                             type_aliases, modules)"
+                             type_aliases, modules, foreign)"
                         ),
                     ));
                 }
@@ -371,6 +382,7 @@ pub fn expand(input: RegistryInput) -> TokenStream {
         enums,
         type_aliases,
         modules,
+        foreign,
     } = &input;
     let mut instantiations = Vec::new();
     let struct_descs = descs_and_instantiations(structs, quote!(ScriptStruct), &mut instantiations);
@@ -381,6 +393,11 @@ pub fn expand(input: RegistryInput) -> TokenStream {
         .map(|ty| quote_spanned! {ty.span()=> <#ty as ::haphe::ScriptAlias>::DESCRIPTOR })
         .collect();
     let module_descs: Vec<_> = modules.iter().flatten().map(module_expr).collect();
+    let foreign_descs: Vec<_> = foreign
+        .iter()
+        .flatten()
+        .map(|ty| quote_spanned! {ty.span()=> <#ty as ::haphe::ScriptForeign>::DESCRIPTOR })
+        .collect();
     quote! {
         #(#attrs)*
         #vis static #name: ::haphe::TypeRegistry<'static> = ::haphe::TypeRegistry::new(
@@ -389,6 +406,7 @@ pub fn expand(input: RegistryInput) -> TokenStream {
             &[#(#alias_descs),*],
             &[#(#module_descs),*],
             &[#(#instantiations),*],
+            &[#(#foreign_descs),*],
         );
     }
 }

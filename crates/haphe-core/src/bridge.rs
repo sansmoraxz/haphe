@@ -457,3 +457,101 @@ pub struct BindTarget<'a> {
     pub type_id: TypeId<'a>,
     pub name: &'a str,
 }
+
+// ---------------------------------------------------------------------------
+// Foreign function calling
+// ---------------------------------------------------------------------------
+
+/// Backend-provided dispatcher for host-supplied functions.
+///
+/// One caller backs one foreign interface: it resolves `function` to the
+/// host's implementation, invokes it with the given arguments, and converts
+/// the result back to a [`ScriptValue`].
+pub trait ForeignCaller {
+    /// Invokes the named host function synchronously.
+    fn call(
+        &self,
+        function: &'static str,
+        args: &[ScriptValue],
+    ) -> Result<ScriptValue, ForeignError>;
+
+    /// Invokes the named host function asynchronously.
+    ///
+    /// The default implementation fails with
+    /// [`ForeignErrorKind::AsyncUnsupported`]; backends whose capabilities
+    /// declare `async_fns` must override it. Registries with async foreign
+    /// functions are rejected up front by the capability check when the
+    /// backend does not support async.
+    fn call_async<'a>(
+        &'a self,
+        function: &'static str,
+        args: &'a [ScriptValue],
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<ScriptValue, ForeignError>> + 'a>>
+    {
+        let _ = args;
+        Box::pin(std::future::ready(Err(ForeignError {
+            function,
+            kind: ForeignErrorKind::AsyncUnsupported,
+        })))
+    }
+}
+
+/// Error raised while dispatching a foreign function call.
+#[derive(Debug)]
+pub struct ForeignError {
+    /// The foreign function that was being called.
+    pub function: &'static str,
+    /// What went wrong.
+    pub kind: ForeignErrorKind,
+}
+
+/// The failure modes of a foreign function call.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum ForeignErrorKind {
+    /// The host raised an error while running the function.
+    Call(Box<dyn std::error::Error + Send + Sync>),
+    /// The host's return value did not convert to the declared Rust type.
+    Convert(ScriptConvertError),
+    /// The caller does not support asynchronous dispatch.
+    AsyncUnsupported,
+}
+
+impl std::fmt::Display for ForeignError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.kind {
+            ForeignErrorKind::Call(e) => {
+                write!(f, "foreign function `{}` failed: {e}", self.function)
+            }
+            ForeignErrorKind::Convert(e) => write!(
+                f,
+                "foreign function `{}` returned an unexpected value: {e}",
+                self.function
+            ),
+            ForeignErrorKind::AsyncUnsupported => write!(
+                f,
+                "foreign function `{}` is async but the caller does not support async dispatch",
+                self.function
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ForeignError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match &self.kind {
+            ForeignErrorKind::Call(e) => Some(e.as_ref()),
+            ForeignErrorKind::Convert(e) => Some(e),
+            ForeignErrorKind::AsyncUnsupported => None,
+        }
+    }
+}
+
+/// A foreign-interface handle constructible from a [`ForeignCaller`].
+///
+/// Implemented by the handle type generated for a foreign trait; backends
+/// use it to hand out trait implementations backed by their runtime.
+pub trait ForeignHandle: Sized {
+    /// Wraps a backend caller into the handle.
+    fn from_caller(caller: Box<dyn ForeignCaller>) -> Self;
+}
