@@ -43,9 +43,7 @@ fn script_to_lua(lua: &Lua, v: ScriptValue) -> mlua::Result<mlua::Value> {
         }
         ScriptValue::Optional(None) => Ok(mlua::Value::Nil),
         ScriptValue::Optional(Some(inner)) => script_to_lua(lua, *inner),
-        ScriptValue::UserData(ud) => lua
-            .create_any_userdata(ud)
-            .map(mlua::Value::UserData),
+        ScriptValue::UserData(ud) => lua.create_any_userdata(ud).map(mlua::Value::UserData),
         _ => Err(mlua::Error::runtime("unsupported ScriptValue variant")),
     }
 }
@@ -63,7 +61,9 @@ fn lua_to_script(v: &mlua::Value) -> mlua::Result<ScriptValue> {
             if let Ok(opaque) = ud.borrow::<haphe::OpaqueUserData>() {
                 Ok(ScriptValue::UserData(opaque.clone()))
             } else {
-                Err(mlua::Error::runtime("cannot convert foreign userdata to script value"))
+                Err(mlua::Error::runtime(
+                    "cannot convert foreign userdata to script value",
+                ))
             }
         }
         other => Err(mlua::Error::runtime(format!(
@@ -101,11 +101,13 @@ fn lua_table_to_script(t: &mlua::Table) -> mlua::Result<ScriptValue> {
 // ---------------------------------------------------------------------------
 
 type FieldGetFn<T> = Arc<dyn Fn(&T, &Lua) -> mlua::Result<mlua::Value> + Send + Sync + 'static>;
-type FieldSetFn<T> = Arc<dyn Fn(&mut T, mlua::Value, &Lua) -> mlua::Result<()> + Send + Sync + 'static>;
+type FieldSetFn<T> =
+    Arc<dyn Fn(&mut T, mlua::Value, &Lua) -> mlua::Result<()> + Send + Sync + 'static>;
 
 // Method/constructor fn pointers using ScriptValue — no generics needed.
 type ScriptMethodRef<T> = fn(&T, &[ScriptValue]) -> Result<ScriptValue, haphe::ScriptConvertError>;
-type ScriptMethodMut<T> = fn(&mut T, &[ScriptValue]) -> Result<ScriptValue, haphe::ScriptConvertError>;
+type ScriptMethodMut<T> =
+    fn(&mut T, &[ScriptValue]) -> Result<ScriptValue, haphe::ScriptConvertError>;
 type ScriptCtorFn<T> = fn(&[ScriptValue]) -> Result<T, haphe::ScriptConvertError>;
 type ScriptArithSelf<T> = fn(T, T) -> T;
 type ScriptArithScalar<T> = fn(T, &[ScriptValue]) -> Result<T, haphe::ScriptConvertError>;
@@ -206,8 +208,10 @@ impl<T: 'static + Clone + mlua::MaybeSend + mlua::MaybeSync> LuaTypeBinder<T> {
                     let mut v = args.into_vec();
                     let ud: mlua::AnyUserData = mlua::FromLua::from_lua(v.remove(0), lua)?;
                     let this = ud.borrow::<T>()?;
-                    let sv_args: Vec<ScriptValue> = v.iter().map(lua_to_script).collect::<mlua::Result<_>>()?;
-                    let result = f(&*this, &sv_args).map_err(|e| mlua::Error::runtime(e.to_string()))?;
+                    let sv_args: Vec<ScriptValue> =
+                        v.iter().map(lua_to_script).collect::<mlua::Result<_>>()?;
+                    let result =
+                        f(&*this, &sv_args).map_err(|e| mlua::Error::runtime(e.to_string()))?;
                     script_to_lua(lua, result)
                 });
             }
@@ -219,8 +223,10 @@ impl<T: 'static + Clone + mlua::MaybeSend + mlua::MaybeSync> LuaTypeBinder<T> {
                     let mut v = args.into_vec();
                     let ud: mlua::AnyUserData = mlua::FromLua::from_lua(v.remove(0), lua)?;
                     let mut this = ud.borrow_mut::<T>()?;
-                    let sv_args: Vec<ScriptValue> = v.iter().map(lua_to_script).collect::<mlua::Result<_>>()?;
-                    let result = f(&mut *this, &sv_args).map_err(|e| mlua::Error::runtime(e.to_string()))?;
+                    let sv_args: Vec<ScriptValue> =
+                        v.iter().map(lua_to_script).collect::<mlua::Result<_>>()?;
+                    let result =
+                        f(&mut *this, &sv_args).map_err(|e| mlua::Error::runtime(e.to_string()))?;
                     script_to_lua(lua, result)
                 });
             }
@@ -268,8 +274,12 @@ impl<T: 'static + Clone + mlua::MaybeSend + mlua::MaybeSync> LuaTypeBinder<T> {
                 std::collections::BTreeMap::new();
             for entry in &self.ariths {
                 match entry {
-                    ArithEntry::SelfOp(op, f) => { self_ops.insert(op, *f); }
-                    ArithEntry::Scalar(op, f) => { scalar_ops.entry(op).or_default().push(*f); }
+                    ArithEntry::SelfOp(op, f) => {
+                        self_ops.insert(op, *f);
+                    }
+                    ArithEntry::Scalar(op, f) => {
+                        scalar_ops.entry(op).or_default().push(*f);
+                    }
                 }
             }
             // Collect all ops.
@@ -292,14 +302,18 @@ impl<T: 'static + Clone + mlua::MaybeSend + mlua::MaybeSync> LuaTypeBinder<T> {
 
                 reg.add_meta_function(meta, move |lua, args: mlua::MultiValue| {
                     let mut v = args.into_vec();
-                    if v.len() != 2 { return Err(mlua::Error::runtime("expected 2 args")); }
+                    if v.len() != 2 {
+                        return Err(mlua::Error::runtime("expected 2 args"));
+                    }
                     let second = v.pop().unwrap();
                     let first = v.pop().unwrap();
 
                     // Try Self op Self.
                     if let Some(f) = self_f
-                        && let Ok(a_ud) = <mlua::AnyUserData as mlua::FromLua>::from_lua(first.clone(), lua)
-                        && let Ok(b_ud) = <mlua::AnyUserData as mlua::FromLua>::from_lua(second.clone(), lua)
+                        && let Ok(a_ud) =
+                            <mlua::AnyUserData as mlua::FromLua>::from_lua(first.clone(), lua)
+                        && let Ok(b_ud) =
+                            <mlua::AnyUserData as mlua::FromLua>::from_lua(second.clone(), lua)
                         && let Ok(a) = a_ud.borrow::<T>()
                         && let Ok(b) = b_ud.borrow::<T>()
                     {
@@ -308,7 +322,8 @@ impl<T: 'static + Clone + mlua::MaybeSend + mlua::MaybeSync> LuaTypeBinder<T> {
 
                     // Try Self op scalar.
                     for f in &scalar_fs {
-                        if let Ok(a_ud) = <mlua::AnyUserData as mlua::FromLua>::from_lua(first.clone(), lua)
+                        if let Ok(a_ud) =
+                            <mlua::AnyUserData as mlua::FromLua>::from_lua(first.clone(), lua)
                             && let Ok(a) = a_ud.borrow::<T>()
                             && let Ok(sv) = lua_to_script(&second)
                             && let Ok(result) = f(a.clone(), &[sv])
@@ -319,7 +334,8 @@ impl<T: 'static + Clone + mlua::MaybeSend + mlua::MaybeSync> LuaTypeBinder<T> {
 
                     // Try scalar op Self (commutative).
                     for f in &scalar_fs {
-                        if let Ok(b_ud) = <mlua::AnyUserData as mlua::FromLua>::from_lua(second.clone(), lua)
+                        if let Ok(b_ud) =
+                            <mlua::AnyUserData as mlua::FromLua>::from_lua(second.clone(), lua)
                             && let Ok(b) = b_ud.borrow::<T>()
                             && let Ok(sv) = lua_to_script(&first)
                             && let Ok(result) = f(b.clone(), &[sv])
@@ -350,9 +366,8 @@ impl<T: 'static + Clone + mlua::MaybeSend + mlua::MaybeSync> TypeBinder<T> for L
         getter: fn(&T) -> V,
         setter: Option<fn(&mut T, V)>,
     ) -> Result<(), Self::Error> {
-        let get_fn: FieldGetFn<T> = Arc::new(move |t, lua| {
-            script_to_lua(lua, getter(t).into_script())
-        });
+        let get_fn: FieldGetFn<T> =
+            Arc::new(move |t, lua| script_to_lua(lua, getter(t).into_script()));
         let set_fn: Option<FieldSetFn<T>> = setter.map(|s| -> FieldSetFn<T> {
             Arc::new(move |t, val, _lua| {
                 let sv = lua_to_script(&val)?;
@@ -361,7 +376,11 @@ impl<T: 'static + Clone + mlua::MaybeSend + mlua::MaybeSync> TypeBinder<T> for L
                 Ok(())
             })
         });
-        self.fields.push(FieldReg { name, getter: get_fn, setter: set_fn });
+        self.fields.push(FieldReg {
+            name,
+            getter: get_fn,
+            setter: set_fn,
+        });
         Ok(())
     }
 
@@ -402,25 +421,26 @@ impl<T: 'static + Clone + mlua::MaybeSend + mlua::MaybeSync> TypeBinder<T> for L
     }
 
     fn meta_tostring(&mut self, f: fn(&T) -> String) -> Result<(), Self::Error> {
-        self.tostring = Some(f); Ok(())
+        self.tostring = Some(f);
+        Ok(())
     }
     fn meta_eq(&mut self, f: fn(&T, &T) -> bool) -> Result<(), Self::Error> {
-        self.eq = Some(f); Ok(())
+        self.eq = Some(f);
+        Ok(())
     }
     fn meta_lt(&mut self, f: fn(&T, &T) -> bool) -> Result<(), Self::Error> {
-        self.lt = Some(f); Ok(())
+        self.lt = Some(f);
+        Ok(())
     }
     fn meta_le(&mut self, f: fn(&T, &T) -> bool) -> Result<(), Self::Error> {
-        self.le = Some(f); Ok(())
+        self.le = Some(f);
+        Ok(())
     }
     fn meta_unm(&mut self, f: fn(&T) -> T) -> Result<(), Self::Error> {
-        self.unm = Some(f); Ok(())
+        self.unm = Some(f);
+        Ok(())
     }
-    fn meta_arith_self(
-        &mut self,
-        op: &'static str,
-        f: fn(T, T) -> T,
-    ) -> Result<(), Self::Error> {
+    fn meta_arith_self(&mut self, op: &'static str, f: fn(T, T) -> T) -> Result<(), Self::Error> {
         self.ariths.push(ArithEntry::SelfOp(op, f));
         Ok(())
     }

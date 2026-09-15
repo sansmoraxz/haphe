@@ -2,8 +2,8 @@
 
 use haphe::{
     ConstantDescriptor, FieldDescriptor, FunctionDescriptor, ModuleDescriptor, Ownership,
-    ParamDescriptor, PrimitiveType, RuntimeBinder, StructDescriptor, ThreadSafety,
-    TypeDescriptor, TypeId, TypeRegistry,
+    ParamDescriptor, PrimitiveType, RuntimeBinder, StructDescriptor, ThreadSafety, TypeDescriptor,
+    TypeId, TypeRegistry,
 };
 use haphe_lua::LuaBinder;
 use mlua::Lua;
@@ -109,12 +109,7 @@ static MATH_MODULE: ModuleDescriptor<'static> = ModuleDescriptor {
     constants: &[PI_CONST, MAX_CONST, ENABLED_CONST, NAME_CONST],
 };
 
-static REGISTRY: TypeRegistry<'static> = TypeRegistry::new(
-    &[POINT],
-    &[],
-    &[],
-    &[MATH_MODULE],
-);
+static REGISTRY: TypeRegistry<'static> = TypeRegistry::new(&[POINT], &[], &[], &[MATH_MODULE], &[]);
 
 #[test]
 fn module_table_is_registered_as_global() {

@@ -242,8 +242,19 @@ fn is_bridge_primitive(ty: &Type) -> bool {
     };
     matches!(
         ident.to_string().as_str(),
-        "bool" | "i8" | "i16" | "i32" | "i64" | "u8" | "u16" | "u32" | "u64"
-            | "f32" | "f64" | "char" | "String"
+        "bool"
+            | "i8"
+            | "i16"
+            | "i32"
+            | "i64"
+            | "u8"
+            | "u16"
+            | "u32"
+            | "u64"
+            | "f32"
+            | "f64"
+            | "char"
+            | "String"
     )
 }
 
@@ -267,28 +278,28 @@ fn gen_field_registrations(
         .iter()
         .filter(|f| is_bridge_primitive(&f.ty) || is_generic_type_param(&f.ty, generic_params))
         .map(|f| {
-        let ident = &f.ident;
-        let name = &f.name;
-        let ty = &f.ty;
+            let ident = &f.ident;
+            let name = &f.name;
+            let ty = &f.ty;
 
-        let setter = if f.readonly {
-            quote! { ::core::option::Option::None }
-        } else {
+            let setter = if f.readonly {
+                quote! { ::core::option::Option::None }
+            } else {
+                quote! {
+                    ::core::option::Option::Some(
+                        (|__t: &mut #self_ty, __v: #ty| __t.#ident = __v) as fn(&mut #self_ty, #ty)
+                    )
+                }
+            };
+
             quote! {
-                ::core::option::Option::Some(
-                    (|__t: &mut #self_ty, __v: #ty| __t.#ident = __v) as fn(&mut #self_ty, #ty)
-                )
+                __b.field::<#ty>(
+                    #name,
+                    (|__t: &#self_ty| __t.#ident.clone()) as fn(&#self_ty) -> #ty,
+                    #setter,
+                )?;
             }
-        };
-
-        quote! {
-            __b.field::<#ty>(
-                #name,
-                (|__t: &#self_ty| __t.#ident.clone()) as fn(&#self_ty) -> #ty,
-                #setter,
-            )?;
-        }
-    });
+        });
 
     quote! { #(#regs)* }
 }

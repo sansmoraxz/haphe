@@ -6,8 +6,8 @@
 
 use proc_macro2::TokenStream;
 use quote::quote;
-use syn::{FnArg, ItemFn, Pat, Type};
 use syn::spanned::Spanned;
+use syn::{FnArg, ItemFn, Pat, Type};
 
 use crate::attrs::{Errors, parse_fn_args, strip_script_attrs};
 use crate::fn_desc::{ReceiverShape, build_fn_info};
@@ -173,15 +173,21 @@ pub fn expand(mut item: ItemFn) -> TokenStream {
     };
     let (impl_g, ty_g, where_c) = struct_generics.split_for_impl();
 
-    let all_params_compatible = !has_type_params && item.sig.inputs.iter().all(|input| {
-        let FnArg::Typed(pat_ty) = input else { return true };
-        crate::bind::is_bridge_compatible_type(&pat_ty.ty)
-    });
-    let return_compatible = !has_type_params && info.return_ty.as_ref().is_none_or(|t| {
-        !matches!(t, Type::Reference(_)) && crate::bind::is_bridge_compatible_type(t)
-    });
+    let all_params_compatible = !has_type_params
+        && item.sig.inputs.iter().all(|input| {
+            let FnArg::Typed(pat_ty) = input else {
+                return true;
+            };
+            crate::bind::is_bridge_compatible_type(&pat_ty.ty)
+        });
+    let return_compatible = !has_type_params
+        && info.return_ty.as_ref().is_none_or(|t| {
+            !matches!(t, Type::Reference(_)) && crate::bind::is_bridge_compatible_type(t)
+        });
 
-    let can_bind = !info.is_async && cfgs.is_empty() && (has_type_params || (all_params_compatible && return_compatible));
+    let can_bind = !info.is_async
+        && cfgs.is_empty()
+        && (has_type_params || (all_params_compatible && return_compatible));
 
     let bind_fn = if can_bind {
         quote! {

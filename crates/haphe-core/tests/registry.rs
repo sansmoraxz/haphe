@@ -101,6 +101,7 @@ static COLOR_DESC: EnumDescriptor<'static> = EnumDescriptor {
     trait_impls: &[],
     thread_safety: ThreadSafety::SEND_SYNC,
     generic_params: &[],
+    is_flags: false,
 };
 
 // ── Describe impls (builder path)
@@ -128,7 +129,7 @@ fn const_constructed_registry() {
     static STRUCTS: [StructDescriptor<'static>; 1] = [POINT_DESC];
     static ENUMS: [EnumDescriptor<'static>; 1] = [COLOR_DESC];
 
-    let registry = TypeRegistry::new(&STRUCTS, &ENUMS, &[], &[]);
+    let registry = TypeRegistry::new(&STRUCTS, &ENUMS, &[], &[], &[]);
 
     let point = registry.get_struct(&TypeId::new("Point")).unwrap();
     assert_eq!(point.name, "Point");
@@ -169,7 +170,7 @@ fn describe_registers_enum() {
 
 #[test]
 fn registry_lookup_missing_returns_none() {
-    let registry = TypeRegistry::new(&[], &[], &[], &[]);
+    let registry = TypeRegistry::new(&[], &[], &[], &[], &[]);
     assert!(registry.get_struct(&TypeId::new("Missing")).is_none());
     assert!(registry.get_enum(&TypeId::new("Missing")).is_none());
 }
@@ -240,7 +241,7 @@ fn module_tree() {
         constants: &CONSTS,
     }];
 
-    let registry = TypeRegistry::new(&[], &[], &[], &MODULES);
+    let registry = TypeRegistry::new(&[], &[], &[], &MODULES, &[]);
     assert_eq!(registry.modules().len(), 1);
     let m = &registry.modules()[0];
     assert_eq!(m.name, "geometry");
@@ -285,6 +286,7 @@ fn duplicate_enum_registration_errors() {
         trait_impls: &[],
         thread_safety: ThreadSafety::SEND_SYNC,
         generic_params: &[],
+        is_flags: false,
     });
     assert!(matches!(result, Err(RegistryError::DuplicateType { .. })));
 }
@@ -303,6 +305,7 @@ fn cross_kind_duplicate_errors() {
         trait_impls: &[],
         thread_safety: ThreadSafety::SEND_SYNC,
         generic_params: &[],
+        is_flags: false,
     });
     assert!(matches!(result, Err(RegistryError::DuplicateType { .. })));
 }
@@ -357,7 +360,7 @@ fn validate_catches_dangling_ref_in_field() {
         generic_params: &[],
     }];
 
-    let registry = TypeRegistry::new(&BAD_STRUCT, &[], &[], &[]);
+    let registry = TypeRegistry::new(&BAD_STRUCT, &[], &[], &[], &[]);
     let errors = registry.validate().unwrap_err();
     assert_eq!(errors.len(), 1);
     assert!(matches!(
@@ -399,7 +402,7 @@ fn validate_catches_dangling_ref_in_method_param() {
         generic_params: &[],
     }];
 
-    let registry = TypeRegistry::new(&STRUCTS, &[], &[], &[]);
+    let registry = TypeRegistry::new(&STRUCTS, &[], &[], &[], &[]);
     let errors = registry.validate().unwrap_err();
     assert_eq!(errors.len(), 1);
     assert!(matches!(
@@ -432,7 +435,7 @@ fn validate_catches_nested_dangling_ref() {
         generic_params: &[],
     }];
 
-    let registry = TypeRegistry::new(&STRUCTS, &[], &[], &[]);
+    let registry = TypeRegistry::new(&STRUCTS, &[], &[], &[], &[]);
     let errors = registry.validate().unwrap_err();
     assert_eq!(errors.len(), 1);
     assert!(matches!(
@@ -469,7 +472,7 @@ fn validate_catches_dangling_ref_in_callback() {
         generic_params: &[],
     }];
 
-    let registry = TypeRegistry::new(&STRUCTS, &[], &[], &[]);
+    let registry = TypeRegistry::new(&STRUCTS, &[], &[], &[], &[]);
     let errors = registry.validate().unwrap_err();
     assert_eq!(errors.len(), 1);
     assert!(matches!(
@@ -610,7 +613,7 @@ fn constructors_on_struct() {
         generic_params: &[],
     }];
 
-    let registry = TypeRegistry::new(&STRUCTS, &[], &[], &[]);
+    let registry = TypeRegistry::new(&STRUCTS, &[], &[], &[], &[]);
     let point = registry.get_struct(&TypeId::new("Point")).unwrap();
     assert_eq!(point.constructors.len(), 1);
     assert_eq!(point.constructors[0].name, "new");
@@ -650,7 +653,7 @@ fn validate_catches_dangling_ref_in_constructor() {
         generic_params: &[],
     }];
 
-    let registry = TypeRegistry::new(&STRUCTS, &[], &[], &[]);
+    let registry = TypeRegistry::new(&STRUCTS, &[], &[], &[], &[]);
     let errors = registry.validate().unwrap_err();
     assert_eq!(errors.len(), 1);
     assert!(matches!(
@@ -680,7 +683,7 @@ fn trait_impls_marker_traits() {
         generic_params: &[],
     }];
 
-    let registry = TypeRegistry::new(&STRUCTS, &[], &[], &[]);
+    let registry = TypeRegistry::new(&STRUCTS, &[], &[], &[], &[]);
     let foo = registry.get_struct(&TypeId::new("Foo")).unwrap();
     assert_eq!(foo.trait_impls.len(), 4);
     assert_eq!(foo.trait_impls[0], TraitImpl::Display);
@@ -710,7 +713,7 @@ fn trait_impls_with_associated_types() {
         generic_params: &[],
     }];
 
-    let registry = TypeRegistry::new(&STRUCTS, &[], &[], &[]);
+    let registry = TypeRegistry::new(&STRUCTS, &[], &[], &[], &[]);
     assert!(registry.validate().is_ok());
 
     let vec2 = registry.get_struct(&TypeId::new("Vec2")).unwrap();
@@ -742,7 +745,7 @@ fn validate_catches_dangling_ref_in_trait_impl() {
         generic_params: &[],
     }];
 
-    let registry = TypeRegistry::new(&STRUCTS, &[], &[], &[]);
+    let registry = TypeRegistry::new(&STRUCTS, &[], &[], &[], &[]);
     let errors = registry.validate().unwrap_err();
     assert_eq!(errors.len(), 1);
     assert!(matches!(
@@ -780,7 +783,7 @@ fn property_descriptors() {
         generic_params: &[],
     }];
 
-    let registry = TypeRegistry::new(&STRUCTS, &[], &[], &[]);
+    let registry = TypeRegistry::new(&STRUCTS, &[], &[], &[], &[]);
     let v = registry.get_struct(&TypeId::new("Vec2")).unwrap();
     assert_eq!(v.properties.len(), 2);
     assert!(v.properties[0].readonly);
@@ -810,7 +813,7 @@ fn validate_catches_dangling_ref_in_property() {
         generic_params: &[],
     }];
 
-    let registry = TypeRegistry::new(&STRUCTS, &[], &[], &[]);
+    let registry = TypeRegistry::new(&STRUCTS, &[], &[], &[], &[]);
     let errors = registry.validate().unwrap_err();
     assert_eq!(errors.len(), 1);
     assert!(matches!(
@@ -853,7 +856,7 @@ fn thread_safety_markers() {
         generic_params: &[],
     }];
 
-    let registry = TypeRegistry::new(&STRUCTS, &[], &[], &[]);
+    let registry = TypeRegistry::new(&STRUCTS, &[], &[], &[], &[]);
     let w = registry.get_struct(&TypeId::new("RcWrapper")).unwrap();
     assert!(!w.thread_safety.is_send);
     assert!(!w.thread_safety.is_sync);
@@ -895,7 +898,7 @@ fn generic_type_params_on_struct() {
         generic_params: &GENERICS,
     }];
 
-    let registry = TypeRegistry::new(&STRUCTS, &[], &[], &[]);
+    let registry = TypeRegistry::new(&STRUCTS, &[], &[], &[], &[]);
     let c = registry.get_struct(&TypeId::new("Container")).unwrap();
     assert_eq!(c.generic_params.len(), 1);
     assert_eq!(c.generic_params[0].name, "T");
@@ -932,7 +935,7 @@ fn generic_param_with_default() {
         generic_params: &GENERICS,
     }];
 
-    let registry = TypeRegistry::new(&STRUCTS, &[], &[], &[]);
+    let registry = TypeRegistry::new(&STRUCTS, &[], &[], &[], &[]);
     let wd = registry.get_struct(&TypeId::new("WithDefault")).unwrap();
     assert!(wd.generic_params[0].default.is_some());
     assert!(registry.validate().is_ok());
@@ -961,7 +964,7 @@ fn validate_catches_undeclared_generic_param() {
         generic_params: &[], // No generics declared
     }];
 
-    let registry = TypeRegistry::new(&STRUCTS, &[], &[], &[]);
+    let registry = TypeRegistry::new(&STRUCTS, &[], &[], &[], &[]);
     let errors = registry.validate().unwrap_err();
     assert_eq!(errors.len(), 1);
     assert!(matches!(
@@ -993,7 +996,7 @@ fn validate_catches_dangling_ref_in_generic_default() {
         generic_params: &GENERICS,
     }];
 
-    let registry = TypeRegistry::new(&STRUCTS, &[], &[], &[]);
+    let registry = TypeRegistry::new(&STRUCTS, &[], &[], &[], &[]);
     let errors = registry.validate().unwrap_err();
     assert_eq!(errors.len(), 1);
     assert!(matches!(
@@ -1040,7 +1043,7 @@ fn type_alias_transparent() {
     };
     static ALIASES: [TypeAliasDescriptor<'static>; 1] = [ALIAS];
 
-    let registry = TypeRegistry::new(&[], &[], &ALIASES, &[]);
+    let registry = TypeRegistry::new(&[], &[], &ALIASES, &[], &[]);
     let s = registry.get_type_alias(&TypeId::new("Seconds")).unwrap();
     assert!(s.transparent);
     assert!(registry.validate().is_ok());
@@ -1079,7 +1082,7 @@ fn type_alias_joins_known_types() {
         generic_params: &[],
     }];
 
-    let registry = TypeRegistry::new(&STRUCTS, &[], &ALIASES, &[]);
+    let registry = TypeRegistry::new(&STRUCTS, &[], &ALIASES, &[], &[]);
     assert!(registry.validate().is_ok());
 }
 
@@ -1095,7 +1098,7 @@ fn validate_catches_dangling_ref_in_alias_inner() {
     };
     static ALIASES: [TypeAliasDescriptor<'static>; 1] = [ALIAS];
 
-    let registry = TypeRegistry::new(&[], &[], &ALIASES, &[]);
+    let registry = TypeRegistry::new(&[], &[], &ALIASES, &[], &[]);
     let errors = registry.validate().unwrap_err();
     assert_eq!(errors.len(), 1);
     assert!(matches!(
@@ -1219,9 +1222,10 @@ fn enum_with_all_new_fields() {
         trait_impls: &TRAITS,
         thread_safety: ThreadSafety::SEND,
         generic_params: &GENERICS,
+        is_flags: false,
     }];
 
-    let registry = TypeRegistry::new(&[], &ENUMS, &[], &[]);
+    let registry = TypeRegistry::new(&[], &ENUMS, &[], &[], &[]);
     let opt = registry.get_enum(&TypeId::new("MyOption")).unwrap();
     assert_eq!(opt.trait_impls.len(), 2);
     assert_eq!(opt.thread_safety, ThreadSafety::SEND);
@@ -1281,7 +1285,7 @@ fn capability_check_catches_unsupported_async() {
         generic_params: &[],
     }];
 
-    let registry = TypeRegistry::new(&STRUCTS, &[], &[], &[]);
+    let registry = TypeRegistry::new(&STRUCTS, &[], &[], &[], &[]);
     let validated = registry.validate().unwrap();
 
     let no_async = BackendCapabilities::ALL.with_async_fns(false);
@@ -1321,7 +1325,7 @@ fn capability_check_catches_unsupported_callbacks() {
         generic_params: &[],
     }];
 
-    let registry = TypeRegistry::new(&STRUCTS, &[], &[], &[]);
+    let registry = TypeRegistry::new(&STRUCTS, &[], &[], &[], &[]);
     let validated = registry.validate().unwrap();
 
     let no_cb = BackendCapabilities::ALL.with_callbacks(false);
@@ -1361,7 +1365,7 @@ fn capability_check_catches_unsupported_generics() {
         generic_params: &GENERICS,
     }];
 
-    let registry = TypeRegistry::new(&STRUCTS, &[], &[], &[]);
+    let registry = TypeRegistry::new(&STRUCTS, &[], &[], &[], &[]);
     let validated = registry.validate().unwrap();
 
     let no_generics = BackendCapabilities::ALL.with_generics(false);
@@ -1394,7 +1398,7 @@ fn capability_check_catches_unsupported_properties() {
         generic_params: &[],
     }];
 
-    let registry = TypeRegistry::new(&STRUCTS, &[], &[], &[]);
+    let registry = TypeRegistry::new(&STRUCTS, &[], &[], &[], &[]);
     let validated = registry.validate().unwrap();
 
     let no_props = BackendCapabilities::ALL.with_properties(false);
@@ -1417,7 +1421,7 @@ fn capability_check_catches_unsupported_type_alias() {
         transparent: false,
     }];
 
-    let registry = TypeRegistry::new(&[], &[], &ALIASES, &[]);
+    let registry = TypeRegistry::new(&[], &[], &ALIASES, &[], &[]);
     let validated = registry.validate().unwrap();
 
     let no_aliases = BackendCapabilities::ALL.with_type_aliases(false);
@@ -1444,7 +1448,7 @@ fn capability_check_catches_insufficient_thread_safety() {
         generic_params: &[],
     }];
 
-    let registry = TypeRegistry::new(&STRUCTS, &[], &[], &[]);
+    let registry = TypeRegistry::new(&STRUCTS, &[], &[], &[], &[]);
     let validated = registry.validate().unwrap();
 
     let needs_send_sync =
@@ -1473,9 +1477,52 @@ fn capability_check_thread_safety_passes_when_met() {
         generic_params: &[],
     }];
 
-    let registry = TypeRegistry::new(&STRUCTS, &[], &[], &[]);
+    let registry = TypeRegistry::new(&STRUCTS, &[], &[], &[], &[]);
     let validated = registry.validate().unwrap();
 
     let needs_send = BackendCapabilities::ALL.with_required_thread_safety(Some(ThreadSafety::SEND));
     assert!(needs_send.check(&validated).is_ok());
+}
+
+#[test]
+fn flags_enum_with_payload_variant_fails_validation() {
+    static PAYLOAD: [TypeDescriptor<'static>; 1] = [TypeDescriptor::Primitive(PrimitiveType::U32)];
+    static VARIANTS: [EnumVariant<'static>; 2] = [
+        EnumVariant {
+            name: "Read",
+            doc: None,
+            kind: VariantKind::Unit,
+        },
+        EnumVariant {
+            name: "Custom",
+            doc: None,
+            kind: VariantKind::Tuple(&PAYLOAD),
+        },
+    ];
+    static ENUMS: [EnumDescriptor<'static>; 1] = [EnumDescriptor {
+        id: TypeId::new("test::Perm"),
+        name: "Perm",
+        doc: None,
+        variants: &VARIANTS,
+        methods: &[],
+        trait_impls: &[],
+        thread_safety: ThreadSafety::SEND_SYNC,
+        generic_params: &[],
+        is_flags: true,
+    }];
+    static REGISTRY: TypeRegistry<'static> = TypeRegistry::new(&[], &ENUMS, &[], &[], &[]);
+
+    let errors = REGISTRY
+        .validate()
+        .expect_err("payload variant in flags enum");
+    assert!(
+        errors.iter().any(|e| matches!(
+            e,
+            RegistryError::NonUnitFlagsVariant {
+                variant: "Custom",
+                ..
+            }
+        )),
+        "got: {errors:?}"
+    );
 }

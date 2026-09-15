@@ -163,7 +163,7 @@ fn generic_fold(ty: &Type, ctx: &TyCtx) -> syn::Result<TokenStream> {
             let is_builtin_path = p.path.segments.len() == 1
                 || matches!(
                     p.path.segments.first().map(|seg| seg.ident.to_string()),
-                    Some(ref first) if matches!(first.as_str(), "std" | "alloc" | "core")
+                    Some(ref first) if matches!(first.as_str(), "std" | "alloc" | "core" | "haphe")
                 );
             let args = if is_builtin_path {
                 generic_type_args(&last.arguments)
@@ -190,6 +190,14 @@ fn generic_fold(ty: &Type, ctx: &TyCtx) -> syn::Result<TokenStream> {
                     let e = generic_fold(e, ctx)?;
                     Ok(quote! { ::haphe::TypeDescriptor::Result(&#t, &#e) })
                 }
+                ("Stream", [inner]) => {
+                    let inner = generic_fold(inner, ctx)?;
+                    Ok(quote! { ::haphe::TypeDescriptor::Stream(&#inner) })
+                }
+                ("Future", [inner]) => {
+                    let inner = generic_fold(inner, ctx)?;
+                    Ok(quote! { ::haphe::TypeDescriptor::Future(&#inner) })
+                }
                 _ => {
                     // Bare user-defined generic type (e.g. `Wrapper<T>` as
                     // self-type in a constructor return): resolve via
@@ -208,7 +216,7 @@ fn generic_fold(ty: &Type, ctx: &TyCtx) -> syn::Result<TokenStream> {
                             ty.span(),
                             "generic parameters may only appear directly or inside built-in containers \
                              (`Option`, `Vec`, `Box`, slices, arrays, tuples, `HashMap`, `BTreeMap`, \
-                             `Result`, references) in this position",
+                             `Result`, `Stream`, `Future`, references) in this position",
                         ))
                     }
                 }

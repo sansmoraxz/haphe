@@ -34,6 +34,8 @@ pub struct ContainerArgs {
     pub methods: Option<Span>,
     /// Newtypes only: expose as equivalent to the inner type.
     pub transparent: Option<Span>,
+    /// Enums only: expose as a bitflags set (unit variants = independent bits).
+    pub flags: Option<Span>,
 }
 
 /// Arguments accepted on fields (and enum-variant fields).
@@ -222,6 +224,7 @@ pub fn parse_container_args(attrs: &[Attribute], errors: &mut Errors) -> Contain
         "traits",
         "methods",
         "transparent",
+        "flags",
         "crate",
     ];
     let mut args = ContainerArgs::default();
@@ -291,6 +294,8 @@ pub fn parse_container_args(attrs: &[Attribute], errors: &mut Errors) -> Contain
                 set_once!(errors, args.methods, &key, key.span());
             } else if key == "transparent" {
                 set_once!(errors, args.transparent, &key, key.span());
+            } else if key == "flags" {
+                set_once!(errors, args.flags, &key, key.span());
             } else if key == "crate" {
                 return Err(syn::Error::new(
                     key.span(),

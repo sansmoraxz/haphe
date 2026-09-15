@@ -1,0 +1,23 @@
+error[E0080]: evaluation panicked: script_bitflags!: every named flag must set exactly one bit; composite or empty masks cannot be represented as independent flags
+  --> tests/ui_bitflags/composite_mask.rs:12:1
+   |
+12 | haphe::script_bitflags!(Perms);
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ evaluation of `_::VARIANTS` failed here
+   |
+   = note: this error originates in the macro `$crate::panic::panic_2021` which comes from the expansion of the macro `haphe::script_bitflags` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+note: erroneous constant encountered
+  --> tests/ui_bitflags/composite_mask.rs:12:1
+   |
+12 | haphe::script_bitflags!(Perms);
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: this note originates in the macro `haphe::script_bitflags` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+note: erroneous constant encountered
+  --> tests/ui_bitflags/composite_mask.rs:12:1
+   |
+12 | haphe::script_bitflags!(Perms);
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: this note originates in the macro `haphe::script_bitflags` (in Nightly builds, run with -Z macro-backtrace for more info)

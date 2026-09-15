@@ -135,9 +135,7 @@ fn bound_lua() -> Lua {
     let mut lua = Lua::new();
     let binder = LuaBinder::new();
     let validated = REGISTRY.validate().expect("registry validates");
-    binder
-        .bind(&validated, &mut lua)
-        .expect("binding succeeds");
+    binder.bind(&validated, &mut lua).expect("binding succeeds");
     lua
 }
 
@@ -284,9 +282,7 @@ fn custom_capabilities() {
     use haphe::BackendCapabilities;
 
     // A backend that disables async still accepts this registry (no async fns).
-    let binder = LuaBinder::with_capabilities(
-        BackendCapabilities::ALL.with_async_fns(false),
-    );
+    let binder = LuaBinder::with_capabilities(BackendCapabilities::ALL.with_async_fns(false));
     let validated = REGISTRY.validate().unwrap();
     binder
         .capabilities()

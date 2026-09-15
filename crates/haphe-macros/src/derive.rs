@@ -432,6 +432,9 @@ fn expand_inner(input: DeriveInput) -> syn::Result<TokenStream> {
 
     let body = match &input.data {
         Data::Struct(data) => {
+            if let Some(span) = container.flags {
+                errors.spanned(span, "`#[script(flags)]` is only valid on enums");
+            }
             let field_exprs: Vec<TokenStream> = match &data.fields {
                 Fields::Named(named) => named
                     .named
@@ -467,6 +470,7 @@ fn expand_inner(input: DeriveInput) -> syn::Result<TokenStream> {
             }
         }
         Data::Enum(data) => {
+            let is_flags = container.flags.is_some();
             let mut variant_exprs = Vec::new();
             for variant in &data.variants {
                 let args = parse_variant_args(&variant.attrs, &mut errors);
@@ -479,6 +483,13 @@ fn expand_inner(input: DeriveInput) -> syn::Result<TokenStream> {
                     .map(|r| r.value())
                     .unwrap_or_else(|| variant.ident.unraw().to_string());
                 let vdoc = doc_tokens(&extract_doc(&variant.attrs));
+                if container.flags.is_some() && !matches!(variant.fields, Fields::Unit) {
+                    errors.spanned(
+                        variant.span(),
+                        "`#[script(flags)]` enums must have only unit variants; \
+                         bitflags cases cannot carry payloads",
+                    );
+                }
                 let kind = match &variant.fields {
                     Fields::Unit => quote! { ::haphe::VariantKind::Unit },
                     Fields::Unnamed(unnamed) => {
@@ -535,6 +546,7 @@ fn expand_inner(input: DeriveInput) -> syn::Result<TokenStream> {
                         trait_impls: &[#(#trait_exprs),*],
                         thread_safety: #thread_safety,
                         generic_params: &[#(#generic_params),*],
+                        is_flags: #is_flags,
                     };
                 }
             }
@@ -594,12 +606,47 @@ fn expand_inner(input: DeriveInput) -> syn::Result<TokenStream> {
         )
     };
 
-    Ok(quote! {
-        #[automatically_derived]
-        impl #impl_g ::haphe::HapheType for #ident #ty_g #where_c {
-            const DESCRIPTOR: ::haphe::TypeDescriptor<'static> =
-                ::haphe::TypeDescriptor::Ref(<Self as ::haphe::ScriptType>::ID);
+    // For generic types, `HapheType` references carry the concrete type
+    // arguments so backends can monomorphize; the erased descriptor itself is
+    // unchanged. Requires each type param to be `HapheType` (fresh clone of
+    // the input generics — `desc_generics` carries claim predicates that
+    // would over-constrain field-position uses).
+    let haphe_type_impl = if is_generic {
+        let mut ht_generics = input.generics.clone();
+        let param_idents: Vec<_> = input
+            .generics
+            .type_params()
+            .map(|p| p.ident.clone())
+            .collect();
+        for param in &param_idents {
+            ht_generics
+                .make_where_clause()
+                .predicates
+                .push(syn::parse_quote! { #param: ::haphe::HapheType });
         }
+        let (ht_impl_g, ht_ty_g, ht_where_c) = ht_generics.split_for_impl();
+        quote! {
+            #[automatically_derived]
+            impl #ht_impl_g ::haphe::HapheType for #ident #ht_ty_g #ht_where_c {
+                const DESCRIPTOR: ::haphe::TypeDescriptor<'static> =
+                    ::haphe::TypeDescriptor::Instance {
+                        id: <Self as ::haphe::ScriptType>::ID,
+                        args: &[#( <#param_idents as ::haphe::HapheType>::DESCRIPTOR ),*],
+                    };
+            }
+        }
+    } else {
+        quote! {
+            #[automatically_derived]
+            impl #impl_g ::haphe::HapheType for #ident #ty_g #where_c {
+                const DESCRIPTOR: ::haphe::TypeDescriptor<'static> =
+                    ::haphe::TypeDescriptor::Ref(<Self as ::haphe::ScriptType>::ID);
+            }
+        }
+    };
+
+    Ok(quote! {
+        #haphe_type_impl
         #[automatically_derived]
         impl #impl_g ::haphe::ScriptType for #ident #ty_g #where_c {
             const ID: ::haphe::TypeId<'static> = #id_expr;
@@ -630,6 +677,9 @@ fn expand_newtype(
     let doc = doc_tokens(&extract_doc(&input.attrs));
     let transparent = container.transparent.is_some();
 
+    if let Some(span) = container.flags {
+        errors.spanned(span, "`#[script(flags)]` is only valid on enums");
+    }
     if !input.generics.params.is_empty() {
         errors.spanned(
             input.generics.span(),

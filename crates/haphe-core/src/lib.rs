@@ -18,13 +18,30 @@
 #[doc(hidden)]
 pub mod __verify;
 pub mod backend;
+#[cfg(feature = "bitflags")]
+mod bitflags_support;
+/// Re-export of the [`bitflags`](https://docs.rs/bitflags) crate for
+/// [`script_bitflags!`] expansions.
+#[cfg(feature = "bitflags")]
+pub use bitflags;
 pub mod bridge;
 pub mod function;
 pub mod haphe_type;
 pub mod module;
 pub mod registry;
 pub mod script;
+#[cfg(any(feature = "streams", feature = "futures"))]
+pub mod stream;
+/// Re-export of the [`futures-core`](https://docs.rs/futures-core) crate for
+/// implementing custom [`stream::Stream`] sources.
+#[cfg(feature = "streams")]
+pub use futures_core;
 pub mod types;
+
+#[cfg(feature = "futures")]
+pub use stream::Future;
+#[cfg(feature = "streams")]
+pub use stream::Stream;
 
 pub use backend::{
     BackendCapabilities, BindingGenerator, CompatibilityError, GeneratedFile, GeneratedOutput,
@@ -38,7 +55,8 @@ pub use function::{FunctionDescriptor, Ownership, ParamDescriptor, Receiver, any
 pub use haphe_type::HapheType;
 pub use module::{ConstantDescriptor, ModuleDescriptor};
 pub use registry::{
-    Describe, RegistryError, TypeKind, TypeRegistry, TypeRegistryBuilder, ValidatedRegistry,
+    Describe, InstantiationDescriptor, RegistryError, TypeKind, TypeRegistry, TypeRegistryBuilder,
+    ValidatedRegistry,
 };
 pub use script::{ScriptAlias, ScriptEnum, ScriptFunction, ScriptImpl, ScriptStruct, ScriptType};
 pub use types::{

@@ -5,4 +5,14 @@ edition = "2024"
 description = "Core IR and traits for haphe scripting-language binding generator"
 license = "Apache-2.0"
 
+[features]
+# Expose bitflags-crate types as flags enums via `script_bitflags!`.
+bitflags = ["dep:bitflags"]
+# First-class `Stream<T>` value type.
+streams = ["dep:futures-core"]
+# First-class `Future<T>` value type (dependency-free).
+futures = []
+
 [dependencies]
+bitflags = { version = "2", optional = true }
+futures-core = { version = "0.3", optional = true, default-features = false }

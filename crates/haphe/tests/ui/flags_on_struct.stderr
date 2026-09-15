@@ -1,0 +1,5 @@
+error: `#[script(flags)]` is only valid on enums
+ --> tests/ui/flags_on_struct.rs:5:10
+  |
+5 | #[script(flags)]
+  |          ^^^^^

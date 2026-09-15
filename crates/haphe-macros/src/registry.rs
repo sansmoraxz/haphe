@@ -303,6 +303,65 @@ fn module_expr(module: &ModuleInput) -> TokenStream {
     }
 }
 
+/// The type's path with generic arguments stripped from the last segment,
+/// used to dedupe erased descriptors across instantiations.
+fn stripped_path_key(ty: &Type) -> String {
+    if let Type::Path(p) = ty {
+        let mut stripped = p.clone();
+        if let Some(last) = stripped.path.segments.last_mut() {
+            last.arguments = syn::PathArguments::None;
+        }
+        stripped.to_token_stream().to_string()
+    } else {
+        ty.to_token_stream().to_string()
+    }
+}
+
+/// Type arguments of the last path segment, if any — marks a generic
+/// instantiation entry.
+fn type_args(ty: &Type) -> Vec<&Type> {
+    let Type::Path(p) = ty else { return Vec::new() };
+    let Some(last) = p.path.segments.last() else {
+        return Vec::new();
+    };
+    let syn::PathArguments::AngleBracketed(args) = &last.arguments else {
+        return Vec::new();
+    };
+    args.args
+        .iter()
+        .filter_map(|a| match a {
+            syn::GenericArgument::Type(t) => Some(t),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Erased descriptors (deduped by stripped path) plus one instantiation
+/// record per entry that carries type arguments.
+fn descs_and_instantiations(
+    types: &Option<Vec<Type>>,
+    script_trait: TokenStream,
+    instantiations: &mut Vec<TokenStream>,
+) -> Vec<TokenStream> {
+    let mut seen = std::collections::HashSet::new();
+    let mut descs = Vec::new();
+    for ty in types.iter().flatten() {
+        if seen.insert(stripped_path_key(ty)) {
+            descs.push(quote_spanned! {ty.span()=> <#ty as ::haphe::#script_trait>::DESCRIPTOR });
+        }
+        let args = type_args(ty);
+        if !args.is_empty() {
+            instantiations.push(quote_spanned! {ty.span()=>
+                ::haphe::InstantiationDescriptor {
+                    id: <#ty as ::haphe::ScriptType>::ID,
+                    args: &[#( <#args as ::haphe::HapheType>::DESCRIPTOR ),*],
+                }
+            });
+        }
+    }
+    descs
+}
+
 pub fn expand(input: RegistryInput) -> TokenStream {
     let RegistryInput {
         attrs,
@@ -313,16 +372,9 @@ pub fn expand(input: RegistryInput) -> TokenStream {
         type_aliases,
         modules,
     } = &input;
-    let struct_descs: Vec<_> = structs
-        .iter()
-        .flatten()
-        .map(|ty| quote_spanned! {ty.span()=> <#ty as ::haphe::ScriptStruct>::DESCRIPTOR })
-        .collect();
-    let enum_descs: Vec<_> = enums
-        .iter()
-        .flatten()
-        .map(|ty| quote_spanned! {ty.span()=> <#ty as ::haphe::ScriptEnum>::DESCRIPTOR })
-        .collect();
+    let mut instantiations = Vec::new();
+    let struct_descs = descs_and_instantiations(structs, quote!(ScriptStruct), &mut instantiations);
+    let enum_descs = descs_and_instantiations(enums, quote!(ScriptEnum), &mut instantiations);
     let alias_descs: Vec<_> = type_aliases
         .iter()
         .flatten()
@@ -336,6 +388,7 @@ pub fn expand(input: RegistryInput) -> TokenStream {
             &[#(#enum_descs),*],
             &[#(#alias_descs),*],
             &[#(#module_descs),*],
+            &[#(#instantiations),*],
         );
     }
 }
