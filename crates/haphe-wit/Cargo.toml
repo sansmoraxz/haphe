@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 description = "WIT (WebAssembly Component Model) binding generator for haphe"
 license = "Apache-2.0"
+readme = "README.md"
 
 [features]
 # Host runtime binding via wasmtime (`WasmBinder`). Enables wasmtime with its
