@@ -12,6 +12,12 @@ pub enum LuaBindError {
         /// The raw string value that could not be parsed.
         value: String,
     },
+    /// A generic function instantiation was registered; Lua dispatches by
+    /// name only, so monomorphized instantiations cannot be told apart.
+    GenericFunction {
+        /// The function's exposed name.
+        name: &'static str,
+    },
 }
 
 impl std::fmt::Display for LuaBindError {
@@ -28,6 +34,13 @@ impl std::fmt::Display for LuaBindError {
                     "module `{module}`: constant `{name}` has unparseable value `{value}`"
                 )
             }
+            Self::GenericFunction { name } => {
+                write!(
+                    f,
+                    "generic function `{name}` is not supported by this backend: \
+                     Lua dispatches by name only and cannot distinguish instantiations"
+                )
+            }
         }
     }
 }
@@ -37,6 +50,7 @@ impl std::error::Error for LuaBindError {
         match self {
             Self::Lua(e) => Some(e),
             Self::InvalidConstant { .. } => None,
+            Self::GenericFunction { .. } => None,
         }
     }
 }

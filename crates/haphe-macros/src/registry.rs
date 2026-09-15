@@ -352,6 +352,7 @@ fn type_args(ty: &Type) -> Vec<&Type> {
 fn descs_and_instantiations(
     types: &Option<Vec<Type>>,
     script_trait: TokenStream,
+    id_expr: impl Fn(&Type) -> TokenStream,
     instantiations: &mut Vec<TokenStream>,
 ) -> Vec<TokenStream> {
     let mut seen = std::collections::HashSet::new();
@@ -362,9 +363,10 @@ fn descs_and_instantiations(
         }
         let args = type_args(ty);
         if !args.is_empty() {
+            let id = id_expr(ty);
             instantiations.push(quote_spanned! {ty.span()=>
                 ::haphe::InstantiationDescriptor {
-                    id: <#ty as ::haphe::ScriptType>::ID,
+                    id: #id,
                     args: &[#( <#args as ::haphe::HapheType>::DESCRIPTOR ),*],
                 }
             });
@@ -385,19 +387,31 @@ pub fn expand(input: RegistryInput) -> TokenStream {
         foreign,
     } = &input;
     let mut instantiations = Vec::new();
-    let struct_descs = descs_and_instantiations(structs, quote!(ScriptStruct), &mut instantiations);
-    let enum_descs = descs_and_instantiations(enums, quote!(ScriptEnum), &mut instantiations);
+    let script_type_id = |ty: &Type| quote_spanned! {ty.span()=> <#ty as ::haphe::ScriptType>::ID };
+    let struct_descs = descs_and_instantiations(
+        structs,
+        quote!(ScriptStruct),
+        script_type_id,
+        &mut instantiations,
+    );
+    let enum_descs = descs_and_instantiations(
+        enums,
+        quote!(ScriptEnum),
+        script_type_id,
+        &mut instantiations,
+    );
     let alias_descs: Vec<_> = type_aliases
         .iter()
         .flatten()
         .map(|ty| quote_spanned! {ty.span()=> <#ty as ::haphe::ScriptAlias>::DESCRIPTOR })
         .collect();
     let module_descs: Vec<_> = modules.iter().flatten().map(module_expr).collect();
-    let foreign_descs: Vec<_> = foreign
-        .iter()
-        .flatten()
-        .map(|ty| quote_spanned! {ty.span()=> <#ty as ::haphe::ScriptForeign>::DESCRIPTOR })
-        .collect();
+    let foreign_descs = descs_and_instantiations(
+        foreign,
+        quote!(ScriptForeign),
+        |ty| quote_spanned! {ty.span()=> <#ty as ::haphe::ScriptForeign>::DESCRIPTOR.id },
+        &mut instantiations,
+    );
     quote! {
         #(#attrs)*
         #vis static #name: ::haphe::TypeRegistry<'static> = ::haphe::TypeRegistry::new(

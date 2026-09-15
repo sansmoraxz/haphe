@@ -51,6 +51,8 @@ static EXPECTED_ADD: FunctionDescriptor<'static> = FunctionDescriptor {
     name: "add",
     doc: Some("Adds two numbers."),
     receiver: None,
+    generic_params: &[],
+    instantiations: &[],
     params: &[
         ParamDescriptor {
             name: "a",

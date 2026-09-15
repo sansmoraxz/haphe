@@ -1,5 +1,5 @@
 use crate::function::FunctionDescriptor;
-use crate::types::{ThreadSafety, TypeId};
+use crate::types::{GenericParam, ThreadSafety, TypeId};
 
 /// A group of host-supplied functions that Rust calls out to.
 ///
@@ -15,6 +15,11 @@ pub struct ForeignInterfaceDescriptor<'a> {
     pub name: &'a str,
     /// Optional documentation string.
     pub doc: Option<&'a str>,
+    /// Declared generic parameters; function signatures may reference them
+    /// via [`TypeDescriptor::GenericParam`](crate::TypeDescriptor). Backends
+    /// monomorphize per recorded
+    /// [`InstantiationDescriptor`](crate::InstantiationDescriptor).
+    pub generic_params: &'a [GenericParam<'a>],
     /// The host-supplied functions. Every entry has
     /// `receiver: Some(Receiver::Ref)`.
     pub functions: &'a [FunctionDescriptor<'a>],

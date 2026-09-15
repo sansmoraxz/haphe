@@ -45,6 +45,8 @@ static ADD_FN: FunctionDescriptor<'static> = FunctionDescriptor {
     name: "add",
     doc: Some("Adds two integers."),
     receiver: None,
+    generic_params: &[],
+    instantiations: &[],
     params: &[
         ParamDescriptor {
             name: "a",

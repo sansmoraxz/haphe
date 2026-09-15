@@ -46,6 +46,8 @@ static EXPECTED_ADD: FunctionDescriptor<'static> = FunctionDescriptor {
     name: "add",
     doc: None,
     receiver: Some(Receiver::Ref),
+    generic_params: &[],
+    instantiations: &[],
     params: &[
         ParamDescriptor {
             name: "a",
@@ -106,6 +108,7 @@ impl ForeignCaller for MockCaller {
     fn call(
         &self,
         function: &'static str,
+        _type_args: &[TypeDescriptor<'static>],
         args: &[ScriptValue],
     ) -> Result<ScriptValue, ForeignError> {
         self.calls
@@ -117,9 +120,10 @@ impl ForeignCaller for MockCaller {
     fn call_async<'a>(
         &'a self,
         function: &'static str,
+        type_args: &'a [TypeDescriptor<'static>],
         args: &'a [ScriptValue],
     ) -> Pin<Box<dyn Future<Output = Result<ScriptValue, ForeignError>> + 'a>> {
-        Box::pin(std::future::ready(self.call(function, args)))
+        Box::pin(std::future::ready(self.call(function, type_args, args)))
     }
 }
 
@@ -222,6 +226,7 @@ fn default_call_async_reports_async_unsupported() {
         fn call(
             &self,
             _function: &'static str,
+            _type_args: &[TypeDescriptor<'static>],
             _args: &[ScriptValue],
         ) -> Result<ScriptValue, ForeignError> {
             Ok(ScriptValue::Unit)

@@ -68,6 +68,8 @@ static EXPECTED_METHODS: &[FunctionDescriptor<'static>] = &[
         name: "distance_to",
         doc: None,
         receiver: Some(Receiver::Ref),
+        generic_params: &[],
+        instantiations: &[],
         params: &[ParamDescriptor {
             name: "other",
             ty: &POINT_REF,
@@ -82,6 +84,8 @@ static EXPECTED_METHODS: &[FunctionDescriptor<'static>] = &[
         name: "scaled",
         doc: None,
         receiver: Some(Receiver::Owned),
+        generic_params: &[],
+        instantiations: &[],
         params: &[ParamDescriptor {
             name: "factor",
             ty: &F64,
@@ -96,6 +100,8 @@ static EXPECTED_METHODS: &[FunctionDescriptor<'static>] = &[
         name: "fetch",
         doc: None,
         receiver: Some(Receiver::Ref),
+        generic_params: &[],
+        instantiations: &[],
         params: &[],
         return_type: &TypeDescriptor::Result(&TypeDescriptor::String, &TypeDescriptor::String),
         return_ownership: Ownership::Owned,
@@ -108,6 +114,8 @@ static EXPECTED_CONSTRUCTORS: &[FunctionDescriptor<'static>] = &[FunctionDescrip
     name: "new",
     doc: Some("Creates a point."),
     receiver: None,
+    generic_params: &[],
+    instantiations: &[],
     params: &[
         ParamDescriptor {
             name: "x",

@@ -1,5 +1,0 @@
-error: foreign traits cannot have generic parameters
- --> tests/ui/foreign_generic_trait.rs:4:12
-  |
-4 | trait Hooks<T> {
-  |            ^

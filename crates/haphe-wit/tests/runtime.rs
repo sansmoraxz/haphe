@@ -526,6 +526,8 @@ fn generic_instance_resource_links() {
         name: "get",
         doc: None,
         receiver: Some(haphe::Receiver::Ref),
+        generic_params: &[],
+        instantiations: &[],
         params: &[],
         return_type: &T_PARAM,
         return_ownership: haphe::Ownership::Owned,

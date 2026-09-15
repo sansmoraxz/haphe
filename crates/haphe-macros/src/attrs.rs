@@ -64,6 +64,9 @@ pub struct FnArgs {
     /// `setter` flag or `setter = "property_name"` override.
     pub setter: Option<(Option<LitStr>, Span)>,
     pub error_kind: Option<LitStr>,
+    /// Repeatable `instantiate(T, ...)` declarations for generic functions:
+    /// one entry per declared instantiation, listing its type arguments.
+    pub instantiate: Vec<(Vec<Type>, Span)>,
 }
 
 /// Arguments accepted on function parameters.
@@ -399,6 +402,7 @@ pub fn parse_fn_args(attrs: &[Attribute], errors: &mut Errors, site: &str) -> Fn
         "getter",
         "setter",
         "error_kind",
+        "instantiate",
     ];
     let mut args = FnArgs::default();
     let parse_errors = parse_script_attrs(
@@ -424,6 +428,20 @@ pub fn parse_fn_args(attrs: &[Attribute], errors: &mut Errors, site: &str) -> Fn
             } else if key == "error_kind" {
                 let value: LitStr = meta.value()?.parse()?;
                 set_once!(errors, args.error_kind, &key, value);
+            } else if key == "instantiate" {
+                let content;
+                syn::parenthesized!(content in meta.input);
+                let types = syn::punctuated::Punctuated::<Type, syn::Token![,]>::parse_terminated(
+                    &content,
+                )?;
+                if types.is_empty() {
+                    return Err(syn::Error::new(
+                        key.span(),
+                        "`instantiate(...)` lists at least one type argument",
+                    ));
+                }
+                args.instantiate
+                    .push((types.into_iter().collect(), key.span()));
             } else {
                 return Ok(false);
             }

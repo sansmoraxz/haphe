@@ -80,7 +80,7 @@ fn generic_param_exprs(input: &DeriveInput, ctx: &TyCtx, errors: &mut Errors) ->
 /// Renders a trait bound compactly, keeping only the whitespace that
 /// separates words (`for<'a> PartialEq<&'a str>` — not `for < 'a > ...` and
 /// not `for<'a>PartialEq<&'astr>`).
-fn stringify_bound(tokens: TokenStream) -> String {
+pub(crate) fn stringify_bound(tokens: TokenStream) -> String {
     let raw = tokens.to_string();
     let mut out = String::with_capacity(raw.len());
     let is_wordish = |c: char| c.is_alphanumeric() || c == '_' || c == '\'';

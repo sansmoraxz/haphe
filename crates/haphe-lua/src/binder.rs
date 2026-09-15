@@ -496,8 +496,14 @@ impl FnBinder for LuaFnBinder {
     fn function(
         &mut self,
         name: &'static str,
+        type_args: &'static [haphe::TypeDescriptor<'static>],
         f: fn(&[ScriptValue]) -> Result<ScriptValue, haphe::ScriptConvertError>,
     ) -> Result<(), Self::Error> {
+        // Lua dispatch is by name only; monomorphized instantiations of a
+        // generic function would silently shadow each other.
+        if !type_args.is_empty() {
+            return Err(LuaBindError::GenericFunction { name });
+        }
         self.functions.push((name, f));
         Ok(())
     }

@@ -58,6 +58,8 @@ fn module_stream_fn_rejected_without_capability() {
         name: "subscribe",
         doc: None,
         receiver: None,
+        generic_params: &[],
+        instantiations: &[],
         params: &[ParamDescriptor {
             name: "topic",
             ty: &TypeDescriptor::String,

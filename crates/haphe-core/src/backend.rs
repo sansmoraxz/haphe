@@ -157,6 +157,8 @@ impl BackendCapabilities {
         for s in registry.structs() {
             check_fns_async(s.id, s.methods, self.async_fns, &mut errors);
             check_fns_async(s.id, s.constructors, self.async_fns, &mut errors);
+            check_fns_generics(s.id, s.methods, self.generics, &mut errors);
+            check_fns_generics(s.id, s.constructors, self.generics, &mut errors);
             if !self.callbacks {
                 check_fns_callbacks(s.id, s.methods, &mut errors);
                 check_fns_callbacks(s.id, s.constructors, &mut errors);
@@ -240,6 +242,7 @@ impl BackendCapabilities {
 
         for e in registry.enums() {
             check_fns_async(e.id, e.methods, self.async_fns, &mut errors);
+            check_fns_generics(e.id, e.methods, self.generics, &mut errors);
             if !self.callbacks {
                 check_fns_callbacks(e.id, e.methods, &mut errors);
             }
@@ -304,6 +307,14 @@ impl BackendCapabilities {
             if !self.futures {
                 check_fns_futures(fi.id, fi.functions, &mut errors);
             }
+            if !fi.generic_params.is_empty() {
+                if !self.generics {
+                    errors.push(CompatibilityError::UnsupportedGenerics { type_id: fi.id });
+                } else if !registry.instantiations().iter().any(|i| i.id == fi.id) {
+                    errors.push(CompatibilityError::UninstantiatedGeneric { type_id: fi.id });
+                }
+            }
+            check_fns_generics(fi.id, fi.functions, self.generics, &mut errors);
             if let Some(required) = self.required_thread_safety
                 && !meets_thread_safety(&fi.thread_safety, &required)
             {
@@ -337,6 +348,19 @@ impl BackendCapabilities {
                     module: module.name,
                     fn_name: function.name,
                 });
+            }
+            if !function.generic_params.is_empty() {
+                if !self.generics {
+                    errors.push(CompatibilityError::UnsupportedModuleGenerics {
+                        module: module.name,
+                        fn_name: function.name,
+                    });
+                } else if function.instantiations.is_empty() {
+                    errors.push(CompatibilityError::UninstantiatedModuleGeneric {
+                        module: module.name,
+                        fn_name: function.name,
+                    });
+                }
             }
             if !self.callbacks {
                 let has_callback = function.params.iter().any(|p| contains_callback(p.ty))
@@ -420,6 +444,24 @@ fn check_fns_async<'a>(
                 type_id,
                 fn_name: f.name,
             });
+        }
+    }
+}
+
+fn check_fns_generics<'a>(
+    type_id: TypeId<'a>,
+    fns: &[crate::function::FunctionDescriptor<'a>],
+    supports_generics: bool,
+    errors: &mut Vec<CompatibilityError<'a>>,
+) {
+    for f in fns {
+        if f.generic_params.is_empty() {
+            continue;
+        }
+        if !supports_generics {
+            errors.push(CompatibilityError::UnsupportedGenerics { type_id });
+        } else if f.instantiations.is_empty() {
+            errors.push(CompatibilityError::UninstantiatedGeneric { type_id });
         }
     }
 }
@@ -611,10 +653,12 @@ pub enum CompatibilityError<'a> {
     /// A future type in a module function or constant in a backend that
     /// doesn't support futures.
     UnsupportedModuleFuture { module: &'a str, context: &'a str },
-    /// A generic type in a backend that doesn't support generics.
+    /// A generic type or foreign interface in a backend that doesn't support
+    /// generics.
     UnsupportedGenerics { type_id: TypeId<'a> },
-    /// A generic type with no recorded instantiation, in a backend that
-    /// supports generics via monomorphization — there is nothing to emit.
+    /// A generic type or foreign interface with no recorded instantiation, in
+    /// a backend that supports generics via monomorphization — there is
+    /// nothing to emit.
     UninstantiatedGeneric { type_id: TypeId<'a> },
     /// A computed property in a backend that doesn't support properties.
     UnsupportedProperties { type_id: TypeId<'a> },
@@ -631,6 +675,11 @@ pub enum CompatibilityError<'a> {
     },
     /// An async module function in a backend that doesn't support async.
     UnsupportedModuleAsync { module: &'a str, fn_name: &'a str },
+    /// A generic module function in a backend that doesn't support generics.
+    UnsupportedModuleGenerics { module: &'a str, fn_name: &'a str },
+    /// A generic module function with no recorded instantiation, in a backend
+    /// that supports generics via monomorphization — there is nothing to emit.
+    UninstantiatedModuleGeneric { module: &'a str, fn_name: &'a str },
     /// A callback type in a module function or constant in a backend that
     /// doesn't support callbacks.
     UnsupportedModuleCallback { module: &'a str, context: &'a str },
@@ -717,6 +766,18 @@ impl std::fmt::Display for CompatibilityError<'_> {
                 write!(
                     f,
                     "module `{module}`: async function `{fn_name}` is not supported by this backend"
+                )
+            }
+            Self::UnsupportedModuleGenerics { module, fn_name } => {
+                write!(
+                    f,
+                    "module `{module}`: generic function `{fn_name}` is not supported by this backend"
+                )
+            }
+            Self::UninstantiatedModuleGeneric { module, fn_name } => {
+                write!(
+                    f,
+                    "module `{module}`: generic function `{fn_name}` has no recorded instantiation; nothing to emit"
                 )
             }
             Self::UnsupportedModuleCallback { module, context } => {

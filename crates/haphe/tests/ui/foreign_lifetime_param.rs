@@ -1,8 +1,8 @@
 use haphe::script;
 
 #[script(foreign)]
-trait Hooks<T> {
-    fn get(&self) -> T;
+trait Hooks<'a> {
+    fn ping(&self);
 }
 
 fn main() {}

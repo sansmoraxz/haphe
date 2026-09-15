@@ -91,11 +91,47 @@ pub fn expand(mut item: ItemTrait) -> TokenStream {
     if let Some(token) = &item.modifiers.auto_token {
         errors.spanned(token.span(), "foreign traits cannot be `auto`");
     }
-    if !item.generics.params.is_empty() {
-        errors.spanned(
-            item.generics.span(),
-            "foreign traits cannot have generic parameters",
-        );
+    let mut generic_names: Vec<String> = Vec::new();
+    let mut gp_exprs: Vec<TokenStream> = Vec::new();
+    for param in &item.generics.params {
+        match param {
+            syn::GenericParam::Type(tp) => {
+                if tp.default.is_some() {
+                    errors.spanned(
+                        tp.span(),
+                        "type parameter defaults are not supported on foreign traits",
+                    );
+                }
+                let name = tp.ident.to_string();
+                let bounds: Vec<String> = tp
+                    .bounds
+                    .iter()
+                    .filter_map(|b| match b {
+                        syn::TypeParamBound::Trait(t) => {
+                            Some(crate::derive::stringify_bound(quote!(#t)))
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                gp_exprs.push(quote! {
+                    ::haphe::GenericParam {
+                        name: #name,
+                        bounds: &[#(#bounds),*],
+                        default: ::core::option::Option::None,
+                    }
+                });
+                generic_names.push(name);
+            }
+            syn::GenericParam::Lifetime(lt) => {
+                errors.spanned(lt.span(), "foreign traits cannot have lifetime parameters");
+            }
+            syn::GenericParam::Const(cp) => {
+                errors.spanned(
+                    cp.span(),
+                    "foreign traits cannot have const generic parameters",
+                );
+            }
+        }
     }
     if let Some(where_clause) = &item.generics.where_clause {
         errors.spanned(
@@ -110,7 +146,6 @@ pub fn expand(mut item: ItemTrait) -> TokenStream {
         );
     }
 
-    let ctx = TyCtx::default();
     let mut fn_descs = Vec::new();
     let mut impl_methods = Vec::new();
     let mut has_async = false;
@@ -143,15 +178,23 @@ pub fn expand(mut item: ItemTrait) -> TokenStream {
                 "foreign methods cannot have default bodies — the host supplies the implementation",
             );
         }
+        let mut method_type_params: Vec<syn::Ident> = Vec::new();
         for param in &m.sig.generics.params {
-            if matches!(
-                param,
-                syn::GenericParam::Type(_) | syn::GenericParam::Lifetime(_)
-            ) {
-                errors.spanned(
-                    param.span(),
-                    "foreign methods cannot have generic parameters",
-                );
+            match param {
+                syn::GenericParam::Type(tp) => {
+                    if tp.default.is_some() {
+                        errors.spanned(
+                            tp.span(),
+                            "type parameter defaults are not supported on foreign methods",
+                        );
+                    }
+                    method_type_params.push(tp.ident.clone());
+                }
+                syn::GenericParam::Lifetime(lt) => {
+                    errors.spanned(lt.span(), "foreign methods cannot have lifetime parameters");
+                }
+                // Const generics are rejected by `build_fn_info`.
+                syn::GenericParam::Const(_) => {}
             }
         }
         for input in &m.sig.inputs {
@@ -200,6 +243,13 @@ pub fn expand(mut item: ItemTrait) -> TokenStream {
             let ok_ty = return_ty.clone().expect("Result always has an Ok type");
             desc_sig.output = syn::parse_quote! { -> #ok_ty };
         }
+        // Each method sees the trait's parameters plus its own.
+        let mut declared_names = generic_names.clone();
+        declared_names.extend(method_type_params.iter().map(|p| p.to_string()));
+        let ctx = TyCtx {
+            generic_params: &declared_names,
+            self_ty: None,
+        };
         // Strips parameter attrs even on error paths (on the clone; the
         // re-emitted trait method is stripped below).
         let info = build_fn_info(&mut desc_sig, &fn_args, &m.attrs, &ctx, &mut errors);
@@ -213,6 +263,24 @@ pub fn expand(mut item: ItemTrait) -> TokenStream {
         }
         if info.is_async {
             has_async = true;
+        }
+
+        // Dispatch needs to describe and convert method-level type arguments,
+        // so the re-emitted trait carries the bounds the handle requires.
+        if !method_type_params.is_empty() {
+            for param in &mut m.sig.generics.params {
+                if let syn::GenericParam::Type(tp) = param {
+                    tp.bounds.push(syn::parse_quote!(::haphe::HapheType));
+                    tp.bounds.push(syn::parse_quote!(::haphe::FromScript));
+                }
+            }
+            for p in &method_type_params {
+                m.sig
+                    .generics
+                    .make_where_clause()
+                    .predicates
+                    .push(syn::parse_quote! { ::haphe::ScriptValue: ::core::convert::From<#p> });
+            }
         }
 
         let name = &info.name;
@@ -232,10 +300,15 @@ pub fn expand(mut item: ItemTrait) -> TokenStream {
             })
             .collect();
 
+        let type_arg_count = method_type_params.len();
+        let type_args_decl = quote! {
+            let __type_args: [::haphe::TypeDescriptor<'static>; #type_arg_count] =
+                [#( <#method_type_params as ::haphe::HapheType>::DESCRIPTOR ),*];
+        };
         let call = if info.is_async {
-            quote! { self.0.call_async(#name, &__args).await }
+            quote! { self.0.call_async(#name, &__type_args, &__args).await }
         } else {
-            quote! { self.0.call(#name, &__args) }
+            quote! { self.0.call(#name, &__type_args, &__args) }
         };
         let return_ty_tokens = match &return_ty {
             Some(ty) => quote! { #ty },
@@ -244,6 +317,7 @@ pub fn expand(mut item: ItemTrait) -> TokenStream {
         let body = match &err_ty {
             Some(err_ty) => quote_spanned! {err_ty.span()=>
                 {
+                    #type_args_decl
                     let __args = [#(#arg_exprs),*];
                     match #call {
                         ::core::result::Result::Ok(__v) => {
@@ -267,6 +341,7 @@ pub fn expand(mut item: ItemTrait) -> TokenStream {
             },
             None => quote! {
                 {
+                    #type_args_decl
                     let __args = [#(#arg_exprs),*];
                     match #call {
                         ::core::result::Result::Ok(__v) => {
@@ -319,15 +394,78 @@ pub fn expand(mut item: ItemTrait) -> TokenStream {
     // the only implementor the macro contract requires.
     let allow_async = has_async.then(|| quote! { #[allow(async_fn_in_trait)] });
 
+    let has_params = !generic_names.is_empty();
+    let generics = &item.generics;
+    let (impl_g, ty_g, where_c) = item.generics.split_for_impl();
+    let type_params: Vec<_> = item
+        .generics
+        .type_params()
+        .map(|p| p.ident.clone())
+        .collect();
+
+    let struct_def = if has_params {
+        quote! {
+            #[doc = #handle_doc]
+            #vis struct #handle_ident #generics (
+                ::std::boxed::Box<dyn ::haphe::ForeignCaller>,
+                ::core::marker::PhantomData<(#(#type_params,)*)>,
+            );
+        }
+    } else {
+        quote! {
+            #[doc = #handle_doc]
+            #vis struct #handle_ident(::std::boxed::Box<dyn ::haphe::ForeignCaller>);
+        }
+    };
+    let construct = if has_params {
+        quote! { Self(caller, ::core::marker::PhantomData) }
+    } else {
+        quote! { Self(caller) }
+    };
+
+    // Dispatch bounds live on the trait impl only, so the erased DESCRIPTOR
+    // and `from_caller` stay unconstrained.
+    let mut dispatch_generics = item.generics.clone();
+    for param in &type_params {
+        dispatch_generics
+            .make_where_clause()
+            .predicates
+            .push(syn::parse_quote! { ::haphe::ScriptValue: ::core::convert::From<#param> });
+        dispatch_generics
+            .make_where_clause()
+            .predicates
+            .push(syn::parse_quote! { #param: ::haphe::FromScript });
+    }
+    let (dis_impl_g, _, dis_where_c) = dispatch_generics.split_for_impl();
+
+    // The erased DESCRIPTOR needs no bounds, but TYPE_ARGS describes the
+    // handle's concrete instantiation, so a generic handle's `ScriptForeign`
+    // impl requires each parameter to be describable.
+    let mut sf_generics = item.generics.clone();
+    for param in &type_params {
+        sf_generics
+            .make_where_clause()
+            .predicates
+            .push(syn::parse_quote! { #param: ::haphe::HapheType });
+    }
+    let (sf_impl_g, _, sf_where_c) = sf_generics.split_for_impl();
+    let type_args = if type_params.is_empty() {
+        TokenStream::new()
+    } else {
+        quote! {
+            const TYPE_ARGS: &'static [::haphe::TypeDescriptor<'static>] =
+                &[#( <#type_params as ::haphe::HapheType>::DESCRIPTOR ),*];
+        }
+    };
+
     quote! {
         #allow_async
         #item
 
-        #[doc = #handle_doc]
-        #vis struct #handle_ident(::std::boxed::Box<dyn ::haphe::ForeignCaller>);
+        #struct_def
 
         #[automatically_derived]
-        impl ::haphe::ScriptForeign for #handle_ident {
+        impl #sf_impl_g ::haphe::ScriptForeign for #handle_ident #ty_g #sf_where_c {
             const DESCRIPTOR: ::haphe::ForeignInterfaceDescriptor<'static> =
                 ::haphe::ForeignInterfaceDescriptor {
                     id: ::haphe::TypeId::new(
@@ -335,20 +473,22 @@ pub fn expand(mut item: ItemTrait) -> TokenStream {
                     ),
                     name: #exposed_name,
                     doc: #doc,
+                    generic_params: &[#(#gp_exprs),*],
                     functions: &[#(#fn_descs),*],
                     thread_safety: ::haphe::ThreadSafety::NONE,
                 };
+            #type_args
         }
 
         #[automatically_derived]
-        impl ::haphe::ForeignHandle for #handle_ident {
+        impl #impl_g ::haphe::ForeignHandle for #handle_ident #ty_g #where_c {
             fn from_caller(caller: ::std::boxed::Box<dyn ::haphe::ForeignCaller>) -> Self {
-                Self(caller)
+                #construct
             }
         }
 
         #[automatically_derived]
-        impl #trait_ident for #handle_ident {
+        impl #dis_impl_g #trait_ident #ty_g for #handle_ident #ty_g #dis_where_c {
             #(#impl_methods)*
         }
     }

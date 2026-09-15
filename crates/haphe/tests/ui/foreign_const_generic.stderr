@@ -1,0 +1,5 @@
+error: foreign traits cannot have const generic parameters
+ --> tests/ui/foreign_const_generic.rs:4:13
+  |
+4 | trait Hooks<const N: usize> {
+  |             ^^^^^

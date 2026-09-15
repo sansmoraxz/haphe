@@ -34,6 +34,8 @@ const fn module_fn(
         name,
         doc: None,
         receiver: None,
+        generic_params: &[],
+        instantiations: &[],
         params: &[],
         return_type: ty,
         return_ownership: Ownership::Owned,

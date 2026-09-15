@@ -108,6 +108,12 @@ pub fn expand(mut item: ItemImpl) -> TokenStream {
         };
         let fn_args = parse_fn_args(&func.attrs, &mut errors, "an impl-block function");
         strip_script_attrs(&mut func.attrs);
+        if let Some((_, span)) = fn_args.instantiate.first() {
+            errors.spanned(
+                *span,
+                "`instantiate` is not supported on impl-block functions",
+            );
+        }
         if fn_args.skip.is_some() {
             strip_param_script_attrs(&mut func.sig);
             continue;

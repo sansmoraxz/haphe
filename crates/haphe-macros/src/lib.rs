@@ -114,6 +114,23 @@ pub fn derive_script(input: TokenStream) -> TokenStream {
 /// On a free function, the same options are given on the attribute itself
 /// (e.g. `#[script(rename = "name")]`).
 ///
+/// # Generic functions
+///
+/// A generic free function declares each concrete use with a repeatable
+/// `instantiate(...)` option; the descriptor records the parameters and
+/// instantiations, and binding registers one monomorphized wrapper per
+/// instantiation (each identified by its type arguments):
+///
+/// ```
+/// use haphe::script;
+///
+/// #[script(instantiate(i64), instantiate(String))]
+/// fn echo<T>(value: T) -> T { value }
+/// ```
+///
+/// Whether a backend accepts generic functions is governed by its generics
+/// capability.
+///
 /// # Foreign traits
 ///
 /// `#[script(foreign)]` on a trait declares functions Rust calls *out* to,
@@ -133,6 +150,19 @@ pub fn derive_script(input: TokenStream) -> TokenStream {
 /// surfaces host failures through `E: From<ForeignError>` and is described
 /// to the host as returning `T`; a non-`Result` method panics if the host
 /// call fails.
+///
+/// Traits may declare type parameters (`trait Store<T>`); signatures
+/// reference them and the descriptor stays erased. Each concrete use is
+/// listed in [`registry!`] (`foreign: [StoreHandle<i32>]`), recorded as an
+/// instantiation for backends that monomorphize, and gated by the backend's
+/// generics capability.
+///
+/// Methods may also declare their own type parameters, with concrete uses
+/// listed via `instantiate(...)` on the method. Dispatch passes the type
+/// arguments' descriptors alongside the call, and the emitted trait method
+/// gains the bounds the handle needs (`HapheType + FromScript`, plus
+/// `ScriptValue: From<T>`). Lifetimes, const generics, and parameter
+/// defaults are not supported.
 ///
 /// ```
 /// use haphe::{ForeignHandle, ScriptForeign, script};

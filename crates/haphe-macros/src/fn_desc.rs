@@ -204,6 +204,56 @@ pub fn build_fn_info(
         }
     };
 
+    // The function's own generic parameters and their declared instantiations.
+    let mut gp_exprs = Vec::new();
+    let mut fn_type_param_count = 0usize;
+    for param in &sig.generics.params {
+        let syn::GenericParam::Type(tp) = param else {
+            continue;
+        };
+        fn_type_param_count += 1;
+        let name = tp.ident.to_string();
+        let bounds: Vec<String> = tp
+            .bounds
+            .iter()
+            .filter_map(|b| match b {
+                syn::TypeParamBound::Trait(t) => Some(crate::derive::stringify_bound(quote!(#t))),
+                _ => None,
+            })
+            .collect();
+        gp_exprs.push(quote! {
+            ::haphe::GenericParam {
+                name: #name,
+                bounds: &[#(#bounds),*],
+                default: ::core::option::Option::None,
+            }
+        });
+    }
+    let mut inst_exprs = Vec::new();
+    for (types, span) in &fn_args.instantiate {
+        if fn_type_param_count == 0 {
+            errors.spanned(
+                *span,
+                "`instantiate(...)` applies to functions with generic parameters",
+            );
+            continue;
+        }
+        if types.len() != fn_type_param_count {
+            errors.spanned(
+                *span,
+                format!(
+                    "`instantiate(...)` lists {} type argument(s), but the function declares {} generic parameter(s)",
+                    types.len(),
+                    fn_type_param_count
+                ),
+            );
+            continue;
+        }
+        inst_exprs.push(quote_spanned! {*span=>
+            &[#( <#types as ::haphe::HapheType>::DESCRIPTOR ),*] as &[::haphe::TypeDescriptor<'static>]
+        });
+    }
+
     let name = fn_args
         .rename
         .as_ref()
@@ -223,6 +273,8 @@ pub fn build_fn_info(
             name: #name,
             doc: #doc_tokens,
             receiver: #receiver_tokens,
+            generic_params: &[#(#gp_exprs),*],
+            instantiations: &[#(#inst_exprs),*],
             params: &[#(#param_exprs),*],
             return_type: #return_expr,
             return_ownership: #return_ownership,

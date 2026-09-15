@@ -32,7 +32,7 @@ pub enum RegistryError<'a> {
     /// exposed name.
     DuplicateModuleEntry { module: &'a str, name: &'a str },
     /// An [`InstantiationDescriptor`] targets a [`TypeId`] that is not a
-    /// registered generic struct or enum.
+    /// registered generic struct, enum, or foreign interface.
     DanglingInstantiation { to: TypeId<'a> },
     /// A flags enum ([`EnumDescriptor::is_flags`]) has a non-unit variant;
     /// bitflags cases cannot carry payloads.
@@ -48,6 +48,28 @@ pub enum RegistryError<'a> {
     /// [`TypeDescriptor::GenericParam`]; instantiations must be concrete.
     NonConcreteInstantiation {
         target: TypeId<'a>,
+        param_name: &'a str,
+    },
+    /// A function that declares no generic parameters records
+    /// [`instantiations`](crate::FunctionDescriptor::instantiations).
+    InstantiationOnNonGenericFunction { function: &'a str },
+    /// A function instantiation's argument count does not match the
+    /// function's declared generic parameters.
+    FunctionInstantiationArityMismatch {
+        function: &'a str,
+        expected: usize,
+        found: usize,
+    },
+    /// A function instantiation argument contains a
+    /// [`TypeDescriptor::GenericParam`]; instantiations must be concrete.
+    NonConcreteFunctionInstantiation {
+        function: &'a str,
+        param_name: &'a str,
+    },
+    /// A module function references a generic parameter name not declared on
+    /// the function.
+    UndeclaredModuleGenericParam {
+        module: &'a str,
         param_name: &'a str,
     },
 }
@@ -95,6 +117,29 @@ impl std::fmt::Display for RegistryError<'_> {
             Self::NonConcreteInstantiation { target, param_name } => write!(
                 f,
                 "instantiation of {target} contains generic parameter `{param_name}`; instantiations must be concrete"
+            ),
+            Self::InstantiationOnNonGenericFunction { function } => write!(
+                f,
+                "function `{function}` records instantiations but declares no generic parameters"
+            ),
+            Self::FunctionInstantiationArityMismatch {
+                function,
+                expected,
+                found,
+            } => write!(
+                f,
+                "instantiation of function `{function}` has {found} type argument(s), expected {expected}"
+            ),
+            Self::NonConcreteFunctionInstantiation {
+                function,
+                param_name,
+            } => write!(
+                f,
+                "instantiation of function `{function}` contains generic parameter `{param_name}`; instantiations must be concrete"
+            ),
+            Self::UndeclaredModuleGenericParam { module, param_name } => write!(
+                f,
+                "module `{module}` has a function using undeclared generic parameter `{param_name}`"
             ),
         }
     }
@@ -263,9 +308,20 @@ impl<'a> TypeRegistry<'a> {
         }
 
         for f in self.foreign_interfaces {
+            let generic_names: HashSet<&str> = f.generic_params.iter().map(|g| g.name).collect();
             collect_dangling_refs_in_methods(f.id, f.functions, &known, &mut errors);
-            collect_undeclared_generics_in_methods(f.id, f.functions, &HashSet::new(), &mut errors);
+            collect_undeclared_generics_in_methods(f.id, f.functions, &generic_names, &mut errors);
             collect_duplicate_members(f.id, f.functions.iter().map(|m| m.name), &mut errors);
+            validate_fn_instantiations(f.functions, &mut errors);
+            for gp in f
+                .generic_params
+                .iter()
+                .chain(f.functions.iter().flat_map(|m| m.generic_params))
+            {
+                if let Some(default) = gp.default {
+                    collect_dangling_refs(f.id, default, &known, &mut errors);
+                }
+            }
         }
 
         for s in self.structs {
@@ -277,6 +333,7 @@ impl<'a> TypeRegistry<'a> {
             }
             collect_dangling_refs_in_methods(s.id, s.methods, &known, &mut errors);
             collect_undeclared_generics_in_methods(s.id, s.methods, &generic_names, &mut errors);
+            validate_fn_instantiations(s.methods, &mut errors);
             collect_dangling_refs_in_methods(s.id, s.constructors, &known, &mut errors);
             collect_undeclared_generics_in_methods(
                 s.id,
@@ -284,6 +341,7 @@ impl<'a> TypeRegistry<'a> {
                 &generic_names,
                 &mut errors,
             );
+            validate_fn_instantiations(s.constructors, &mut errors);
             for prop in s.properties {
                 collect_dangling_refs(s.id, prop.ty, &known, &mut errors);
                 collect_undeclared_generics(s.id, prop.ty, &generic_names, &mut errors);
@@ -339,6 +397,7 @@ impl<'a> TypeRegistry<'a> {
             }
             collect_dangling_refs_in_methods(e.id, e.methods, &known, &mut errors);
             collect_undeclared_generics_in_methods(e.id, e.methods, &generic_names, &mut errors);
+            validate_fn_instantiations(e.methods, &mut errors);
             collect_dangling_refs_in_trait_impls(e.id, e.trait_impls, &known, &mut errors);
             for gp in e.generic_params {
                 if let Some(default) = gp.default {
@@ -363,10 +422,12 @@ impl<'a> TypeRegistry<'a> {
             let generic_params = match (
                 self.structs.iter().find(|s| s.id == inst.id),
                 self.enums.iter().find(|e| e.id == inst.id),
+                self.foreign_interfaces.iter().find(|f| f.id == inst.id),
             ) {
-                (Some(s), _) => s.generic_params,
-                (_, Some(e)) => e.generic_params,
-                (None, None) => {
+                (Some(s), ..) => s.generic_params,
+                (_, Some(e), _) => e.generic_params,
+                (.., Some(f)) => f.generic_params,
+                (None, None, None) => {
                     errors.push(RegistryError::DanglingInstantiation { to: inst.id });
                     continue;
                 }
@@ -463,11 +524,30 @@ fn validate_module<'a>(
         });
     };
     for function in module.functions {
+        let declared: HashSet<&str> = function.generic_params.iter().map(|g| g.name).collect();
+        let check_declared = |ty: &TypeDescriptor<'a>, errors: &mut Vec<RegistryError<'a>>| {
+            walk_generic_params(ty, &mut |name| {
+                if !declared.contains(name) {
+                    errors.push(RegistryError::UndeclaredModuleGenericParam {
+                        module: module.name,
+                        param_name: name,
+                    });
+                }
+            });
+        };
         for param in function.params {
             collect(param.ty, errors);
+            check_declared(param.ty, errors);
         }
         collect(function.return_type, errors);
+        check_declared(function.return_type, errors);
+        for inst in function.instantiations {
+            for arg in *inst {
+                collect(arg, errors);
+            }
+        }
     }
+    validate_fn_instantiations(module.functions, errors);
     for constant in module.constants {
         collect(constant.ty, errors);
     }
@@ -551,6 +631,11 @@ fn collect_dangling_refs_in_methods<'a>(
             collect_dangling_refs(owner, param.ty, known, errors);
         }
         collect_dangling_refs(owner, method.return_type, known, errors);
+        for inst in method.instantiations {
+            for arg in *inst {
+                collect_dangling_refs(owner, arg, known, errors);
+            }
+        }
     }
 }
 
@@ -561,10 +646,48 @@ fn collect_undeclared_generics_in_methods<'a>(
     errors: &mut Vec<RegistryError<'a>>,
 ) {
     for method in methods {
+        // A function sees the owner's parameters plus its own.
+        let mut declared = declared.clone();
+        declared.extend(method.generic_params.iter().map(|g| g.name));
         for param in method.params {
-            collect_undeclared_generics(owner, param.ty, declared, errors);
+            collect_undeclared_generics(owner, param.ty, &declared, errors);
         }
-        collect_undeclared_generics(owner, method.return_type, declared, errors);
+        collect_undeclared_generics(owner, method.return_type, &declared, errors);
+    }
+}
+
+/// Checks that instantiations appear only on generic functions, with the
+/// declared arity, and carry only concrete type arguments.
+fn validate_fn_instantiations<'a>(
+    fns: &'a [FunctionDescriptor<'a>],
+    errors: &mut Vec<RegistryError<'a>>,
+) {
+    for function in fns {
+        if function.generic_params.is_empty() {
+            if !function.instantiations.is_empty() {
+                errors.push(RegistryError::InstantiationOnNonGenericFunction {
+                    function: function.name,
+                });
+            }
+            continue;
+        }
+        for inst in function.instantiations {
+            if inst.len() != function.generic_params.len() {
+                errors.push(RegistryError::FunctionInstantiationArityMismatch {
+                    function: function.name,
+                    expected: function.generic_params.len(),
+                    found: inst.len(),
+                });
+            }
+            for arg in *inst {
+                walk_generic_params(arg, &mut |name| {
+                    errors.push(RegistryError::NonConcreteFunctionInstantiation {
+                        function: function.name,
+                        param_name: name,
+                    });
+                });
+            }
+        }
     }
 }
 

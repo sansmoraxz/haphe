@@ -5,7 +5,7 @@
 //! descriptor through any path that names the function.
 
 use proc_macro2::TokenStream;
-use quote::quote;
+use quote::{quote, quote_spanned};
 use syn::spanned::Spanned;
 use syn::{FnArg, ItemFn, Pat, Type};
 
@@ -126,81 +126,119 @@ pub fn expand(mut item: ItemFn) -> TokenStream {
 
     // Generate a wrapper that converts ScriptValue args to concrete types
     // and the result back to ScriptValue. Each param uses FromScript, the
-    // return uses IntoScript — both with concrete types, no unsafe.
-    let param_conversions: Vec<TokenStream> = param_info
-        .iter()
-        .enumerate()
-        .map(|(i, (name, ty))| {
-            quote! {
-                let #name = <#ty as ::haphe::FromScript>::from_script(
-                    __args.get(#i).cloned().unwrap_or(::haphe::ScriptValue::Unit)
-                ).map_err(|__e| ::haphe::ScriptConvertError {
-                    expected: stringify!(#ty),
-                    got: __e.got,
-                })?;
-            }
-        })
-        .collect();
-
-    let return_conversion = if info.return_ty.is_some() {
-        quote! { ::haphe::IntoScript::into_script(#fn_ident(#(#call_args),*)) }
-    } else {
-        quote! { { #fn_ident(#(#call_args),*); ::haphe::ScriptValue::Unit } }
-    };
-
-    let has_type_params = !fn_generic_names.is_empty();
-    let type_params: Vec<_> = item
+    // return uses IntoScript — both with concrete types, no unsafe. For a
+    // generic function, one wrapper is generated per `instantiate(...)`
+    // declaration with the type parameters substituted.
+    let type_params: Vec<syn::Ident> = item
         .sig
         .generics
         .params
         .iter()
         .filter_map(|p| match p {
-            syn::GenericParam::Type(tp) => Some(&tp.ident),
+            syn::GenericParam::Type(tp) => Some(tp.ident.clone()),
             _ => None,
         })
         .collect();
+    let has_type_params = !type_params.is_empty();
 
-    // Build a generics set with only type params (no lifetimes) for the
-    // hidden struct + trait impls. The function itself keeps its lifetimes.
-    let struct_generics = {
-        let mut g = item.sig.generics.clone();
-        g.params = g
-            .params
-            .into_iter()
-            .filter(|p| matches!(p, syn::GenericParam::Type(_)))
+    let make_wrapper = |subst: &std::collections::HashMap<String, Type>| -> TokenStream {
+        let conversions: Vec<TokenStream> = param_info
+            .iter()
+            .enumerate()
+            .map(|(i, (name, ty))| {
+                let ty = substitute_type_params(ty, subst);
+                quote! {
+                    let #name = <#ty as ::haphe::FromScript>::from_script(
+                        __args.get(#i).cloned().unwrap_or(::haphe::ScriptValue::Unit)
+                    ).map_err(|__e| ::haphe::ScriptConvertError {
+                        expected: stringify!(#ty),
+                        got: __e.got,
+                    })?;
+                }
+            })
             .collect();
-        g
+        let turbofish = if subst.is_empty() {
+            TokenStream::new()
+        } else {
+            let args: Vec<&Type> = type_params
+                .iter()
+                .map(|p| subst.get(&p.to_string()).expect("all params substituted"))
+                .collect();
+            quote! { ::<#(#args),*> }
+        };
+        let return_conversion = if info.return_ty.is_some() {
+            quote! { ::haphe::IntoScript::into_script(#fn_ident #turbofish (#(#call_args),*)) }
+        } else {
+            quote! { { #fn_ident #turbofish (#(#call_args),*); ::haphe::ScriptValue::Unit } }
+        };
+        quote! {
+            |__args: &[::haphe::ScriptValue]| -> ::core::result::Result<::haphe::ScriptValue, ::haphe::ScriptConvertError> {
+                #(#conversions)*
+                ::core::result::Result::Ok(#return_conversion)
+            }
+        }
     };
-    let (impl_g, ty_g, where_c) = struct_generics.split_for_impl();
 
-    let all_params_compatible = !has_type_params
-        && item.sig.inputs.iter().all(|input| {
-            let FnArg::Typed(pat_ty) = input else {
-                return true;
-            };
-            crate::bind::is_bridge_compatible_type(&pat_ty.ty)
-        });
-    let return_compatible = !has_type_params
-        && info.return_ty.as_ref().is_none_or(|t| {
-            !matches!(t, Type::Reference(_)) && crate::bind::is_bridge_compatible_type(t)
-        });
+    let compatible = |subst: &std::collections::HashMap<String, Type>| -> bool {
+        param_info.iter().all(|(_, ty)| {
+            crate::bind::is_bridge_compatible_type(&substitute_type_params(ty, subst))
+        }) && info.return_ty.as_ref().is_none_or(|t| {
+            let t = substitute_type_params(t, subst);
+            !matches!(t, Type::Reference(_)) && crate::bind::is_bridge_compatible_type(&t)
+        })
+    };
 
-    let can_bind = !info.is_async
-        && cfgs.is_empty()
-        && (has_type_params || (all_params_compatible && return_compatible));
+    let empty_subst = std::collections::HashMap::new();
+    let (can_bind, bind_body) = if has_type_params {
+        let substs: Vec<std::collections::HashMap<String, Type>> = fn_args
+            .instantiate
+            .iter()
+            .map(|(types, _)| {
+                type_params
+                    .iter()
+                    .map(|p| p.to_string())
+                    .zip(types.iter().cloned())
+                    .collect()
+            })
+            .collect();
+        let can = !info.is_async
+            && cfgs.is_empty()
+            && !substs.is_empty()
+            && substs.iter().all(&compatible);
+        let registrations: Vec<TokenStream> = fn_args
+            .instantiate
+            .iter()
+            .zip(&substs)
+            .map(|((types, span), subst)| {
+                let wrapper = make_wrapper(subst);
+                quote_spanned! {*span=>
+                    __binder.function(
+                        #exposed_name,
+                        &[#( <#types as ::haphe::HapheType>::DESCRIPTOR ),*],
+                        #wrapper,
+                    )?;
+                }
+            })
+            .collect();
+        (
+            can,
+            quote! { #(#registrations)* ::core::result::Result::Ok(()) },
+        )
+    } else {
+        let can = !info.is_async && cfgs.is_empty() && compatible(&empty_subst);
+        let wrapper = make_wrapper(&empty_subst);
+        (
+            can,
+            quote! { __binder.function(#exposed_name, &[], #wrapper) },
+        )
+    };
 
     let bind_fn = if can_bind {
         quote! {
             #[automatically_derived]
-            impl #impl_g ::haphe::ScriptBindFn for #ident #ty_g #where_c {
+            impl ::haphe::ScriptBindFn for #ident {
                 fn bind<__B: ::haphe::FnBinder>(__binder: &mut __B) -> ::core::result::Result<(), __B::Error> {
-                    __binder.function(
-                        #exposed_name,
-                        |__args: &[::haphe::ScriptValue]| -> ::core::result::Result<::haphe::ScriptValue, ::haphe::ScriptConvertError> {
-                            #(#param_conversions)*
-                            ::core::result::Result::Ok(#return_conversion)
-                        },
-                    )
+                    #bind_body
                 }
             }
         }
@@ -208,36 +246,42 @@ pub fn expand(mut item: ItemFn) -> TokenStream {
         TokenStream::new()
     };
 
-    let struct_def = if has_type_params {
-        quote! {
-            #(#cfgs)*
-            #[doc(hidden)]
-            #[allow(non_camel_case_types)]
-            #vis struct #ident #impl_g #where_c {
-                _marker: ::core::marker::PhantomData<(#(#type_params,)*)>,
-            }
-        }
-    } else {
-        quote! {
-            #(#cfgs)*
-            #[doc(hidden)]
-            #[allow(non_camel_case_types)]
-            #vis struct #ident {}
-        }
-    };
-
     quote! {
         #item
 
-        #struct_def
+        #(#cfgs)*
+        #[doc(hidden)]
+        #[allow(non_camel_case_types)]
+        #vis struct #ident {}
 
         #(#cfgs)*
         #[automatically_derived]
-        impl #impl_g ::haphe::ScriptFunction for #ident #ty_g #where_c {
+        impl ::haphe::ScriptFunction for #ident {
             const DESCRIPTOR: ::haphe::FunctionDescriptor<'static> = #descriptor;
         }
 
         #(#cfgs)*
         #bind_fn
     }
+}
+
+/// Replaces bare type-parameter paths (`T`, `Vec<T>`) with concrete types.
+fn substitute_type_params(ty: &Type, subst: &std::collections::HashMap<String, Type>) -> Type {
+    struct Replace<'a>(&'a std::collections::HashMap<String, Type>);
+    impl syn::visit_mut::VisitMut for Replace<'_> {
+        fn visit_type_mut(&mut self, ty: &mut Type) {
+            if let Type::Path(p) = ty
+                && p.qself.is_none()
+                && let Some(ident) = p.path.get_ident()
+                && let Some(concrete) = self.0.get(&ident.to_string())
+            {
+                *ty = concrete.clone();
+                return;
+            }
+            syn::visit_mut::visit_type_mut(self, ty);
+        }
+    }
+    let mut ty = ty.clone();
+    syn::visit_mut::VisitMut::visit_type_mut(&mut Replace(subst), &mut ty);
+    ty
 }

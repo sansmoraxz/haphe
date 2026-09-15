@@ -1,4 +1,4 @@
-use crate::types::TypeDescriptor;
+use crate::types::{GenericParam, TypeDescriptor};
 
 /// A Rust function or method exposed to scripting languages.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -9,6 +9,15 @@ pub struct FunctionDescriptor<'a> {
     pub doc: Option<&'a str>,
     /// If `Some`, this is a method with the given receiver type.
     pub receiver: Option<Receiver>,
+    /// Generic parameters declared on the function itself; the signature may
+    /// reference them via [`TypeDescriptor::GenericParam`], and each concrete
+    /// use is listed in [`instantiations`](Self::instantiations).
+    pub generic_params: &'a [GenericParam<'a>],
+    /// Concrete instantiations of [`generic_params`](Self::generic_params):
+    /// one entry per declared use, each carrying the type arguments in
+    /// declaration order. Backends monomorphize the function once per entry.
+    /// Empty for non-generic functions.
+    pub instantiations: &'a [&'a [TypeDescriptor<'a>]],
     /// Positional parameters (excluding `self`).
     pub params: &'a [ParamDescriptor<'a>],
     /// The return type of the function.

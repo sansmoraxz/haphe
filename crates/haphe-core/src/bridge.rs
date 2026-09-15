@@ -14,7 +14,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::types::TypeId;
+use crate::types::{TypeDescriptor, TypeId};
 
 // ---------------------------------------------------------------------------
 // Value conversion
@@ -444,9 +444,17 @@ pub trait FnBinder: Sized {
     /// Register a free function. The wrapper converts arguments from
     /// `ScriptValue` and returns the result as `ScriptValue` — the macro
     /// generates the conversion code with concrete types.
+    ///
+    /// A generic function registers once per declared instantiation:
+    /// `type_args` carries that instantiation's concrete type arguments (in
+    /// declaration order, matching an entry of the descriptor's
+    /// [`instantiations`](crate::FunctionDescriptor::instantiations)) and `f`
+    /// is the corresponding monomorphized wrapper. `type_args` is empty for
+    /// non-generic functions.
     fn function(
         &mut self,
         name: &'static str,
+        type_args: &'static [crate::types::TypeDescriptor<'static>],
         f: fn(&[ScriptValue]) -> Result<ScriptValue, ScriptConvertError>,
     ) -> Result<(), Self::Error>;
 }
@@ -464,14 +472,23 @@ pub struct BindTarget<'a> {
 
 /// Backend-provided dispatcher for host-supplied functions.
 ///
-/// One caller backs one foreign interface: it resolves `function` to the
-/// host's implementation, invokes it with the given arguments, and converts
-/// the result back to a [`ScriptValue`].
+/// One caller backs one foreign interface (one instantiation of it, for a
+/// generic interface): it resolves `function` to the host's implementation,
+/// invokes it with the given arguments, and converts the result back to a
+/// [`ScriptValue`].
+///
+/// `type_args` carries the concrete type arguments of a function-level
+/// generic call, in declaration order — empty for non-generic functions.
+/// Backends that monomorphize select the implementation by comparing them
+/// against the interface's recorded
+/// [`MethodInstantiation`](crate::MethodInstantiation)s; dynamic backends may
+/// ignore them.
 pub trait ForeignCaller {
     /// Invokes the named host function synchronously.
     fn call(
         &self,
         function: &'static str,
+        type_args: &[TypeDescriptor<'static>],
         args: &[ScriptValue],
     ) -> Result<ScriptValue, ForeignError>;
 
@@ -485,10 +502,11 @@ pub trait ForeignCaller {
     fn call_async<'a>(
         &'a self,
         function: &'static str,
+        type_args: &'a [TypeDescriptor<'static>],
         args: &'a [ScriptValue],
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<ScriptValue, ForeignError>> + 'a>>
     {
-        let _ = args;
+        let _ = (type_args, args);
         Box::pin(std::future::ready(Err(ForeignError {
             function,
             kind: ForeignErrorKind::AsyncUnsupported,

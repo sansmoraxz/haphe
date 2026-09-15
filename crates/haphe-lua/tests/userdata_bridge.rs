@@ -378,26 +378,18 @@ fn generic_struct_field_read() {
 // Generic free function tests
 // ---------------------------------------------------------------------------
 
-#[script]
-fn double<T: Clone + std::ops::Add<Output = T> + haphe::FromScript + haphe::IntoScript>(x: T) -> T
-where
-    haphe::ScriptValue: From<T>,
-{
+#[script(instantiate(i32))]
+fn double<T: Clone + std::ops::Add<Output = T>>(x: T) -> T {
     x.clone() + x
 }
 
-fn setup_generic_fn_lua() -> Lua {
-    let lua = Lua::new();
-    let globals = lua.globals();
-    let tbl = lua.create_table().unwrap();
-    bind_fn::<double<i32>>(&lua, &tbl).unwrap();
-    globals.set("funcs", tbl).unwrap();
-    lua
-}
-
+/// Lua dispatches by name only, so monomorphized instantiations of a generic
+/// function are rejected at bind time (generics as a Lua extension are a
+/// possible future feature).
 #[test]
-fn generic_free_fn_i32() {
-    let lua = setup_generic_fn_lua();
-    let result: i64 = lua.load("return funcs.double(21)").eval().unwrap();
-    assert_eq!(result, 42);
+fn generic_free_fn_is_rejected() {
+    let lua = Lua::new();
+    let tbl = lua.create_table().unwrap();
+    let err = bind_fn::<double>(&lua, &tbl).unwrap_err();
+    assert!(err.to_string().contains("generic function `double`"));
 }

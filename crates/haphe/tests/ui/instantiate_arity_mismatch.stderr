@@ -1,0 +1,5 @@
+error: `instantiate(...)` lists 2 type argument(s), but the function declares 1 generic parameter(s)
+ --> tests/ui/instantiate_arity_mismatch.rs:3:10
+  |
+3 | #[script(instantiate(i64, String))]
+  |          ^^^^^^^^^^^
