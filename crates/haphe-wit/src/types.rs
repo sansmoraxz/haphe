@@ -41,8 +41,12 @@ pub(crate) fn render_type(
             "option<{}>",
             render_type(inner, nested(pos), plan, env, context)?
         )),
-        TypeDescriptor::List(inner) | TypeDescriptor::Array(inner, _) => Ok(format!(
+        TypeDescriptor::List(inner) => Ok(format!(
             "list<{}>",
+            render_type(inner, nested(pos), plan, env, context)?
+        )),
+        TypeDescriptor::Array(inner, len) => Ok(format!(
+            "list<{}, {len}>",
             render_type(inner, nested(pos), plan, env, context)?
         )),
         TypeDescriptor::Map(k, v) => Ok(format!(

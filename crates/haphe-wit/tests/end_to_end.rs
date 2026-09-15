@@ -107,6 +107,12 @@ async fn fetch_data(url: String) -> String {
     url
 }
 
+/// Sums a fixed block of four samples.
+#[script]
+fn sum_block(samples: [u8; 4]) -> u32 {
+    samples.iter().map(|&s| s as u32).sum()
+}
+
 /// Parses a point from text.
 #[script]
 fn parse_point(text: String) -> Result<Point, String> {
@@ -128,7 +134,7 @@ haphe::registry! {
         modules: [
             mod geometry {
                 doc: "Geometry types and utilities",
-                functions: [add, mul, midpoint, parse_point, fetch_data],
+                functions: [add, mul, midpoint, parse_point, fetch_data, sum_block],
                 types: [Point, Color],
                 constants: [
                     /// The ratio of a circle's circumference to its diameter.
@@ -249,6 +255,11 @@ fn free_functions() {
         wit.contains("fetch-data: async func(url: string) -> string;"),
         "got:\n{wit}"
     );
+    // Fixed-size arrays map to WIT 0.3 fixed-length lists.
+    assert!(
+        wit.contains("sum-block: func(samples: list<u8, 4>) -> u32;"),
+        "got:\n{wit}"
+    );
 }
 
 #[test]
@@ -348,7 +359,7 @@ fn tag(l: Labeled<String, i32>) -> String {
 
 haphe::registry! {
     pub static GENERIC_REGISTRY = {
-        structs: [Labeled<String, i32>, Labeled<bool, u8>],
+        structs: [Labeled<String, i32>, Labeled<bool, u8>, Labeled<[u8; 4], bool>],
         modules: [
             mod tags {
                 doc: "Tagging",
@@ -370,6 +381,12 @@ fn generic_instantiations_are_monomorphized() {
     let wit = generate_generic();
     assert!(wit.contains("record labeled-string-s32 {"), "got:\n{wit}");
     assert!(wit.contains("record labeled-bool-u8 {"), "got:\n{wit}");
+    // Fixed-length list arguments mangle with their length (`list4-u8`).
+    assert!(
+        wit.contains("record labeled-list4-u8-bool {"),
+        "got:\n{wit}"
+    );
+    assert!(wit.contains("value: list<u8, 4>,"), "got:\n{wit}");
     // Substituted fields.
     assert!(wit.contains("value: string,"), "got:\n{wit}");
     assert!(wit.contains("extra: u8,"), "got:\n{wit}");

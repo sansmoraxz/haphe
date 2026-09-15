@@ -276,9 +276,8 @@ impl<'a> Plan<'a> {
             TypeDescriptor::Bytes => "bytes".into(),
             TypeDescriptor::Unit => "unit".into(),
             TypeDescriptor::Option(t) => format!("option-{}", self.mangle_type(t, env)?),
-            TypeDescriptor::List(t) | TypeDescriptor::Array(t, _) => {
-                format!("list-{}", self.mangle_type(t, env)?)
-            }
+            TypeDescriptor::List(t) => format!("list-{}", self.mangle_type(t, env)?),
+            TypeDescriptor::Array(t, n) => format!("list{n}-{}", self.mangle_type(t, env)?),
             TypeDescriptor::Map(k, v) => format!(
                 "map-{}-{}",
                 self.mangle_type(k, env)?,
