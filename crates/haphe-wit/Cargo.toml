@@ -6,16 +6,30 @@ description = "WIT (WebAssembly Component Model) binding generator for haphe"
 license = "Apache-2.0"
 
 [features]
+# Host runtime binding via wasmtime (`WasmBinder`). Enables wasmtime with its
+# default features (cranelift, async, cache, gc, wat, ...).
 runtime = ["dep:wasmtime"]
+
+# Individually selectable wasmtime extras (each implies `runtime`),
+
+# Additional compilation strategies
+winch = ["runtime", "wasmtime/winch"]
+pulley = ["runtime", "wasmtime/pulley"]
+all-arch = ["runtime", "wasmtime/all-arch"]
+
+# Caching
+incremental-cache = ["runtime", "wasmtime/incremental-cache"]
+
+# Instrumentation / interception
+call-hook = ["runtime", "wasmtime/call-hook"]
+memory-protection-keys = ["runtime", "wasmtime/memory-protection-keys"]
+wmemcheck = ["runtime", "wasmtime/wmemcheck"]
+trace-log = ["runtime", "wasmtime/trace-log"]
 
 [dependencies]
 haphe = { path = "../haphe", default-features = false }
 wit-parser = "0.259"
-wasmtime = { version = "48", optional = true, default-features = false, features = [
-    "runtime",
-    "component-model",
-    "cranelift",
-] }
+wasmtime = { version = "48", optional = true }
 
 [dev-dependencies]
 haphe = { path = "../haphe", features = ["macros"] }
