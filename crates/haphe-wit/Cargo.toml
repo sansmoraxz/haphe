@@ -32,7 +32,7 @@ wit-parser = "0.259"
 wasmtime = { version = "48", optional = true }
 
 [dev-dependencies]
-haphe = { path = "../haphe", features = ["macros"] }
+haphe = { path = "../haphe", features = ["macros", "streams", "futures"] }
 wat = "1"
 
 [[test]]

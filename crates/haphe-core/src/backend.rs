@@ -12,7 +12,7 @@ pub trait RuntimeBinder {
     /// The error type returned during binding.
     type Error: std::error::Error;
 
-    /// The name of the target scripting language (e.g. `"lua"`, `"rhai"`).
+    /// The name of the target scripting language.
     fn language_name(&self) -> &str;
 
     /// Declares which IR features this backend supports and what constraints
@@ -59,6 +59,10 @@ pub struct BackendCapabilities {
     pub async_fns: bool,
     /// Supports `TypeDescriptor::Callback` in fields/params.
     pub callbacks: bool,
+    /// Supports `TypeDescriptor::Stream` values.
+    pub streams: bool,
+    /// Supports `TypeDescriptor::Future` values.
+    pub futures: bool,
     /// Supports generic type parameters on struct/enum descriptors.
     pub generics: bool,
     /// Supports computed properties on struct descriptors.
@@ -75,6 +79,8 @@ impl BackendCapabilities {
     pub const ALL: Self = Self {
         async_fns: true,
         callbacks: true,
+        streams: true,
+        futures: true,
         generics: true,
         properties: true,
         type_aliases: true,
@@ -90,6 +96,18 @@ impl BackendCapabilities {
     /// Sets whether callbacks are supported.
     pub const fn with_callbacks(mut self, v: bool) -> Self {
         self.callbacks = v;
+        self
+    }
+
+    /// Sets whether stream value types are supported.
+    pub const fn with_streams(mut self, v: bool) -> Self {
+        self.streams = v;
+        self
+    }
+
+    /// Sets whether future value types are supported.
+    pub const fn with_futures(mut self, v: bool) -> Self {
+        self.futures = v;
         self
     }
 
@@ -150,6 +168,46 @@ impl BackendCapabilities {
                     }
                 }
             }
+            if !self.streams {
+                check_fns_streams(s.id, s.methods, &mut errors);
+                check_fns_streams(s.id, s.constructors, &mut errors);
+                for field in s.fields {
+                    if contains_stream(field.ty) {
+                        errors.push(CompatibilityError::UnsupportedStream {
+                            type_id: s.id,
+                            context: field.name,
+                        });
+                    }
+                }
+                for prop in s.properties {
+                    if contains_stream(prop.ty) {
+                        errors.push(CompatibilityError::UnsupportedStream {
+                            type_id: s.id,
+                            context: prop.name,
+                        });
+                    }
+                }
+            }
+            if !self.futures {
+                check_fns_futures(s.id, s.methods, &mut errors);
+                check_fns_futures(s.id, s.constructors, &mut errors);
+                for field in s.fields {
+                    if contains_future(field.ty) {
+                        errors.push(CompatibilityError::UnsupportedFuture {
+                            type_id: s.id,
+                            context: field.name,
+                        });
+                    }
+                }
+                for prop in s.properties {
+                    if contains_future(prop.ty) {
+                        errors.push(CompatibilityError::UnsupportedFuture {
+                            type_id: s.id,
+                            context: prop.name,
+                        });
+                    }
+                }
+            }
             if !s.generic_params.is_empty() {
                 if !self.generics {
                     errors.push(CompatibilityError::UnsupportedGenerics { type_id: s.id });
@@ -175,6 +233,28 @@ impl BackendCapabilities {
             check_fns_async(e.id, e.methods, self.async_fns, &mut errors);
             if !self.callbacks {
                 check_fns_callbacks(e.id, e.methods, &mut errors);
+            }
+            if !self.streams {
+                check_fns_streams(e.id, e.methods, &mut errors);
+                for v in e.variants {
+                    if variant_payload_matches(&v.kind, contains_stream) {
+                        errors.push(CompatibilityError::UnsupportedStream {
+                            type_id: e.id,
+                            context: v.name,
+                        });
+                    }
+                }
+            }
+            if !self.futures {
+                check_fns_futures(e.id, e.methods, &mut errors);
+                for v in e.variants {
+                    if variant_payload_matches(&v.kind, contains_future) {
+                        errors.push(CompatibilityError::UnsupportedFuture {
+                            type_id: e.id,
+                            context: v.name,
+                        });
+                    }
+                }
             }
             if !e.generic_params.is_empty() {
                 if !self.generics {
@@ -233,11 +313,51 @@ impl BackendCapabilities {
                     });
                 }
             }
+            if !self.streams {
+                let has_stream = function.params.iter().any(|p| contains_stream(p.ty))
+                    || contains_stream(function.return_type);
+                if has_stream {
+                    errors.push(CompatibilityError::UnsupportedModuleStream {
+                        module: module.name,
+                        context: function.name,
+                    });
+                }
+            }
+            if !self.futures {
+                let has_future = function.params.iter().any(|p| contains_future(p.ty))
+                    || contains_future(function.return_type);
+                if has_future {
+                    errors.push(CompatibilityError::UnsupportedModuleFuture {
+                        module: module.name,
+                        context: function.name,
+                    });
+                }
+            }
         }
         if !self.callbacks {
             for constant in module.constants {
                 if contains_callback(constant.ty) {
                     errors.push(CompatibilityError::UnsupportedModuleCallback {
+                        module: module.name,
+                        context: constant.name,
+                    });
+                }
+            }
+        }
+        if !self.streams {
+            for constant in module.constants {
+                if contains_stream(constant.ty) {
+                    errors.push(CompatibilityError::UnsupportedModuleStream {
+                        module: module.name,
+                        context: constant.name,
+                    });
+                }
+            }
+        }
+        if !self.futures {
+            for constant in module.constants {
+                if contains_future(constant.ty) {
+                    errors.push(CompatibilityError::UnsupportedModuleFuture {
                         module: module.name,
                         context: constant.name,
                     });
@@ -293,16 +413,126 @@ fn check_fns_callbacks<'a>(
     }
 }
 
+fn check_fns_streams<'a>(
+    type_id: TypeId<'a>,
+    fns: &[crate::function::FunctionDescriptor<'a>],
+    errors: &mut Vec<CompatibilityError<'a>>,
+) {
+    for f in fns {
+        for param in f.params {
+            if contains_stream(param.ty) {
+                errors.push(CompatibilityError::UnsupportedStream {
+                    type_id,
+                    context: f.name,
+                });
+                return;
+            }
+        }
+        if contains_stream(f.return_type) {
+            errors.push(CompatibilityError::UnsupportedStream {
+                type_id,
+                context: f.name,
+            });
+        }
+    }
+}
+
 fn contains_callback(ty: &TypeDescriptor<'_>) -> bool {
     match ty {
         TypeDescriptor::Callback { .. } => true,
-        TypeDescriptor::Option(inner) | TypeDescriptor::List(inner) => contains_callback(inner),
+        TypeDescriptor::Option(inner)
+        | TypeDescriptor::List(inner)
+        | TypeDescriptor::Stream(inner)
+        | TypeDescriptor::Future(inner) => contains_callback(inner),
         TypeDescriptor::Array(inner, _) => contains_callback(inner),
         TypeDescriptor::Map(k, v) | TypeDescriptor::Result(k, v) => {
             contains_callback(k) || contains_callback(v)
         }
         TypeDescriptor::Tuple(elems) => elems.iter().any(contains_callback),
         TypeDescriptor::Instance { args, .. } => args.iter().any(contains_callback),
+        TypeDescriptor::Primitive(_)
+        | TypeDescriptor::String
+        | TypeDescriptor::Bytes
+        | TypeDescriptor::Unit
+        | TypeDescriptor::Ref(_)
+        | TypeDescriptor::GenericParam(_) => false,
+    }
+}
+
+fn check_fns_futures<'a>(
+    type_id: TypeId<'a>,
+    fns: &[crate::function::FunctionDescriptor<'a>],
+    errors: &mut Vec<CompatibilityError<'a>>,
+) {
+    for f in fns {
+        for param in f.params {
+            if contains_future(param.ty) {
+                errors.push(CompatibilityError::UnsupportedFuture {
+                    type_id,
+                    context: f.name,
+                });
+                return;
+            }
+        }
+        if contains_future(f.return_type) {
+            errors.push(CompatibilityError::UnsupportedFuture {
+                type_id,
+                context: f.name,
+            });
+        }
+    }
+}
+
+fn variant_payload_matches(
+    kind: &crate::types::VariantKind<'_>,
+    pred: fn(&TypeDescriptor<'_>) -> bool,
+) -> bool {
+    match kind {
+        crate::types::VariantKind::Unit => false,
+        crate::types::VariantKind::Tuple(types) => types.iter().any(pred),
+        crate::types::VariantKind::Struct(fields) => fields.iter().any(|f| pred(f.ty)),
+    }
+}
+
+fn contains_future(ty: &TypeDescriptor<'_>) -> bool {
+    match ty {
+        TypeDescriptor::Future(_) => true,
+        TypeDescriptor::Stream(inner) => contains_future(inner),
+        TypeDescriptor::Option(inner) | TypeDescriptor::List(inner) => contains_future(inner),
+        TypeDescriptor::Array(inner, _) => contains_future(inner),
+        TypeDescriptor::Map(k, v) | TypeDescriptor::Result(k, v) => {
+            contains_future(k) || contains_future(v)
+        }
+        TypeDescriptor::Tuple(elems) => elems.iter().any(contains_future),
+        TypeDescriptor::Instance { args, .. } => args.iter().any(contains_future),
+        TypeDescriptor::Callback {
+            params,
+            return_type,
+        } => params.iter().any(contains_future) || contains_future(return_type),
+        TypeDescriptor::Primitive(_)
+        | TypeDescriptor::String
+        | TypeDescriptor::Bytes
+        | TypeDescriptor::Unit
+        | TypeDescriptor::Ref(_)
+        | TypeDescriptor::GenericParam(_) => false,
+    }
+}
+
+fn contains_stream(ty: &TypeDescriptor<'_>) -> bool {
+    match ty {
+        TypeDescriptor::Stream(_) => true,
+        TypeDescriptor::Future(inner) => contains_stream(inner),
+        TypeDescriptor::Option(inner) | TypeDescriptor::List(inner) => contains_stream(inner),
+        TypeDescriptor::Array(inner, _) => contains_stream(inner),
+        TypeDescriptor::Map(k, v) | TypeDescriptor::Result(k, v) => {
+            contains_stream(k) || contains_stream(v)
+        }
+        TypeDescriptor::Tuple(elems) => elems.iter().any(contains_stream),
+        TypeDescriptor::Instance { args, .. } => args.iter().any(contains_stream),
+        TypeDescriptor::Callback {
+            params,
+            return_type,
+        } => params.iter().any(contains_stream) || contains_stream(return_type),
         TypeDescriptor::Primitive(_)
         | TypeDescriptor::String
         | TypeDescriptor::Bytes
@@ -330,6 +560,22 @@ pub enum CompatibilityError<'a> {
         type_id: TypeId<'a>,
         context: &'a str,
     },
+    /// A stream type in a backend that doesn't support streams.
+    UnsupportedStream {
+        type_id: TypeId<'a>,
+        context: &'a str,
+    },
+    /// A stream type in a module function or constant in a backend that
+    /// doesn't support streams.
+    UnsupportedModuleStream { module: &'a str, context: &'a str },
+    /// A future type in a backend that doesn't support futures.
+    UnsupportedFuture {
+        type_id: TypeId<'a>,
+        context: &'a str,
+    },
+    /// A future type in a module function or constant in a backend that
+    /// doesn't support futures.
+    UnsupportedModuleFuture { module: &'a str, context: &'a str },
     /// A generic type in a backend that doesn't support generics.
     UnsupportedGenerics { type_id: TypeId<'a> },
     /// A generic type with no recorded instantiation, in a backend that
@@ -365,6 +611,30 @@ impl std::fmt::Display for CompatibilityError<'_> {
                 write!(
                     f,
                     "type {type_id}: callback in `{context}` is not supported by this backend"
+                )
+            }
+            Self::UnsupportedStream { type_id, context } => {
+                write!(
+                    f,
+                    "type {type_id}: stream in `{context}` is not supported by this backend"
+                )
+            }
+            Self::UnsupportedModuleStream { module, context } => {
+                write!(
+                    f,
+                    "module `{module}`: stream in `{context}` is not supported by this backend"
+                )
+            }
+            Self::UnsupportedFuture { type_id, context } => {
+                write!(
+                    f,
+                    "type {type_id}: future in `{context}` is not supported by this backend"
+                )
+            }
+            Self::UnsupportedModuleFuture { module, context } => {
+                write!(
+                    f,
+                    "module `{module}`: future in `{context}` is not supported by this backend"
                 )
             }
             Self::UnsupportedGenerics { type_id } => {

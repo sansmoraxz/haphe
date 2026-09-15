@@ -85,9 +85,8 @@ pub enum TypeDescriptor<'a> {
     ///
     /// `id` is the generic type's (erased) [`TypeId`]; `args` are the
     /// concrete type arguments in declaration order. Backends that
-    /// monomorphize (e.g. WIT) pair `args` with the target's
-    /// `generic_params` to substitute [`TypeDescriptor::GenericParam`]
-    /// occurrences.
+    /// monomorphize pair `args` with the target's `generic_params` to
+    /// substitute [`TypeDescriptor::GenericParam`] occurrences.
     Instance {
         /// The generic type's erased id.
         id: TypeId<'a>,
@@ -96,6 +95,12 @@ pub enum TypeDescriptor<'a> {
     },
     /// The unit type `()`.
     Unit,
+    /// A stream of values; `Unit` payload means a bare signal stream.
+    /// Backends map it to their native streaming construct.
+    Stream(&'a TypeDescriptor<'a>),
+    /// A deferred value; `Unit` payload means a bare completion signal.
+    /// Backends map it to their native deferred-value construct.
+    Future(&'a TypeDescriptor<'a>),
     /// A reference to a generic type parameter by name (e.g. `"T"`).
     ///
     /// Only valid inside a [`StructDescriptor`] or [`EnumDescriptor`] that
@@ -113,7 +118,10 @@ impl TypeDescriptor<'_> {
         match (self, other) {
             (T::Primitive(a), T::Primitive(b)) => *a as u8 == *b as u8,
             (T::String, T::String) | (T::Bytes, T::Bytes) | (T::Unit, T::Unit) => true,
-            (T::Option(a), T::Option(b)) | (T::List(a), T::List(b)) => a.const_eq(b),
+            (T::Option(a), T::Option(b))
+            | (T::List(a), T::List(b))
+            | (T::Stream(a), T::Stream(b))
+            | (T::Future(a), T::Future(b)) => a.const_eq(b),
             (T::Array(a, n), T::Array(b, m)) => *n == *m && a.const_eq(b),
             (T::Map(ka, va), T::Map(kb, vb)) | (T::Result(ka, va), T::Result(kb, vb)) => {
                 ka.const_eq(kb) && va.const_eq(vb)
@@ -175,9 +183,8 @@ pub enum PrimitiveType {
 
 /// A standard Rust trait implemented by a described type.
 ///
-/// Backends map these to native constructs: `Display` → pyo3 `__str__`,
-/// mlua `__tostring`, JS `toString()`; `Add` → pyo3 `__add__`, mlua
-/// `MetaMethod::Add`, rhai `+` operator; etc.
+/// Backends map these to their target language's native constructs
+/// (string conversion protocols, operator overloads, metamethods, etc.).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum TraitImpl<'a> {
@@ -284,8 +291,8 @@ pub struct GenericParam<'a> {
 /// A computed property (getter/setter) on a type, distinct from a direct
 /// struct field.
 ///
-/// Backends generate accessor methods: pyo3 → `#[getter]`/`#[setter]`,
-/// rhai → `register_get`/`register_set`, mlua → index metamethods, etc.
+/// Backends generate accessor methods using their target language's
+/// property or getter/setter mechanism.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PropertyDescriptor<'a> {
     /// Property name.
@@ -358,7 +365,7 @@ pub struct EnumDescriptor<'a> {
     pub generic_params: &'a [GenericParam<'a>],
     /// Whether this enum is a bitflags set: each (unit) variant names one
     /// independent bit, in declaration order. Backends map it to their native
-    /// bitset construct (WIT `flags`).
+    /// bitset construct.
     pub is_flags: bool,
 }
 

@@ -105,9 +105,8 @@ impl std::error::Error for RegistryError<'_> {}
 /// `Labeled<String, i32>`.
 ///
 /// Recorded by [`registry!`](https://docs.rs/haphe) entries that carry type
-/// arguments. Backends that monomorphize (e.g. WIT) emit one concrete type
-/// per instantiation by substituting `args` for the target's
-/// `generic_params`.
+/// arguments. Backends that monomorphize emit one concrete type per
+/// instantiation by substituting `args` for the target's `generic_params`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct InstantiationDescriptor<'a> {
     /// The generic type's erased [`TypeId`].
@@ -578,9 +577,10 @@ where
                 walk_type_refs(arg, visitor);
             }
         }
-        TypeDescriptor::Option(inner) | TypeDescriptor::List(inner) => {
-            walk_type_refs(inner, visitor)
-        }
+        TypeDescriptor::Option(inner)
+        | TypeDescriptor::List(inner)
+        | TypeDescriptor::Stream(inner)
+        | TypeDescriptor::Future(inner) => walk_type_refs(inner, visitor),
         TypeDescriptor::Array(inner, _) => walk_type_refs(inner, visitor),
         TypeDescriptor::Map(k, v) | TypeDescriptor::Result(k, v) => {
             walk_type_refs(k, visitor);
@@ -619,9 +619,10 @@ where
                 walk_generic_params(arg, visitor);
             }
         }
-        TypeDescriptor::Option(inner) | TypeDescriptor::List(inner) => {
-            walk_generic_params(inner, visitor)
-        }
+        TypeDescriptor::Option(inner)
+        | TypeDescriptor::List(inner)
+        | TypeDescriptor::Stream(inner)
+        | TypeDescriptor::Future(inner) => walk_generic_params(inner, visitor),
         TypeDescriptor::Array(inner, _) => walk_generic_params(inner, visitor),
         TypeDescriptor::Map(k, v) | TypeDescriptor::Result(k, v) => {
             walk_generic_params(k, visitor);

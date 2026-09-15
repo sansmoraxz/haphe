@@ -14,6 +14,10 @@ default = ["macros"]
 macros = ["dep:haphe-macros"]
 # Expose bitflags-crate types as flags enums via `haphe::script_bitflags!`.
 bitflags = ["haphe-core/bitflags"]
+# First-class `haphe::Stream<T>` value type.
+streams = ["haphe-core/streams"]
+# First-class `haphe::Future<T>` value type.
+futures = ["haphe-core/futures"]
 
 [dev-dependencies]
 trybuild = "1"

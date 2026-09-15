@@ -448,3 +448,58 @@ fn flags_enum_emits_wit_flags() {
     assert!(wit.contains("exec,"), "got:\n{wit}");
     assert!(!wit.contains("enum perm"), "got:\n{wit}");
 }
+
+// ---------------------------------------------------------------------------
+// Streams and futures
+// ---------------------------------------------------------------------------
+
+/// Subscribes to a topic.
+#[script]
+fn subscribe(topic: String) -> haphe::Stream<String> {
+    let _ = topic;
+    unimplemented!()
+}
+
+/// Schedules a rate lookup.
+#[script]
+fn schedule(fut: haphe::Future<f64>) -> haphe::Future<f64> {
+    fut
+}
+
+haphe::registry! {
+    pub static STREAMS_REGISTRY = {
+        structs: [Labeled<haphe::Stream<i32>, u8>],
+        modules: [
+            mod events {
+                doc: "Event streaming",
+                functions: [subscribe, schedule],
+                types: [Labeled<haphe::Stream<i32>, u8>],
+            },
+        ],
+    };
+}
+
+#[test]
+fn stream_and_future_types_emit() {
+    let output =
+        haphe::generate(&WitGenerator::new("haphe:demo"), &STREAMS_REGISTRY).expect("generates");
+    let wit = String::from_utf8(output.files[0].content.clone()).unwrap();
+    assert!(
+        wit.contains("subscribe: func(topic: string) -> stream<string>;"),
+        "got:\n{wit}"
+    );
+    assert!(
+        wit.contains("schedule: func(fut: future<f64>) -> future<f64>;"),
+        "got:\n{wit}"
+    );
+    // Mangling of a stream-typed generic argument.
+    assert!(
+        wit.contains("record labeled-stream-s32-u8 {"),
+        "got:\n{wit}"
+    );
+    assert!(
+        wit.contains("/// haphe:generic-instance = labeled<stream-s32, u8>"),
+        "got:\n{wit}"
+    );
+    assert!(wit.contains("value: stream<s32>,"), "got:\n{wit}");
+}

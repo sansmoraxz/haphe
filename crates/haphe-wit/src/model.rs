@@ -297,6 +297,14 @@ impl<'a> Plan<'a> {
                 self.mangle_type(o, env)?,
                 self.mangle_type(e, env)?
             ),
+            TypeDescriptor::Stream(inner) => match inner {
+                TypeDescriptor::Unit => "stream".to_string(),
+                _ => format!("stream-{}", self.mangle_type(inner, env)?),
+            },
+            TypeDescriptor::Future(inner) => match inner {
+                TypeDescriptor::Unit => "future".to_string(),
+                _ => format!("future-{}", self.mangle_type(inner, env)?),
+            },
             TypeDescriptor::Ref(id) => self
                 .type_names
                 .get(id.as_str())
@@ -465,7 +473,9 @@ impl<'a> Plan<'a> {
             }
             TypeDescriptor::Option(inner)
             | TypeDescriptor::List(inner)
-            | TypeDescriptor::Array(inner, _) => self.collect_uses(inner, env, refs)?,
+            | TypeDescriptor::Array(inner, _)
+            | TypeDescriptor::Stream(inner)
+            | TypeDescriptor::Future(inner) => self.collect_uses(inner, env, refs)?,
             TypeDescriptor::Map(k, v) | TypeDescriptor::Result(k, v) => {
                 self.collect_uses(k, env, refs)?;
                 self.collect_uses(v, env, refs)?;

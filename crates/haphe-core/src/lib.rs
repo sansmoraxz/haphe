@@ -30,7 +30,18 @@ pub mod haphe_type;
 pub mod module;
 pub mod registry;
 pub mod script;
+#[cfg(any(feature = "streams", feature = "futures"))]
+pub mod stream;
+/// Re-export of the [`futures-core`](https://docs.rs/futures-core) crate for
+/// implementing custom [`stream::Stream`] sources.
+#[cfg(feature = "streams")]
+pub use futures_core;
 pub mod types;
+
+#[cfg(feature = "futures")]
+pub use stream::Future;
+#[cfg(feature = "streams")]
+pub use stream::Stream;
 
 pub use backend::{
     BackendCapabilities, BindingGenerator, CompatibilityError, GeneratedFile, GeneratedOutput,

@@ -52,13 +52,39 @@ async fn fetch_rate(id: i32) -> f64 {
     id as f64
 }
 
+struct Empty;
+
+impl haphe::futures_core::Stream for Empty {
+    type Item = i32;
+
+    fn poll_next(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<i32>> {
+        std::task::Poll::Ready(None)
+    }
+}
+
+/// Streams up to `n` counts.
+#[script]
+fn counts(n: i32) -> haphe::Stream<i32> {
+    let _ = n;
+    haphe::Stream::new(Empty)
+}
+
+/// Resolves to `x` eventually.
+#[script]
+fn delayed(x: f64) -> haphe::Future<f64> {
+    haphe::Future::new(async move { x })
+}
+
 haphe::registry! {
     pub static REGISTRY = {
         structs: [Point],
         modules: [
             mod geometry {
                 doc: "Geometry utilities",
-                functions: [add, fetch_rate],
+                functions: [add, fetch_rate, counts, delayed],
                 types: [Point],
                 constants: [
                     /// Circle constant.
@@ -211,7 +237,7 @@ fn guest_fails_to_instantiate_against_empty_linker() {
     assert!(msg.contains("haphe:demo/geometry"), "got: {msg}");
 }
 
-/// Functions are bound at Lua-parity depth: the definition exists (the guest
+/// Functions are bound at stub depth: the definition exists (the guest
 /// links and instantiates) but calling it traps with a clear message.
 #[test]
 fn stub_function_links_but_traps_when_called() {
@@ -256,6 +282,81 @@ fn async_function_links_and_stub_traps() {
     let msg = format!("{err:?}");
     assert!(
         msg.contains("haphe-wit: `fetch-rate` not yet implemented"),
+        "got: {msg}"
+    );
+}
+
+/// Guest importing `counts`, whose result is `stream<s32>` — at the core
+/// level the stream is an `i32` handle. Instantiation type-checks the
+/// stream-shaped signature against the binder's definition.
+const STREAM_GUEST: &str = r#"
+(component
+  (import "haphe:demo/geometry" (instance $geo
+    (export "counts" (func (param "n" s32) (result (stream s32))))
+  ))
+  (core func $counts (canon lower (func $geo "counts")))
+  (core module $m
+    (import "geo" "counts" (func $counts (param i32) (result i32)))
+    (func (export "run") (result f64)
+      (drop (call $counts (i32.const 3)))
+      (f64.const 0))
+  )
+  (core instance $mi (instantiate $m
+    (with "geo" (instance (export "counts" (func $counts))))
+  ))
+  (func (export "run") (result f64) (canon lift (core func $mi "run")))
+)
+"#;
+
+/// Guest importing `delayed`, whose result is `future<f64>` — an `i32`
+/// handle at the core level, like streams.
+const FUTURE_GUEST: &str = r#"
+(component
+  (import "haphe:demo/geometry" (instance $geo
+    (export "delayed" (func (param "x" f64) (result (future f64))))
+  ))
+  (core func $delayed (canon lower (func $geo "delayed")))
+  (core module $m
+    (import "geo" "delayed" (func $delayed (param f64) (result i32)))
+    (func (export "run") (result f64)
+      (drop (call $delayed (f64.const 1.5)))
+      (f64.const 0))
+  )
+  (core instance $mi (instantiate $m
+    (with "geo" (instance (export "delayed" (func $delayed))))
+  ))
+  (func (export "run") (result f64) (canon lift (core func $mi "run")))
+)
+"#;
+
+/// A `stream<T>`-returning function is defined in the linker with the right
+/// shape (the guest's typed import instantiates) and its stub traps.
+#[test]
+fn stream_function_links_and_stub_traps() {
+    let engine = Engine::default();
+    let mut linker = Linker::new(&engine);
+    haphe::bind(&binder(), &REGISTRY, &mut linker).expect("binding succeeds");
+
+    let err = run_guest(&engine, &linker, STREAM_GUEST).expect_err("stub should trap");
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("haphe-wit: `counts` not yet implemented"),
+        "got: {msg}"
+    );
+}
+
+/// A `future<T>`-returning function is defined in the linker with the right
+/// shape and its stub traps.
+#[test]
+fn future_function_links_and_stub_traps() {
+    let engine = Engine::default();
+    let mut linker = Linker::new(&engine);
+    haphe::bind(&binder(), &REGISTRY, &mut linker).expect("binding succeeds");
+
+    let err = run_guest(&engine, &linker, FUTURE_GUEST).expect_err("stub should trap");
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("haphe-wit: `delayed` not yet implemented"),
         "got: {msg}"
     );
 }

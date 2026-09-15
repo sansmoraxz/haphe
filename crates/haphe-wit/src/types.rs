@@ -131,6 +131,22 @@ pub(crate) fn render_type(
             // Instantiation args are concrete, so no further env applies.
             render_type(bound, pos, plan, None, context)
         }
+        TypeDescriptor::Stream(inner) => Ok(if matches!(inner, TypeDescriptor::Unit) {
+            "stream".to_string()
+        } else {
+            format!(
+                "stream<{}>",
+                render_type(inner, nested(pos), plan, env, context)?
+            )
+        }),
+        TypeDescriptor::Future(inner) => Ok(if matches!(inner, TypeDescriptor::Unit) {
+            "future".to_string()
+        } else {
+            format!(
+                "future<{}>",
+                render_type(inner, nested(pos), plan, env, context)?
+            )
+        }),
         TypeDescriptor::Unit => Err(WitGenError::UnrepresentableType {
             context: context.to_string(),
             detail: "unit type is only valid as a bare return type".to_string(),

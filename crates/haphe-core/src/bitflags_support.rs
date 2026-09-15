@@ -11,10 +11,9 @@
 /// Each named flag becomes one unit variant, in declaration order. Every
 /// named flag must set **exactly one bit** — a composite mask (e.g.
 /// `ALL = READ | WRITE`) or an empty mask fails at compile time, because
-/// bitset formats like WIT `flags` model independent single bits only.
+/// backend bitset formats model independent single bits only.
 ///
 /// ```
-/// use haphe_core as haphe; // in user code: use haphe
 /// haphe_core::bitflags::bitflags! {
 ///     #[derive(Clone, Copy)]
 ///     pub struct Perms: u32 {

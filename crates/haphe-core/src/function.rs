@@ -19,9 +19,9 @@ pub struct FunctionDescriptor<'a> {
     pub is_async: bool,
     /// Optional error class hint for backend exception mapping.
     ///
-    /// Backends use this to generate specific exception types: pyo3 →
-    /// `PyValueError`, wasm → specific `Error` subclass, etc. `None` means
-    /// use the backend's default error type.
+    /// Backends use this to generate specific exception or error types in
+    /// their target language. `None` means use the backend's default error
+    /// type.
     pub error_kind: Option<&'a str>,
 }
 

@@ -52,7 +52,7 @@ anyhow = ["mlua/anyhow"]
 userdata-wrappers = ["mlua/userdata-wrappers"]
 
 [dev-dependencies]
-haphe = { path = "../haphe", features = ["macros", "bitflags"] }
+haphe = { path = "../haphe", features = ["macros", "bitflags", "streams", "futures"] }
 mlua = { version = "0.12", features = ["lua55"] }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync"] }
 serde = { version = "1", features = ["derive"] }
