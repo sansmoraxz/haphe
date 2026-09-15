@@ -505,7 +505,15 @@ fn emit_enum(
 
     p.doc(e.doc);
     let mut case_names = NameMap::new();
-    if unit_only {
+    if e.is_flags {
+        // Validated upstream: flags enums have only unit variants. Bit
+        // positions follow declaration order.
+        p.open(&format!("flags {wit_name}"));
+        for v in e.variants {
+            p.doc(v.doc);
+            p.line(&format!("{},", case_names.insert(v.name)?));
+        }
+    } else if unit_only {
         p.open(&format!("enum {wit_name}"));
         for v in e.variants {
             p.doc(v.doc);

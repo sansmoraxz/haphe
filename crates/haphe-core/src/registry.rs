@@ -33,6 +33,9 @@ pub enum RegistryError<'a> {
     /// An [`InstantiationDescriptor`] targets a [`TypeId`] that is not a
     /// registered generic struct or enum.
     DanglingInstantiation { to: TypeId<'a> },
+    /// A flags enum ([`EnumDescriptor::is_flags`]) has a non-unit variant;
+    /// bitflags cases cannot carry payloads.
+    NonUnitFlagsVariant { owner: TypeId<'a>, variant: &'a str },
     /// An [`InstantiationDescriptor`]'s argument count does not match the
     /// target's declared generic parameters.
     InstantiationArityMismatch {
@@ -76,6 +79,10 @@ impl std::fmt::Display for RegistryError<'_> {
             Self::DanglingInstantiation { to } => {
                 write!(f, "instantiation targets unregistered generic type {to}")
             }
+            Self::NonUnitFlagsVariant { owner, variant } => write!(
+                f,
+                "flags enum {owner} has non-unit variant `{variant}`; bitflags cases cannot carry payloads"
+            ),
             Self::InstantiationArityMismatch {
                 target,
                 expected,
@@ -269,6 +276,12 @@ impl<'a> TypeRegistry<'a> {
             let generic_names: HashSet<&str> = e.generic_params.iter().map(|g| g.name).collect();
 
             for variant in e.variants {
+                if e.is_flags && !matches!(variant.kind, VariantKind::Unit) {
+                    errors.push(RegistryError::NonUnitFlagsVariant {
+                        owner: e.id,
+                        variant: variant.name,
+                    });
+                }
                 match &variant.kind {
                     VariantKind::Unit => {}
                     VariantKind::Tuple(types) => {

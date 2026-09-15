@@ -192,7 +192,8 @@ fn empty_enum_rejected() {
         trait_impls: &[],
         thread_safety: ThreadSafety::SEND_SYNC,
         generic_params: &[],
-    }];
+    is_flags: false,
+        }];
     static REGISTRY: TypeRegistry = TypeRegistry::new(&[], &ENUMS, &[], &[], &[]);
 
     let err = generate_err(&REGISTRY);

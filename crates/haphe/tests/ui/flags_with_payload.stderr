@@ -1,0 +1,5 @@
+error: `#[script(flags)]` enums must have only unit variants; bitflags cases cannot carry payloads
+ --> tests/ui/flags_with_payload.rs:9:5
+  |
+9 |     Custom(u32),
+  |     ^^^^^^

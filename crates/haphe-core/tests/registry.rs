@@ -101,6 +101,7 @@ static COLOR_DESC: EnumDescriptor<'static> = EnumDescriptor {
     trait_impls: &[],
     thread_safety: ThreadSafety::SEND_SYNC,
     generic_params: &[],
+    is_flags: false,
 };
 
 // ── Describe impls (builder path)
@@ -285,6 +286,7 @@ fn duplicate_enum_registration_errors() {
         trait_impls: &[],
         thread_safety: ThreadSafety::SEND_SYNC,
         generic_params: &[],
+        is_flags: false,
     });
     assert!(matches!(result, Err(RegistryError::DuplicateType { .. })));
 }
@@ -303,6 +305,7 @@ fn cross_kind_duplicate_errors() {
         trait_impls: &[],
         thread_safety: ThreadSafety::SEND_SYNC,
         generic_params: &[],
+        is_flags: false,
     });
     assert!(matches!(result, Err(RegistryError::DuplicateType { .. })));
 }
@@ -1219,6 +1222,7 @@ fn enum_with_all_new_fields() {
         trait_impls: &TRAITS,
         thread_safety: ThreadSafety::SEND,
         generic_params: &GENERICS,
+        is_flags: false,
     }];
 
     let registry = TypeRegistry::new(&[], &ENUMS, &[], &[], &[]);
@@ -1478,4 +1482,47 @@ fn capability_check_thread_safety_passes_when_met() {
 
     let needs_send = BackendCapabilities::ALL.with_required_thread_safety(Some(ThreadSafety::SEND));
     assert!(needs_send.check(&validated).is_ok());
+}
+
+#[test]
+fn flags_enum_with_payload_variant_fails_validation() {
+    static PAYLOAD: [TypeDescriptor<'static>; 1] = [TypeDescriptor::Primitive(PrimitiveType::U32)];
+    static VARIANTS: [EnumVariant<'static>; 2] = [
+        EnumVariant {
+            name: "Read",
+            doc: None,
+            kind: VariantKind::Unit,
+        },
+        EnumVariant {
+            name: "Custom",
+            doc: None,
+            kind: VariantKind::Tuple(&PAYLOAD),
+        },
+    ];
+    static ENUMS: [EnumDescriptor<'static>; 1] = [EnumDescriptor {
+        id: TypeId::new("test::Perm"),
+        name: "Perm",
+        doc: None,
+        variants: &VARIANTS,
+        methods: &[],
+        trait_impls: &[],
+        thread_safety: ThreadSafety::SEND_SYNC,
+        generic_params: &[],
+        is_flags: true,
+    }];
+    static REGISTRY: TypeRegistry<'static> = TypeRegistry::new(&[], &ENUMS, &[], &[], &[]);
+
+    let errors = REGISTRY
+        .validate()
+        .expect_err("payload variant in flags enum");
+    assert!(
+        errors.iter().any(|e| matches!(
+            e,
+            RegistryError::NonUnitFlagsVariant {
+                variant: "Custom",
+                ..
+            }
+        )),
+        "got: {errors:?}"
+    );
 }

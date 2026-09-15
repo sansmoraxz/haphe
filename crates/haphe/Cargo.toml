@@ -12,6 +12,8 @@ haphe-macros = { path = "../haphe-macros", optional = true }
 [features]
 default = ["macros"]
 macros = ["dep:haphe-macros"]
+# Expose bitflags-crate types as flags enums via `haphe::script_bitflags!`.
+bitflags = ["haphe-core/bitflags"]
 
 [dev-dependencies]
 trybuild = "1"

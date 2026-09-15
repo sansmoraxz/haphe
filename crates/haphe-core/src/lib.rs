@@ -18,6 +18,12 @@
 #[doc(hidden)]
 pub mod __verify;
 pub mod backend;
+#[cfg(feature = "bitflags")]
+mod bitflags_support;
+/// Re-export of the [`bitflags`](https://docs.rs/bitflags) crate for
+/// [`script_bitflags!`] expansions.
+#[cfg(feature = "bitflags")]
+pub use bitflags;
 pub mod bridge;
 pub mod function;
 pub mod haphe_type;

@@ -2,6 +2,7 @@
 //! would write by hand.
 
 #![cfg(feature = "macros")]
+#![allow(dead_code)]
 
 use haphe::{
     EnumDescriptor, EnumVariant, FieldDescriptor, PrimitiveType, Script, ScriptEnum, ScriptImpl,
@@ -73,6 +74,7 @@ static HAND_WRITTEN: EnumDescriptor<'static> = EnumDescriptor {
     trait_impls: &[TraitImpl::Clone],
     thread_safety: ThreadSafety::SEND_SYNC,
     generic_params: &[],
+    is_flags: false,
 };
 
 static GENERATED: EnumDescriptor<'static> = <Color as ScriptEnum>::DESCRIPTOR;
@@ -83,4 +85,25 @@ fn generated_matches_hand_written() {
     assert_eq!(GENERATED.methods.len(), 1);
     assert_eq!(GENERATED.methods[0].name, "luminance");
     let _ = Color::Internal.clone().luminance();
+}
+
+/// File permission bits.
+#[derive(Script)]
+#[script(flags)]
+enum Perm {
+    Read,
+    Write,
+    Exec,
+}
+
+#[test]
+fn flags_enum_descriptor() {
+    let desc = <Perm as ScriptEnum>::DESCRIPTOR;
+    assert!(desc.is_flags);
+    assert_eq!(desc.variants.len(), 3);
+    assert!(
+        desc.variants
+            .iter()
+            .all(|v| matches!(v.kind, haphe::VariantKind::Unit))
+    );
 }

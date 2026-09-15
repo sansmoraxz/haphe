@@ -597,6 +597,9 @@ dependencies = [
 [[package]]
 name = "haphe-core"
 version = "0.1.0"
+dependencies = [
+ "bitflags",
+]
 
 [[package]]
 name = "haphe-lua"

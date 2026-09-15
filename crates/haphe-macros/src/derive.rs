@@ -432,6 +432,9 @@ fn expand_inner(input: DeriveInput) -> syn::Result<TokenStream> {
 
     let body = match &input.data {
         Data::Struct(data) => {
+            if let Some(span) = container.flags {
+                errors.spanned(span, "`#[script(flags)]` is only valid on enums");
+            }
             let field_exprs: Vec<TokenStream> = match &data.fields {
                 Fields::Named(named) => named
                     .named
@@ -467,6 +470,7 @@ fn expand_inner(input: DeriveInput) -> syn::Result<TokenStream> {
             }
         }
         Data::Enum(data) => {
+            let is_flags = container.flags.is_some();
             let mut variant_exprs = Vec::new();
             for variant in &data.variants {
                 let args = parse_variant_args(&variant.attrs, &mut errors);
@@ -479,6 +483,13 @@ fn expand_inner(input: DeriveInput) -> syn::Result<TokenStream> {
                     .map(|r| r.value())
                     .unwrap_or_else(|| variant.ident.unraw().to_string());
                 let vdoc = doc_tokens(&extract_doc(&variant.attrs));
+                if container.flags.is_some() && !matches!(variant.fields, Fields::Unit) {
+                    errors.spanned(
+                        variant.span(),
+                        "`#[script(flags)]` enums must have only unit variants; \
+                         bitflags cases cannot carry payloads",
+                    );
+                }
                 let kind = match &variant.fields {
                     Fields::Unit => quote! { ::haphe::VariantKind::Unit },
                     Fields::Unnamed(unnamed) => {
@@ -535,6 +546,7 @@ fn expand_inner(input: DeriveInput) -> syn::Result<TokenStream> {
                         trait_impls: &[#(#trait_exprs),*],
                         thread_safety: #thread_safety,
                         generic_params: &[#(#generic_params),*],
+                        is_flags: #is_flags,
                     };
                 }
             }
@@ -665,6 +677,9 @@ fn expand_newtype(
     let doc = doc_tokens(&extract_doc(&input.attrs));
     let transparent = container.transparent.is_some();
 
+    if let Some(span) = container.flags {
+        errors.spanned(span, "`#[script(flags)]` is only valid on enums");
+    }
     if !input.generics.params.is_empty() {
         errors.spanned(
             input.generics.span(),

@@ -5,4 +5,9 @@ edition = "2024"
 description = "Core IR and traits for haphe scripting-language binding generator"
 license = "Apache-2.0"
 
+[features]
+# Expose bitflags-crate types as flags enums via `script_bitflags!`.
+bitflags = ["dep:bitflags"]
+
 [dependencies]
+bitflags = { version = "2", optional = true }

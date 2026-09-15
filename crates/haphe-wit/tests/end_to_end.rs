@@ -417,3 +417,34 @@ fn generic_instances_owned_by_claiming_module() {
 fn generation_is_reproducible() {
     assert_eq!(generate_generic(), generate_generic());
 }
+
+// ---------------------------------------------------------------------------
+// Flags
+// ---------------------------------------------------------------------------
+
+/// File permission bits.
+#[derive(Script)]
+#[script(flags)]
+enum Perm {
+    Read,
+    Write,
+    Exec,
+}
+
+haphe::registry! {
+    pub static FLAGS_REGISTRY = {
+        enums: [Perm],
+    };
+}
+
+#[test]
+fn flags_enum_emits_wit_flags() {
+    let output =
+        haphe::generate(&WitGenerator::new("haphe:demo"), &FLAGS_REGISTRY).expect("generates");
+    let wit = String::from_utf8(output.files[0].content.clone()).unwrap();
+    assert!(wit.contains("flags perm {"), "got:\n{wit}");
+    assert!(wit.contains("read,"), "got:\n{wit}");
+    assert!(wit.contains("write,"), "got:\n{wit}");
+    assert!(wit.contains("exec,"), "got:\n{wit}");
+    assert!(!wit.contains("enum perm"), "got:\n{wit}");
+}

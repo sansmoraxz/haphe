@@ -356,6 +356,10 @@ pub struct EnumDescriptor<'a> {
     pub thread_safety: ThreadSafety,
     /// Generic type parameters declared on this enum.
     pub generic_params: &'a [GenericParam<'a>],
+    /// Whether this enum is a bitflags set: each (unit) variant names one
+    /// independent bit, in declaration order. Backends map it to their native
+    /// bitset construct (WIT `flags`).
+    pub is_flags: bool,
 }
 
 /// A single variant of an enum.
