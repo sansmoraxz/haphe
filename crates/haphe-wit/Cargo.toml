@@ -34,6 +34,7 @@ wasmtime = { version = "48", optional = true }
 [dev-dependencies]
 haphe = { path = "../haphe", features = ["macros", "streams", "futures"] }
 wat = "1"
+wasmtime-wasi = { version = "48", features = ["p3"] }
 
 [[test]]
 name = "runtime"

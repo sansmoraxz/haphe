@@ -101,13 +101,14 @@ fn binder() -> WasmBinder<()> {
 
 /// Instantiates `guest_wat` against `linker` and calls its exported `run`
 /// function (no arguments, one result).
-fn run_guest(
+fn run_guest<T>(
     engine: &Engine,
-    linker: &Linker<()>,
+    linker: &Linker<T>,
+    data: T,
     guest_wat: &str,
 ) -> Result<Val, wasmtime::Error> {
     let component = Component::new(engine, wat::parse_str(guest_wat)?)?;
-    let mut store = wasmtime::Store::new(engine, ());
+    let mut store = wasmtime::Store::new(engine, data);
     let instance = linker.instantiate(&mut store, &component)?;
     let run = instance
         .get_func(&mut store, "run")
@@ -217,7 +218,7 @@ fn guest_receives_bound_constant_value() {
     let mut linker = Linker::new(&engine);
     haphe::bind(&binder(), &REGISTRY, &mut linker).expect("binding succeeds");
 
-    let result = run_guest(&engine, &linker, PI_GUEST).expect("guest runs");
+    let result = run_guest(&engine, &linker, (), PI_GUEST).expect("guest runs");
     match result {
         Val::Float64(pi) => assert!((pi - 3.141592653589793).abs() < 1e-15),
         other => panic!("expected f64, got: {other:?}"),
@@ -232,7 +233,7 @@ fn guest_fails_to_instantiate_against_empty_linker() {
     let engine = Engine::default();
     let empty_linker = Linker::new(&engine);
 
-    let err = run_guest(&engine, &empty_linker, PI_GUEST).expect_err("missing import");
+    let err = run_guest(&engine, &empty_linker, (), PI_GUEST).expect_err("missing import");
     let msg = format!("{err:?}");
     assert!(msg.contains("haphe:demo/geometry"), "got: {msg}");
 }
@@ -245,7 +246,7 @@ fn stub_function_links_but_traps_when_called() {
     let mut linker = Linker::new(&engine);
     haphe::bind(&binder(), &REGISTRY, &mut linker).expect("binding succeeds");
 
-    let err = run_guest(&engine, &linker, ADD_GUEST).expect_err("stub should trap");
+    let err = run_guest(&engine, &linker, (), ADD_GUEST).expect_err("stub should trap");
     let msg = format!("{err:?}");
     assert!(
         msg.contains("haphe-wit: `add` not yet implemented"),
@@ -262,7 +263,7 @@ fn resource_surface_links_and_constructor_traps() {
     let mut linker = Linker::new(&engine);
     haphe::bind(&binder(), &REGISTRY, &mut linker).expect("binding succeeds");
 
-    let err = run_guest(&engine, &linker, POINT_GUEST).expect_err("ctor stub should trap");
+    let err = run_guest(&engine, &linker, (), POINT_GUEST).expect_err("ctor stub should trap");
     let msg = format!("{err:?}");
     assert!(
         msg.contains("haphe-wit: `[constructor]point` not yet implemented"),
@@ -278,7 +279,7 @@ fn async_function_links_and_stub_traps() {
     let mut linker = Linker::new(&engine);
     haphe::bind(&binder(), &REGISTRY, &mut linker).expect("binding succeeds");
 
-    let err = run_guest(&engine, &linker, ASYNC_GUEST).expect_err("stub should trap");
+    let err = run_guest(&engine, &linker, (), ASYNC_GUEST).expect_err("stub should trap");
     let msg = format!("{err:?}");
     assert!(
         msg.contains("haphe-wit: `fetch-rate` not yet implemented"),
@@ -337,7 +338,7 @@ fn stream_function_links_and_stub_traps() {
     let mut linker = Linker::new(&engine);
     haphe::bind(&binder(), &REGISTRY, &mut linker).expect("binding succeeds");
 
-    let err = run_guest(&engine, &linker, STREAM_GUEST).expect_err("stub should trap");
+    let err = run_guest(&engine, &linker, (), STREAM_GUEST).expect_err("stub should trap");
     let msg = format!("{err:?}");
     assert!(
         msg.contains("haphe-wit: `counts` not yet implemented"),
@@ -353,12 +354,112 @@ fn future_function_links_and_stub_traps() {
     let mut linker = Linker::new(&engine);
     haphe::bind(&binder(), &REGISTRY, &mut linker).expect("binding succeeds");
 
-    let err = run_guest(&engine, &linker, FUTURE_GUEST).expect_err("stub should trap");
+    let err = run_guest(&engine, &linker, (), FUTURE_GUEST).expect_err("stub should trap");
     let msg = format!("{err:?}");
     assert!(
         msg.contains("haphe-wit: `delayed` not yet implemented"),
         "got: {msg}"
     );
+}
+
+/// Guest importing both a WASI 0.3 interface (`wasi:clocks/system-clock`)
+/// and the haphe interface. `now` returns `record instant { seconds: s64,
+/// nanoseconds: u32 }`, which lowers through a caller-provided return
+/// pointer (hence the guest memory in `canon lower`). `run` returns -1
+/// unless the reported seconds are after 2020-09-13 (epoch 1600000000) —
+/// i.e. the host handed back real system time — otherwise the host's `pi`.
+const WASI_GUEST: &str = r#"
+(component
+  (import "wasi:clocks/system-clock@0.3.0" (instance $clock
+    (type $instant-def (record (field "seconds" s64) (field "nanoseconds" u32)))
+    (export "instant" (type $instant (eq $instant-def)))
+    (export "now" (func (result $instant)))
+  ))
+  (import "haphe:demo/geometry" (instance $geo
+    (export "pi" (func (result f64)))
+  ))
+  (core module $libc (memory (export "mem") 1))
+  (core instance $libc (instantiate $libc))
+  (core func $now (canon lower (func $clock "now") (memory (core memory $libc "mem"))))
+  (core func $pi (canon lower (func $geo "pi")))
+  (core module $m
+    (import "libc" "mem" (memory 1))
+    (import "host" "now" (func $now (param i32)))
+    (import "host" "pi" (func $pi (result f64)))
+    (func (export "run") (result f64)
+      (call $now (i32.const 0))
+      (if (result f64) (i64.gt_s (i64.load (i32.const 0)) (i64.const 1600000000))
+        (then (call $pi))
+        (else (f64.const -1))))
+  )
+  (core instance $mi (instantiate $m
+    (with "libc" (instance $libc))
+    (with "host" (instance
+      (export "now" (func $now))
+      (export "pi" (func $pi))))
+  ))
+  (func (export "run") (result f64) (canon lift (core func $mi "run")))
+)
+"#;
+
+/// WASI wiring is not implicit: `haphe::bind` defines only the registry's
+/// own interfaces, so a guest importing `wasi:*` fails to instantiate until
+/// the host composes `wasmtime-wasi` into the same linker. Once composed,
+/// both the WASI call and the haphe call execute for real.
+#[test]
+fn wasi_interfaces_compose_with_binder_in_one_linker() {
+    use wasmtime_wasi::{WasiCtx, WasiCtxView, WasiView};
+
+    struct Host {
+        ctx: WasiCtx,
+        table: wasmtime::component::ResourceTable,
+    }
+
+    impl WasiView for Host {
+        fn ctx(&mut self) -> WasiCtxView<'_> {
+            WasiCtxView {
+                ctx: &mut self.ctx,
+                table: &mut self.table,
+            }
+        }
+    }
+
+    let host = || Host {
+        ctx: WasiCtx::builder().build(),
+        table: wasmtime::component::ResourceTable::new(),
+    };
+
+    let engine = Engine::default();
+
+    // Without wasmtime-wasi in the linker the WASI import is unsatisfied.
+    let mut haphe_only: Linker<Host> = Linker::new(&engine);
+    haphe::bind(
+        &WasmBinder::<Host>::new(WitGenerator::new("haphe:demo")),
+        &REGISTRY,
+        &mut haphe_only,
+    )
+    .expect("binding succeeds");
+    let err = run_guest(&engine, &haphe_only, host(), WASI_GUEST).expect_err("wasi import missing");
+    assert!(
+        format!("{err:?}").contains("wasi:clocks/system-clock"),
+        "got: {err:?}"
+    );
+
+    // Composed: wasmtime-wasi (WASI 0.3) and the haphe binder share one linker.
+    let mut linker: Linker<Host> = Linker::new(&engine);
+    wasmtime_wasi::p3::add_to_linker(&mut linker).expect("wasi links");
+    haphe::bind(
+        &WasmBinder::<Host>::new(WitGenerator::new("haphe:demo")),
+        &REGISTRY,
+        &mut linker,
+    )
+    .expect("binding succeeds");
+
+    let result = run_guest(&engine, &linker, host(), WASI_GUEST).expect("guest runs");
+    match result {
+        Val::Float64(pi) => assert!((pi - 3.141592653589793).abs() < 1e-15, "got: {pi}"),
+        other => panic!("expected f64, got: {other:?}"),
+    }
 }
 
 /// Planning errors surface through `haphe::bind` the same way they do
@@ -462,6 +563,6 @@ fn generic_instance_resource_links() {
 
     // Instantiation succeeding proves `holder-f64` and its method stub are
     // defined with compatible shapes.
-    let result = run_guest(&engine, &linker, GENERIC_GUEST).expect("guest instantiates");
+    let result = run_guest(&engine, &linker, (), GENERIC_GUEST).expect("guest instantiates");
     assert!(matches!(result, Val::Float64(_)));
 }
