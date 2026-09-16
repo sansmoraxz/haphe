@@ -15,7 +15,7 @@ use mlua::Lua;
 #[script(
     thread_safety = send_sync,
     traits(
-        Display, PartialEq,
+        Display, ToString, PartialEq,
         Add, Add(rhs = f64, output = Self),
         Mul(rhs = f64, output = Self),
         Div(rhs = f64, output = Self),
@@ -392,4 +392,234 @@ fn generic_free_fn_is_rejected() {
     let tbl = lua.create_table().unwrap();
     let err = bind_fn::<double>(&lua, &tbl).unwrap_err();
     assert!(err.to_string().contains("generic function `double`"));
+}
+
+// ---------------------------------------------------------------------------
+// Operator overload resolution: exact rhs-type match first, then declaration
+// order.
+// ---------------------------------------------------------------------------
+
+/// f64 overload deliberately declared FIRST: under order-only resolution an
+/// integer rhs would bind to it; exact-match-first must pick the i64 one.
+#[derive(Script, Clone)]
+#[script(traits(Add(rhs = f64, output = Self), Add(rhs = i64, output = Self)))]
+struct Probe {
+    which: i64,
+    value: f64,
+}
+
+impl std::ops::Add<f64> for Probe {
+    type Output = Probe;
+    fn add(self, rhs: f64) -> Probe {
+        Probe {
+            which: 1,
+            value: self.value + rhs,
+        }
+    }
+}
+
+impl std::ops::Add<i64> for Probe {
+    type Output = Probe;
+    fn add(self, rhs: i64) -> Probe {
+        Probe {
+            which: 2,
+            value: self.value + rhs as f64,
+        }
+    }
+}
+
+/// Only a float overload: an integer rhs has no exact match and falls back
+/// to declaration order (lossy integer→float conversion).
+#[derive(Script, Clone)]
+#[script(traits(Add(rhs = f64, output = Self)))]
+struct OnlyFloat {
+    value: f64,
+}
+
+impl std::ops::Add<f64> for OnlyFloat {
+    type Output = OnlyFloat;
+    fn add(self, rhs: f64) -> OnlyFloat {
+        OnlyFloat {
+            value: self.value + rhs,
+        }
+    }
+}
+
+fn setup_overload_lua() -> Lua {
+    let lua = Lua::new();
+    let table = lua.create_table().unwrap();
+    bind_type::<Probe>(&lua, &table).unwrap();
+    let table = lua.create_table().unwrap();
+    bind_type::<OnlyFloat>(&lua, &table).unwrap();
+    let globals = lua.globals();
+    globals
+        .set(
+            "p",
+            lua.create_any_userdata(Probe {
+                which: 0,
+                value: 10.0,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+    globals
+        .set(
+            "of",
+            lua.create_any_userdata(OnlyFloat { value: 1.5 }).unwrap(),
+        )
+        .unwrap();
+    lua
+}
+
+#[test]
+fn integer_rhs_prefers_exact_integer_overload() {
+    let lua = setup_overload_lua();
+    let which: i64 = lua.load("local q = p + 3; return q.which").eval().unwrap();
+    assert_eq!(which, 2, "integer rhs must pick Add(rhs = i64)");
+    let value: f64 = lua.load("local q = p + 3; return q.value").eval().unwrap();
+    assert_eq!(value, 13.0);
+}
+
+#[test]
+fn float_rhs_prefers_exact_float_overload() {
+    let lua = setup_overload_lua();
+    let which: i64 = lua
+        .load("local q = p + 2.5; return q.which")
+        .eval()
+        .unwrap();
+    assert_eq!(which, 1, "float rhs must pick Add(rhs = f64)");
+    let value: f64 = lua
+        .load("local q = p + 2.5; return q.value")
+        .eval()
+        .unwrap();
+    assert_eq!(value, 12.5);
+}
+
+#[test]
+fn integer_falls_back_to_float_overload_when_no_exact_match() {
+    let lua = setup_overload_lua();
+    let value: f64 = lua.load("local q = of + 4; return q.value").eval().unwrap();
+    assert_eq!(value, 5.5);
+}
+
+// ---------------------------------------------------------------------------
+// Eq/Ord markers imply the Partial metamethods (core dedupe fix).
+// ---------------------------------------------------------------------------
+
+/// Declares ONLY `Eq, Ord` — `__eq`, `__lt`, and `__le` must still bind.
+#[derive(Script, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[script(traits(Eq, Ord))]
+struct Rank {
+    level: i64,
+}
+
+/// Declares both markers — `__eq` binds once and works.
+#[derive(Script, Clone, PartialEq, Eq)]
+#[script(traits(PartialEq, Eq))]
+struct Badge {
+    id: i64,
+}
+
+fn setup_marker_lua() -> Lua {
+    let lua = Lua::new();
+    let table = lua.create_table().unwrap();
+    bind_type::<Rank>(&lua, &table).unwrap();
+    let table = lua.create_table().unwrap();
+    bind_type::<Badge>(&lua, &table).unwrap();
+    let globals = lua.globals();
+    globals
+        .set("r1", lua.create_any_userdata(Rank { level: 1 }).unwrap())
+        .unwrap();
+    globals
+        .set("r1b", lua.create_any_userdata(Rank { level: 1 }).unwrap())
+        .unwrap();
+    globals
+        .set("r2", lua.create_any_userdata(Rank { level: 2 }).unwrap())
+        .unwrap();
+    globals
+        .set("b1a", lua.create_any_userdata(Badge { id: 1 }).unwrap())
+        .unwrap();
+    globals
+        .set("b1b", lua.create_any_userdata(Badge { id: 1 }).unwrap())
+        .unwrap();
+    globals
+        .set("b2", lua.create_any_userdata(Badge { id: 2 }).unwrap())
+        .unwrap();
+    lua
+}
+
+#[test]
+fn eq_ord_markers_bind_comparison_metamethods() {
+    let lua = setup_marker_lua();
+    let (eq, ne, lt, nlt, le): (bool, bool, bool, bool, bool) = lua
+        .load("return r1 == r1b, r1 == r2, r1 < r2, r2 < r1, r1 <= r1b")
+        .eval()
+        .unwrap();
+    assert!(eq, "__eq via `traits(Eq)` alone");
+    assert!(!ne);
+    assert!(lt, "__lt via `traits(Ord)` alone");
+    assert!(!nlt);
+    assert!(le, "__le via `traits(Ord)` alone");
+}
+
+#[test]
+fn both_eq_markers_bind_once_and_work() {
+    let lua = setup_marker_lua();
+    let (same, different): (bool, bool) = lua.load("return b1a == b1b, b1a == b2").eval().unwrap();
+    assert!(same);
+    assert!(!different);
+}
+
+// ---------------------------------------------------------------------------
+// Display → `..` concatenation with strict string-like operands.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn concat_with_strings_numbers_and_self() {
+    let lua = setup_lua();
+    let s: String = lua
+        .load(r#"return vectors.Vec2.new(1, 2) .. " tail""#)
+        .eval()
+        .unwrap();
+    assert_eq!(s, "(1, 2) tail");
+    let s: String = lua
+        .load(r#"return "head " .. vectors.Vec2.new(1, 2)"#)
+        .eval()
+        .unwrap();
+    assert_eq!(s, "head (1, 2)");
+    let s: String = lua
+        .load("local v = vectors.Vec2.new(1, 2); return v .. v")
+        .eval()
+        .unwrap();
+    assert_eq!(s, "(1, 2)(1, 2)");
+    let s: String = lua
+        .load("return vectors.Vec2.new(1, 2) .. 42")
+        .eval()
+        .unwrap();
+    assert_eq!(s, "(1, 2)42");
+}
+
+#[test]
+fn concat_rejects_non_string_like_operands() {
+    let lua = setup_lua();
+    let err = lua
+        .load("return vectors.Vec2.new(1, 2) .. true")
+        .eval::<String>()
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("attempt to concatenate a boolean value"),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn no_display_means_no_concat() {
+    // `Rank` declares no Display: Lua raises its own concat error.
+    let lua = setup_marker_lua();
+    let err = lua
+        .load(r#"return r1 .. "x""#)
+        .eval::<String>()
+        .unwrap_err();
+    assert!(err.to_string().contains("concatenate"), "got: {err}");
 }

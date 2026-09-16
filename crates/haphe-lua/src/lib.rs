@@ -11,8 +11,16 @@
 //! - **Module tables**: nested Lua tables mirroring the module hierarchy.
 //! - **Constants**: module constants converted to Lua values.
 //! - **Type binding**: [`bind_type`] registers a type's fields, methods,
-//!   constructors, and trait metamethods (Display, PartialEq, Add, etc.)
-//!   as Lua UserData — no hand-written mlua code required.
+//!   constructors, and trait metamethods (Display → `tostring`, ToString →
+//!   `..` concatenation with string-like operands, PartialEq/Eq → `==`,
+//!   PartialOrd/Ord → `<`/`<=`, arithmetic operators, ...) as Lua UserData —
+//!   no hand-written mlua code required.
+//! - **Declaration stubs**: [`LuaDeclGenerator`] emits a LuaLS `---@meta`
+//!   definition file so editors see the bound surface with full types.
+//! - **Foreign interfaces**: [`foreign_handle`] builds the handle for a
+//!   `#[script(foreign)]` trait from a table of Lua callbacks, so Rust calls
+//!   out to script-supplied functions — no binder or registration machinery
+//!   involved, just the Lua state and the table.
 //!
 //! # Capabilities
 //!
@@ -20,6 +28,16 @@
 //! (unless the `async` feature is enabled). With the `send` feature, thread
 //! safety requires `Send` (mlua wraps userdata in `Arc<Mutex<T>>`);
 //! without it, no thread-safety constraint is imposed.
+//!
+//! # Operator overloads
+//!
+//! Repeated operator-trait declarations (`traits(Add, Add(rhs = f64))`) are
+//! merged into ONE Lua metamethod per operator. Resolution order:
+//! `Self op Self` first, then scalar overloads whose declared rhs type
+//! exactly matches the Lua value's shape (an integer prefers an integer
+//! overload, a float a float one), then the remaining overloads in
+//! declaration order — where a Lua integer still converts into a float
+//! overload, so declaration order decides among lossy candidates.
 //!
 //! # Example
 //!
@@ -58,8 +76,13 @@
 //! ```
 
 mod binder;
+mod decl;
 mod error;
+mod foreign;
 mod module;
+
+pub use decl::{LuaDeclError, LuaDeclGenerator};
+pub use foreign::{foreign_caller, foreign_handle};
 
 use haphe::{
     BackendCapabilities, RuntimeBinder, ScriptBind, ScriptBindFn, ThreadSafety, ValidatedRegistry,
@@ -92,7 +115,7 @@ impl LuaBinder {
         Self { capabilities }
     }
 
-    fn default_capabilities() -> BackendCapabilities {
+    pub(crate) fn default_capabilities() -> BackendCapabilities {
         let thread_safety = if cfg!(feature = "send") {
             Some(ThreadSafety::SEND)
         } else {

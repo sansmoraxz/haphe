@@ -13,7 +13,7 @@ use mlua::{Lua, MetaMethod, UserDataFields, UserDataMethods};
 use crate::LuaBindError;
 
 /// Converts a [`ScriptValue`] to an [`mlua::Value`].
-fn script_to_lua(lua: &Lua, v: ScriptValue) -> mlua::Result<mlua::Value> {
+pub(crate) fn script_to_lua(lua: &Lua, v: ScriptValue) -> mlua::Result<mlua::Value> {
     match v {
         ScriptValue::Unit => Ok(mlua::Value::Nil),
         ScriptValue::Bool(b) => Ok(mlua::Value::Boolean(b)),
@@ -44,12 +44,15 @@ fn script_to_lua(lua: &Lua, v: ScriptValue) -> mlua::Result<mlua::Value> {
         ScriptValue::Optional(None) => Ok(mlua::Value::Nil),
         ScriptValue::Optional(Some(inner)) => script_to_lua(lua, *inner),
         ScriptValue::UserData(ud) => lua.create_any_userdata(ud).map(mlua::Value::UserData),
+        // Unit-enum cases travel as their case-name string: the declared
+        // exposed names, passed through verbatim and matched exactly.
+        ScriptValue::Enum { case } => Ok(mlua::Value::String(lua.create_string(&case)?)),
         _ => Err(mlua::Error::runtime("unsupported ScriptValue variant")),
     }
 }
 
 /// Converts an [`mlua::Value`] to a [`ScriptValue`].
-fn lua_to_script(v: &mlua::Value) -> mlua::Result<ScriptValue> {
+pub(crate) fn lua_to_script(v: &mlua::Value) -> mlua::Result<ScriptValue> {
     match v {
         mlua::Value::Nil => Ok(ScriptValue::Unit),
         mlua::Value::Boolean(b) => Ok(ScriptValue::Bool(*b)),
@@ -111,6 +114,11 @@ type ScriptMethodMut<T> =
 type ScriptCtorFn<T> = fn(&[ScriptValue]) -> Result<T, haphe::ScriptConvertError>;
 type ScriptArithSelf<T> = fn(T, T) -> T;
 type ScriptArithScalar<T> = fn(T, &[ScriptValue]) -> Result<T, haphe::ScriptConvertError>;
+/// One scalar overload: the declared rhs type plus its monomorphized wrapper.
+type ScalarOverload<T> = (
+    &'static haphe::TypeDescriptor<'static>,
+    ScriptArithScalar<T>,
+);
 
 struct FieldReg<T: 'static> {
     name: &'static str,
@@ -135,7 +143,25 @@ struct CtorReg<T: 'static> {
 
 enum ArithEntry<T: 'static> {
     SelfOp(&'static str, ScriptArithSelf<T>),
-    Scalar(&'static str, ScriptArithScalar<T>),
+    Scalar(&'static str, ScalarOverload<T>),
+}
+
+/// Lua's overload-ranking policy: whether a Lua value's natural shape is an
+/// exact match for a declared scalar operand type. Integers are *not* exact
+/// matches for float operands (although they convert), so an integer rhs
+/// prefers an integer overload regardless of declaration order.
+fn rhs_matches_exactly(rhs: &haphe::TypeDescriptor<'_>, value: &mlua::Value) -> bool {
+    use haphe::{PrimitiveType as P, TypeDescriptor as Td};
+    match value {
+        mlua::Value::Integer(_) => matches!(
+            rhs,
+            Td::Primitive(P::I8 | P::I16 | P::I32 | P::I64 | P::U8 | P::U16 | P::U32 | P::U64)
+        ),
+        mlua::Value::Number(_) => matches!(rhs, Td::Primitive(P::F32 | P::F64)),
+        mlua::Value::Boolean(_) => matches!(rhs, Td::Primitive(P::Bool)),
+        mlua::Value::String(_) => matches!(rhs, Td::String | Td::Primitive(P::Char)),
+        _ => false,
+    }
 }
 
 /// Collects registrations from `ScriptBind::bind`, then applies them to Lua.
@@ -145,6 +171,7 @@ pub(crate) struct LuaTypeBinder<T: 'static> {
     mut_methods: Vec<MutMethodReg<T>>,
     constructors: Vec<CtorReg<T>>,
     tostring: Option<fn(&T) -> String>,
+    concat: Option<fn(&T) -> String>,
     eq: Option<fn(&T, &T) -> bool>,
     lt: Option<fn(&T, &T) -> bool>,
     le: Option<fn(&T, &T) -> bool>,
@@ -160,6 +187,7 @@ impl<T: 'static + Clone + mlua::MaybeSend + mlua::MaybeSync> LuaTypeBinder<T> {
             mut_methods: Vec::new(),
             constructors: Vec::new(),
             tostring: None,
+            concat: None,
             eq: None,
             lt: None,
             le: None,
@@ -235,6 +263,39 @@ impl<T: 'static + Clone + mlua::MaybeSend + mlua::MaybeSync> LuaTypeBinder<T> {
             if let Some(f) = self.tostring {
                 reg.add_meta_method(MetaMethod::ToString, move |_, this, ()| Ok(f(this)));
             }
+            if let Some(f) = self.concat {
+                // Strict string-like rule: each operand must be this type,
+                // a string, or a number; anything else errors in Lua's own
+                // style.
+                let fragment = move |lua: &Lua, v: &mlua::Value| -> mlua::Result<String> {
+                    if let mlua::Value::UserData(ud) = v
+                        && let Ok(this) = ud.borrow::<T>()
+                    {
+                        return Ok(f(&this));
+                    }
+                    match v {
+                        mlua::Value::String(s) => Ok(s.to_str()?.to_owned()),
+                        mlua::Value::Integer(_) | mlua::Value::Number(_) => Ok(lua
+                            .coerce_string(v.clone())?
+                            .expect("numbers coerce to strings")
+                            .to_str()?
+                            .to_owned()),
+                        other => Err(mlua::Error::runtime(format!(
+                            "attempt to concatenate a {} value",
+                            other.type_name()
+                        ))),
+                    }
+                };
+                reg.add_meta_function(MetaMethod::Concat, move |lua, args: mlua::MultiValue| {
+                    let v = args.into_vec();
+                    if v.len() != 2 {
+                        return Err(mlua::Error::runtime("expected 2 args"));
+                    }
+                    let mut out = fragment(lua, &v[0])?;
+                    out.push_str(&fragment(lua, &v[1])?);
+                    lua.create_string(&out)
+                });
+            }
             if let Some(f) = self.eq {
                 reg.add_meta_function(MetaMethod::Eq, move |lua, args: mlua::MultiValue| {
                     let mut v = args.into_vec();
@@ -267,18 +328,23 @@ impl<T: 'static + Clone + mlua::MaybeSend + mlua::MaybeSync> LuaTypeBinder<T> {
                 });
             }
 
-            // Arithmetic: group by op, merge handlers.
+            // Arithmetic: group by op, merge handlers. Repeated operator
+            // declarations become overloads of ONE metamethod, resolved as:
+            // `Self op Self` first, then scalar overloads whose declared rhs
+            // type exactly matches the value's shape, then the remaining
+            // overloads in declaration order (where an integer still
+            // converts into a float overload).
             let mut self_ops: std::collections::BTreeMap<&str, ScriptArithSelf<T>> =
                 std::collections::BTreeMap::new();
-            let mut scalar_ops: std::collections::BTreeMap<&str, Vec<ScriptArithScalar<T>>> =
+            let mut scalar_ops: std::collections::BTreeMap<&str, Vec<ScalarOverload<T>>> =
                 std::collections::BTreeMap::new();
             for entry in &self.ariths {
                 match entry {
                     ArithEntry::SelfOp(op, f) => {
                         self_ops.insert(op, *f);
                     }
-                    ArithEntry::Scalar(op, f) => {
-                        scalar_ops.entry(op).or_default().push(*f);
+                    ArithEntry::Scalar(op, overload) => {
+                        scalar_ops.entry(op).or_default().push(*overload);
                     }
                 }
             }
@@ -297,7 +363,7 @@ impl<T: 'static + Clone + mlua::MaybeSend + mlua::MaybeSync> LuaTypeBinder<T> {
                     _ => continue,
                 };
                 let self_f = self_ops.get(op).copied();
-                let scalar_fs: Vec<ScriptArithScalar<T>> =
+                let scalar_fs: Vec<ScalarOverload<T>> =
                     scalar_ops.get(op).cloned().unwrap_or_default();
 
                 reg.add_meta_function(meta, move |lua, args: mlua::MultiValue| {
@@ -320,28 +386,38 @@ impl<T: 'static + Clone + mlua::MaybeSend + mlua::MaybeSync> LuaTypeBinder<T> {
                         return lua.create_any_userdata(f(a.clone(), b.clone()));
                     }
 
-                    // Try Self op scalar.
-                    for f in &scalar_fs {
-                        if let Ok(a_ud) =
-                            <mlua::AnyUserData as mlua::FromLua>::from_lua(first.clone(), lua)
-                            && let Ok(a) = a_ud.borrow::<T>()
-                            && let Ok(sv) = lua_to_script(&second)
-                            && let Ok(result) = f(a.clone(), &[sv])
-                        {
-                            return lua.create_any_userdata(result);
-                        }
-                    }
+                    // Scalar overloads, two passes: exact rhs-type matches
+                    // first, then the rest in declaration order.
+                    let try_scalar =
+                        |receiver: &mlua::Value,
+                         scalar: &mlua::Value|
+                         -> Option<mlua::Result<mlua::AnyUserData>> {
+                            let ud = <mlua::AnyUserData as mlua::FromLua>::from_lua(
+                                receiver.clone(),
+                                lua,
+                            )
+                            .ok()?;
+                            let this = ud.borrow::<T>().ok()?;
+                            let sv = lua_to_script(scalar).ok()?;
+                            for exact_pass in [true, false] {
+                                for (rhs, f) in &scalar_fs {
+                                    if rhs_matches_exactly(rhs, scalar) == exact_pass
+                                        && let Ok(result) =
+                                            f(this.clone(), std::slice::from_ref(&sv))
+                                    {
+                                        return Some(lua.create_any_userdata(result));
+                                    }
+                                }
+                            }
+                            None
+                        };
 
-                    // Try scalar op Self (commutative).
-                    for f in &scalar_fs {
-                        if let Ok(b_ud) =
-                            <mlua::AnyUserData as mlua::FromLua>::from_lua(second.clone(), lua)
-                            && let Ok(b) = b_ud.borrow::<T>()
-                            && let Ok(sv) = lua_to_script(&first)
-                            && let Ok(result) = f(b.clone(), &[sv])
-                        {
-                            return lua.create_any_userdata(result);
-                        }
+                    // Self op scalar, then scalar op Self (commutative).
+                    if let Some(result) = try_scalar(&first, &second) {
+                        return result;
+                    }
+                    if let Some(result) = try_scalar(&second, &first) {
+                        return result;
                     }
 
                     Err(mlua::Error::runtime("no matching operand types"))
@@ -424,6 +500,10 @@ impl<T: 'static + Clone + mlua::MaybeSend + mlua::MaybeSync> TypeBinder<T> for L
         self.tostring = Some(f);
         Ok(())
     }
+    fn meta_concat(&mut self, f: fn(&T) -> String) -> Result<(), Self::Error> {
+        self.concat = Some(f);
+        Ok(())
+    }
     fn meta_eq(&mut self, f: fn(&T, &T) -> bool) -> Result<(), Self::Error> {
         self.eq = Some(f);
         Ok(())
@@ -447,9 +527,10 @@ impl<T: 'static + Clone + mlua::MaybeSend + mlua::MaybeSync> TypeBinder<T> for L
     fn meta_arith_scalar(
         &mut self,
         op: &'static str,
+        rhs: &'static haphe::TypeDescriptor<'static>,
         f: fn(T, &[ScriptValue]) -> Result<T, haphe::ScriptConvertError>,
     ) -> Result<(), Self::Error> {
-        self.ariths.push(ArithEntry::Scalar(op, f));
+        self.ariths.push(ArithEntry::Scalar(op, (rhs, f)));
         Ok(())
     }
 }

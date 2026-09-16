@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 description = "mlua backend for the haphe scripting-language binding generator"
 license = "Apache-2.0"
+readme = "README.md"
 
 [dependencies]
 haphe = { path = "../haphe", default-features = false }
@@ -32,6 +33,13 @@ error-send = ["mlua/error-send"]
 
 # Async support
 async = ["mlua/async"]
+
+# Foreign dispatch for generic interfaces and generic functions: Lua is
+# dynamically typed, so one Lua function serves every declared instantiation
+# and runtime type arguments are ignored (return values are still checked by
+# the calling side's conversions). Without this feature such foreign
+# interfaces are rejected with a descriptive error.
+generics = []
 
 # Serialization (serde integration for Lua values)
 serialize = ["mlua/serialize"]

@@ -18,6 +18,19 @@ pub enum LuaBindError {
         /// The function's exposed name.
         name: &'static str,
     },
+    /// A foreign interface's callbacks table lacks a function (the field is
+    /// missing or not a Lua function).
+    MissingForeignFunction {
+        /// The foreign interface's exposed name.
+        interface: &'static str,
+        /// The missing function's exposed name.
+        function: &'static str,
+    },
+    /// A generic foreign interface was used without the `generics` feature.
+    GenericForeignInterface {
+        /// The interface's exposed name.
+        name: &'static str,
+    },
 }
 
 impl std::fmt::Display for LuaBindError {
@@ -38,7 +51,25 @@ impl std::fmt::Display for LuaBindError {
                 write!(
                     f,
                     "generic function `{name}` is not supported by this backend: \
-                     Lua dispatches by name only and cannot distinguish instantiations"
+                     Lua dispatches by name only and cannot distinguish instantiations \
+                     (foreign dispatch can opt in via the `generics` feature)"
+                )
+            }
+            Self::MissingForeignFunction {
+                interface,
+                function,
+            } => {
+                write!(
+                    f,
+                    "callbacks table for foreign interface `{interface}` has no \
+                     function `{function}`"
+                )
+            }
+            Self::GenericForeignInterface { name } => {
+                write!(
+                    f,
+                    "foreign interface `{name}` is generic; enable the `generics` \
+                     feature to dispatch instantiations through one Lua function"
                 )
             }
         }
@@ -51,6 +82,8 @@ impl std::error::Error for LuaBindError {
             Self::Lua(e) => Some(e),
             Self::InvalidConstant { .. } => None,
             Self::GenericFunction { .. } => None,
+            Self::MissingForeignFunction { .. } => None,
+            Self::GenericForeignInterface { .. } => None,
         }
     }
 }
