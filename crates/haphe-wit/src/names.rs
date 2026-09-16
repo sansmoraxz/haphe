@@ -103,15 +103,26 @@ impl NameMap {
     /// Registers `original` under its kebab form, returning the kebab name or
     /// a collision error if a different original already claimed it.
     pub fn insert(&mut self, original: &str) -> Result<String, WitGenError> {
+        self.insert_as(original, original)
+    }
+
+    /// Like [`insert`](Self::insert), but with a distinct `identity` for the
+    /// collision check — used by trait projections so a user member with the
+    /// same spelling still collides descriptively.
+    pub(crate) fn insert_as(
+        &mut self,
+        original: &str,
+        identity: &str,
+    ) -> Result<String, WitGenError> {
         let kebab = to_kebab(original);
         match self.seen.get(&kebab) {
-            Some(first) if first != original => Err(WitGenError::NameCollision {
+            Some(first) if first != identity => Err(WitGenError::NameCollision {
                 kebab,
                 first: first.clone(),
-                second: original.to_string(),
+                second: identity.to_string(),
             }),
             _ => {
-                self.seen.insert(kebab.clone(), original.to_string());
+                self.seen.insert(kebab.clone(), identity.to_string());
                 Ok(kebab)
             }
         }

@@ -21,11 +21,42 @@ use wasmtime::Engine;
 use wasmtime::component::{Component, Linker, Val};
 
 /// A 2D point.
-#[derive(Script, Clone)]
-#[script(traits(Clone), methods)]
+#[derive(Script, Clone, Default, PartialEq, Debug)]
+#[script(thread_safety = send_sync, traits(Clone, PartialEq, Display, Default), methods)]
 struct Point {
     x: f64,
     y: f64,
+}
+
+impl std::fmt::Display for Point {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "({}, {})", self.x, self.y)
+    }
+}
+
+// Resource values cross fn signatures as opaque userdata.
+impl From<Point> for haphe::ScriptValue {
+    fn from(p: Point) -> Self {
+        haphe::ScriptValue::UserData(haphe::OpaqueUserData::new(p))
+    }
+}
+
+impl haphe::FromScript for Point {
+    fn from_script(v: haphe::ScriptValue) -> Result<Self, haphe::ScriptConvertError> {
+        match v {
+            haphe::ScriptValue::UserData(ud) => {
+                ud.downcast_clone::<Point>()
+                    .ok_or(haphe::ScriptConvertError {
+                        expected: "Point",
+                        got: "a different userdata",
+                    })
+            }
+            other => Err(haphe::ScriptConvertError {
+                expected: "Point",
+                got: other.variant_name(),
+            }),
+        }
+    }
 }
 
 #[script]
@@ -38,12 +69,58 @@ impl Point {
     fn distance_to(&self, other: &Point) -> f64 {
         ((self.x - other.x).powi(2) + (self.y - other.y).powi(2)).sqrt()
     }
+
+    fn scale(&mut self, k: f64) {
+        self.x *= k;
+        self.y *= k;
+    }
+
+    fn take_x(self) -> f64 {
+        self.x
+    }
+
+    async fn xy_sum(&self) -> f64 {
+        self.x + self.y
+    }
+
+    async fn nudge(&mut self, dx: f64) {
+        self.x += dx;
+    }
+}
+
+/// A second resource type, for cross-type handle checks.
+#[derive(Script, Clone)]
+#[script(thread_safety = send_sync, methods)]
+struct Counter {
+    n: i64,
+}
+
+#[script]
+impl Counter {
+    #[script(constructor)]
+    fn new() -> Self {
+        Counter { n: 0 }
+    }
+
+    fn bump(&mut self) -> i64 {
+        self.n += 1;
+        self.n
+    }
 }
 
 /// Adds two integers.
 #[script]
 fn add(a: i32, b: i32) -> i32 {
     a + b
+}
+
+/// Midpoint of two points (resource params and return through a free fn).
+#[script]
+fn midpoint(a: &Point, b: &Point) -> Point {
+    Point {
+        x: (a.x + b.x) / 2.0,
+        y: (a.y + b.y) / 2.0,
+    }
 }
 
 /// Fetches a rate asynchronously.
@@ -80,12 +157,12 @@ fn delayed(x: f64) -> haphe::Future<f64> {
 
 haphe::registry! {
     pub static REGISTRY = {
-        structs: [Point],
+        structs: [Point, Counter],
         modules: [
             mod geometry {
                 doc: "Geometry utilities",
-                functions: [add, fetch_rate, counts, delayed],
-                types: [Point],
+                functions: [add, midpoint, fetch_rate, counts, delayed],
+                types: [Point, Counter],
                 constants: [
                     /// Circle constant.
                     PI: f64 = 3.141592653589793,
@@ -249,7 +326,7 @@ fn stub_function_links_but_traps_when_called() {
     let err = run_guest(&engine, &linker, (), ADD_GUEST).expect_err("stub should trap");
     let msg = format!("{err:?}");
     assert!(
-        msg.contains("haphe-wit: `add` not yet implemented"),
+        msg.contains("haphe-wit: `add`: not registered"),
         "got: {msg}"
     );
 }
@@ -266,7 +343,7 @@ fn resource_surface_links_and_constructor_traps() {
     let err = run_guest(&engine, &linker, (), POINT_GUEST).expect_err("ctor stub should trap");
     let msg = format!("{err:?}");
     assert!(
-        msg.contains("haphe-wit: `[constructor]point` not yet implemented"),
+        msg.contains("declared but not registered; call `register_type`"),
         "got: {msg}"
     );
 }
@@ -282,7 +359,7 @@ fn async_function_links_and_stub_traps() {
     let err = run_guest(&engine, &linker, (), ASYNC_GUEST).expect_err("stub should trap");
     let msg = format!("{err:?}");
     assert!(
-        msg.contains("haphe-wit: `fetch-rate` not yet implemented"),
+        msg.contains("async free functions are not yet bridged"),
         "got: {msg}"
     );
 }
@@ -341,7 +418,7 @@ fn stream_function_links_and_stub_traps() {
     let err = run_guest(&engine, &linker, (), STREAM_GUEST).expect_err("stub should trap");
     let msg = format!("{err:?}");
     assert!(
-        msg.contains("haphe-wit: `counts` not yet implemented"),
+        msg.contains("haphe-wit: `counts`: not registered"),
         "got: {msg}"
     );
 }
@@ -357,7 +434,7 @@ fn future_function_links_and_stub_traps() {
     let err = run_guest(&engine, &linker, (), FUTURE_GUEST).expect_err("stub should trap");
     let msg = format!("{err:?}");
     assert!(
-        msg.contains("haphe-wit: `delayed` not yet implemented"),
+        msg.contains("haphe-wit: `delayed`: not registered"),
         "got: {msg}"
     );
 }
@@ -707,6 +784,7 @@ fn generic_foreign_handle_resolves_monomorphized_export() {
 
 /// A plain data pair (WIT record).
 #[derive(Script, Clone, Debug, PartialEq)]
+#[script(thread_safety = send_sync, traits(PartialEq))]
 struct Pair {
     a: f64,
     b: f64,
@@ -751,8 +829,9 @@ impl haphe::FromScript for Pair {
     }
 }
 
-/// A unit enum (WIT enum); conversions are derive-generated.
+/// A unit enum (WIT enum) with a numeric repr: cases carry discriminants.
 #[derive(Script, Debug, PartialEq)]
+#[repr(u8)]
 enum Fruit {
     Apple,
     DragonFruit,
@@ -825,6 +904,119 @@ fn composite_values_cross_the_foreign_boundary() {
     // crate's kebab conversion.
     assert_eq!(comp.rate(Fruit::Apple), 0);
     assert_eq!(comp.rate(Fruit::DragonFruit), 1);
+}
+
+#[test]
+fn numeric_enum_discriminants_cross_the_boundary() {
+    let engine = Engine::default();
+    let component = Component::new(&engine, wat::parse_str(COMPOSITE_GUEST).unwrap()).unwrap();
+    let linker: Linker<()> = Linker::new(&engine);
+    let mut store = wasmtime::Store::new(&engine, ());
+    let instance = linker.instantiate(&mut store, &component).unwrap();
+    let store = std::sync::Arc::new(std::sync::Mutex::new(store));
+    let validated = COMPOSITE_REGISTRY.validate().unwrap();
+    let caller = haphe_wit::foreign_caller_in(
+        "haphe:demo",
+        store,
+        &instance,
+        &<CompositeHandle as haphe::ScriptForeign>::DESCRIPTOR,
+        &[],
+        &validated,
+    )
+    .unwrap();
+
+    // Lifted enum returns carry the recorded discriminant.
+    let out = caller
+        .call("pick", &[], &[haphe::ScriptValue::I64(1)])
+        .unwrap();
+    assert!(matches!(
+        out,
+        haphe::ScriptValue::Enum { ref case, discriminant: Some(1) } if case == "DragonFruit"
+    ));
+
+    // A plain integer lowers into a numeric enum parameter.
+    let out = caller
+        .call("rate", &[], &[haphe::ScriptValue::I64(0)])
+        .unwrap();
+    assert!(matches!(out, haphe::ScriptValue::I64(0)));
+    // Unknown discriminants error instead of guessing.
+    let err = caller
+        .call("rate", &[], &[haphe::ScriptValue::I64(9)])
+        .unwrap_err();
+    assert!(format!("{err}").contains("discriminant"), "got: {err}");
+}
+
+// ---------------------------------------------------------------------------
+// Enum companion methods (live dispatch)
+// ---------------------------------------------------------------------------
+
+/// A rated fruit grade with a method, dispatched as a companion function.
+#[derive(Script, Debug, PartialEq, Clone, Copy)]
+#[script(methods, thread_safety = send_sync)]
+enum Grade {
+    Poor,
+    Fine,
+}
+
+#[script]
+impl Grade {
+    fn score(&self, bonus: i64) -> i64 {
+        let base = match self {
+            Grade::Poor => 1,
+            Grade::Fine => 10,
+        };
+        base + bonus
+    }
+}
+
+haphe::registry! {
+    pub static GRADE_REGISTRY = {
+        enums: [Grade],
+    };
+}
+
+/// Calls `grade-score(fine, 5)` -> 15.
+const GRADE_GUEST: &str = r#"
+(component
+  (type $grade-def (enum "poor" "fine"))
+  (import "haphe:demo/types" (instance $t
+    (export "grade" (type $grade (eq $grade-def)))
+    (export "grade-score" (func (param "self" $grade) (param "bonus" s64) (result s64)))
+  ))
+  (core func $score (canon lower (func $t "grade-score")))
+  (core module $m
+    (import "t" "score" (func $score (param i32 i64) (result i64)))
+    (func (export "run") (result i64)
+      (call $score (i32.const 1) (i64.const 5)))
+  )
+  (core instance $mi (instantiate $m
+    (with "t" (instance (export "score" (func $score))))
+  ))
+  (func (export "run") (result s64) (canon lift (core func $mi "run")))
+)
+"#;
+
+#[test]
+fn enum_companion_method_dispatches_live() {
+    let engine = Engine::default();
+    let mut linker = Linker::new(&engine);
+    let mut binder = WasmBinder::new(WitGenerator::new("haphe:demo"));
+    binder.register_enum::<Grade>().unwrap();
+    haphe::bind(&binder, &GRADE_REGISTRY, &mut linker).expect("binding succeeds");
+
+    let result = run_guest(&engine, &linker, (), GRADE_GUEST).expect("guest runs");
+    assert!(matches!(result, Val::S64(15)), "got: {result:?}");
+}
+
+#[test]
+fn unregistered_enum_companion_traps_descriptively() {
+    let engine = Engine::default();
+    let mut linker = Linker::new(&engine);
+    let binder = WasmBinder::new(WitGenerator::new("haphe:demo"));
+    haphe::bind(&binder, &GRADE_REGISTRY, &mut linker).expect("binding succeeds");
+
+    let err = run_guest(&engine, &linker, (), GRADE_GUEST).expect_err("stub traps");
+    assert!(format!("{err:?}").contains("register_enum"), "got: {err:?}");
 }
 
 // ---------------------------------------------------------------------------
@@ -1101,7 +1293,612 @@ fn registry_level_monomorph_stub_links_but_traps() {
     let err = run_guest(&engine, &linker, (), RELAY_GUEST).expect_err("stub should trap");
     let msg = format!("{err:?}");
     assert!(
-        msg.contains("haphe-wit: `relay-s64` not yet implemented"),
+        msg.contains("haphe-wit: `relay-s64`: not registered"),
         "got: {msg}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Live provided-direction dispatch
+// ---------------------------------------------------------------------------
+
+/// A binder with the geometry registry's types and functions registered.
+fn live_binder() -> WasmBinder<()> {
+    let mut b = WasmBinder::new(WitGenerator::new("haphe:demo"));
+    b.register_type::<Point>().unwrap();
+    b.register_type::<Counter>().unwrap();
+    b.register_fn::<add>().unwrap();
+    b.register_fn::<midpoint>().unwrap();
+    b
+}
+
+#[test]
+fn duplicate_registration_is_rejected() {
+    let mut b = WasmBinder::<()>::new(WitGenerator::new("haphe:demo"));
+    b.register_type::<Point>().unwrap();
+    let Err(err) = b.register_type::<Point>() else {
+        panic!("expected a duplicate-registration error");
+    };
+    assert!(
+        matches!(err, WasmBindError::DuplicateRegistration { .. }),
+        "got: {err:?}"
+    );
+}
+
+/// The registered `add` executes for real: 1 + 2 = 3.
+#[test]
+fn registered_function_dispatches_live() {
+    let engine = Engine::default();
+    let mut linker = Linker::new(&engine);
+    haphe::bind(&live_binder(), &REGISTRY, &mut linker).expect("binding succeeds");
+
+    let result = run_guest(&engine, &linker, (), ADD_GUEST).expect("guest runs");
+    assert!(matches!(result, Val::S32(3)), "got: {result:?}");
+}
+
+/// Full resource lifecycle: construct, borrow-method with a second handle,
+/// field set/get, `&mut self` mutation, owned-receiver consumption.
+/// d(0,3 -> 4,0) = 5; set-x(p1, 10); scale(p1, 2) -> x = 20; take-x(p2) = 4;
+/// total = 5 + 20 + 4 = 29.
+const POINT_LIFE_GUEST: &str = r#"
+(component
+  (import "haphe:demo/geometry" (instance $geo
+    (export "point" (type $point (sub resource)))
+    (export "[constructor]point" (func (param "x" f64) (param "y" f64) (result (own $point))))
+    (export "[method]point.distance-to" (func (param "self" (borrow $point)) (param "other" (borrow $point)) (result f64)))
+    (export "[method]point.x" (func (param "self" (borrow $point)) (result f64)))
+    (export "[method]point.set-x" (func (param "self" (borrow $point)) (param "value" f64)))
+    (export "[method]point.scale" (func (param "self" (borrow $point)) (param "k" f64)))
+    (export "[static]point.take-x" (func (param "this" (own $point)) (result f64)))
+  ))
+  (core func $ctor (canon lower (func $geo "[constructor]point")))
+  (core func $dist (canon lower (func $geo "[method]point.distance-to")))
+  (core func $getx (canon lower (func $geo "[method]point.x")))
+  (core func $setx (canon lower (func $geo "[method]point.set-x")))
+  (core func $scale (canon lower (func $geo "[method]point.scale")))
+  (core func $takex (canon lower (func $geo "[static]point.take-x")))
+  (core module $m
+    (import "geo" "ctor" (func $ctor (param f64 f64) (result i32)))
+    (import "geo" "dist" (func $dist (param i32 i32) (result f64)))
+    (import "geo" "getx" (func $getx (param i32) (result f64)))
+    (import "geo" "setx" (func $setx (param i32 f64)))
+    (import "geo" "scale" (func $scale (param i32 f64)))
+    (import "geo" "takex" (func $takex (param i32) (result f64)))
+    (func (export "run") (result f64) (local $p1 i32) (local $p2 i32) (local $acc f64)
+      (local.set $p1 (call $ctor (f64.const 0) (f64.const 3)))
+      (local.set $p2 (call $ctor (f64.const 4) (f64.const 0)))
+      (local.set $acc (call $dist (local.get $p1) (local.get $p2)))
+      (call $setx (local.get $p1) (f64.const 10))
+      (call $scale (local.get $p1) (f64.const 2))
+      (local.set $acc (f64.add (local.get $acc) (call $getx (local.get $p1))))
+      (local.set $acc (f64.add (local.get $acc) (call $takex (local.get $p2))))
+      (local.get $acc))
+  )
+  (core instance $mi (instantiate $m
+    (with "geo" (instance
+      (export "ctor" (func $ctor))
+      (export "dist" (func $dist))
+      (export "getx" (func $getx))
+      (export "setx" (func $setx))
+      (export "scale" (func $scale))
+      (export "takex" (func $takex))))
+  ))
+  (func (export "run") (result f64) (canon lift (core func $mi "run")))
+)
+"#;
+
+#[test]
+fn resource_lifecycle_dispatches_live() {
+    let engine = Engine::default();
+    let mut linker = Linker::new(&engine);
+    haphe::bind(&live_binder(), &REGISTRY, &mut linker).expect("binding succeeds");
+
+    let result = run_guest(&engine, &linker, (), POINT_LIFE_GUEST).expect("guest runs");
+    match result {
+        Val::Float64(v) => assert!((v - 29.0).abs() < 1e-12, "got: {v}"),
+        other => panic!("expected f64, got: {other:?}"),
+    }
+}
+
+/// Async methods dispatch through the on-thread executor; `&mut self`
+/// mutation persists in place. nudge(p, 9): x = 10; xy-sum = 10 + 2 = 12.
+const ASYNC_METHOD_GUEST: &str = r#"
+(component
+  (import "haphe:demo/geometry" (instance $geo
+    (export "point" (type $point (sub resource)))
+    (export "[constructor]point" (func (param "x" f64) (param "y" f64) (result (own $point))))
+    (export "[method]point.xy-sum" (func (param "self" (borrow $point)) (result f64)))
+    (export "[method]point.nudge" (func (param "self" (borrow $point)) (param "dx" f64)))
+  ))
+  (core func $ctor (canon lower (func $geo "[constructor]point")))
+  (core func $sum (canon lower (func $geo "[method]point.xy-sum")))
+  (core func $nudge (canon lower (func $geo "[method]point.nudge")))
+  (core module $m
+    (import "geo" "ctor" (func $ctor (param f64 f64) (result i32)))
+    (import "geo" "sum" (func $sum (param i32) (result f64)))
+    (import "geo" "nudge" (func $nudge (param i32 f64)))
+    (func (export "run") (result f64) (local $p i32)
+      (local.set $p (call $ctor (f64.const 1) (f64.const 2)))
+      (call $nudge (local.get $p) (f64.const 9))
+      (call $sum (local.get $p)))
+  )
+  (core instance $mi (instantiate $m
+    (with "geo" (instance
+      (export "ctor" (func $ctor))
+      (export "sum" (func $sum))
+      (export "nudge" (func $nudge))))
+  ))
+  (func (export "run") (result f64) (canon lift (core func $mi "run")))
+)
+"#;
+
+#[test]
+fn async_methods_dispatch_and_mutate_in_place() {
+    let engine = Engine::default();
+    let mut linker = Linker::new(&engine);
+    haphe::bind(&live_binder(), &REGISTRY, &mut linker).expect("binding succeeds");
+
+    let result = run_guest(&engine, &linker, (), ASYNC_METHOD_GUEST).expect("guest runs");
+    match result {
+        Val::Float64(v) => assert!((v - 12.0).abs() < 1e-12, "got: {v}"),
+        other => panic!("expected f64, got: {other:?}"),
+    }
+}
+
+/// Trait projections on a resource: `default` static ctor and `eq`.
+/// default() == point(0, 0) -> 1.0.
+const PROJECTION_GUEST: &str = r#"
+(component
+  (import "haphe:demo/geometry" (instance $geo
+    (export "point" (type $point (sub resource)))
+    (export "[constructor]point" (func (param "x" f64) (param "y" f64) (result (own $point))))
+    (export "[static]point.default" (func (result (own $point))))
+    (export "[method]point.eq" (func (param "self" (borrow $point)) (param "other" (borrow $point)) (result bool)))
+  ))
+  (core func $ctor (canon lower (func $geo "[constructor]point")))
+  (core func $default (canon lower (func $geo "[static]point.default")))
+  (core func $eq (canon lower (func $geo "[method]point.eq")))
+  (core module $m
+    (import "geo" "ctor" (func $ctor (param f64 f64) (result i32)))
+    (import "geo" "default" (func $default (result i32)))
+    (import "geo" "eq" (func $eq (param i32 i32) (result i32)))
+    (func (export "run") (result f64)
+      (if (result f64)
+        (call $eq (call $default) (call $ctor (f64.const 0) (f64.const 0)))
+        (then (f64.const 1)) (else (f64.const 0))))
+  )
+  (core instance $mi (instantiate $m
+    (with "geo" (instance
+      (export "ctor" (func $ctor))
+      (export "default" (func $default))
+      (export "eq" (func $eq))))
+  ))
+  (func (export "run") (result f64) (canon lift (core func $mi "run")))
+)
+"#;
+
+#[test]
+fn trait_projections_dispatch_live() {
+    let engine = Engine::default();
+    let mut linker = Linker::new(&engine);
+    haphe::bind(&live_binder(), &REGISTRY, &mut linker).expect("binding succeeds");
+
+    let result = run_guest(&engine, &linker, (), PROJECTION_GUEST).expect("guest runs");
+    match result {
+        Val::Float64(v) => assert!((v - 1.0).abs() < 1e-12, "eq(default, (0,0)) held: {v}"),
+        other => panic!("expected f64, got: {other:?}"),
+    }
+}
+
+/// Resource params and returns through a free function: midpoint of (0,0)
+/// and (4,6) has x = 2.
+const MIDPOINT_GUEST: &str = r#"
+(component
+  (import "haphe:demo/geometry" (instance $geo
+    (export "point" (type $point (sub resource)))
+    (export "[constructor]point" (func (param "x" f64) (param "y" f64) (result (own $point))))
+    (export "[method]point.x" (func (param "self" (borrow $point)) (result f64)))
+    (export "midpoint" (func (param "a" (borrow $point)) (param "b" (borrow $point)) (result (own $point))))
+  ))
+  (core func $ctor (canon lower (func $geo "[constructor]point")))
+  (core func $getx (canon lower (func $geo "[method]point.x")))
+  (core func $mid (canon lower (func $geo "midpoint")))
+  (core module $m
+    (import "geo" "ctor" (func $ctor (param f64 f64) (result i32)))
+    (import "geo" "getx" (func $getx (param i32) (result f64)))
+    (import "geo" "mid" (func $mid (param i32 i32) (result i32)))
+    (func (export "run") (result f64)
+      (call $getx
+        (call $mid
+          (call $ctor (f64.const 0) (f64.const 0))
+          (call $ctor (f64.const 4) (f64.const 6)))))
+  )
+  (core instance $mi (instantiate $m
+    (with "geo" (instance
+      (export "ctor" (func $ctor))
+      (export "getx" (func $getx))
+      (export "mid" (func $mid))))
+  ))
+  (func (export "run") (result f64) (canon lift (core func $mi "run")))
+)
+"#;
+
+#[test]
+fn resource_params_and_returns_cross_free_functions() {
+    let engine = Engine::default();
+    let mut linker = Linker::new(&engine);
+    haphe::bind(&live_binder(), &REGISTRY, &mut linker).expect("binding succeeds");
+
+    let result = run_guest(&engine, &linker, (), MIDPOINT_GUEST).expect("guest runs");
+    match result {
+        Val::Float64(v) => assert!((v - 2.0).abs() < 1e-12, "got: {v}"),
+        other => panic!("expected f64, got: {other:?}"),
+    }
+}
+
+/// Reusing an owned handle after transferring it traps (the entry was
+/// consumed).
+const REUSE_GUEST: &str = r#"
+(component
+  (import "haphe:demo/geometry" (instance $geo
+    (export "point" (type $point (sub resource)))
+    (export "[constructor]point" (func (param "x" f64) (param "y" f64) (result (own $point))))
+    (export "[static]point.take-x" (func (param "this" (own $point)) (result f64)))
+  ))
+  (core func $ctor (canon lower (func $geo "[constructor]point")))
+  (core func $takex (canon lower (func $geo "[static]point.take-x")))
+  (core module $m
+    (import "geo" "ctor" (func $ctor (param f64 f64) (result i32)))
+    (import "geo" "takex" (func $takex (param i32) (result f64)))
+    (func (export "run") (result f64) (local $p i32)
+      (local.set $p (call $ctor (f64.const 7) (f64.const 0)))
+      (drop (call $takex (local.get $p)))
+      (call $takex (local.get $p)))
+  )
+  (core instance $mi (instantiate $m
+    (with "geo" (instance
+      (export "ctor" (func $ctor))
+      (export "takex" (func $takex))))
+  ))
+  (func (export "run") (result f64) (canon lift (core func $mi "run")))
+)
+"#;
+
+#[test]
+fn consumed_handle_reuse_traps() {
+    let engine = Engine::default();
+    let mut linker = Linker::new(&engine);
+    haphe::bind(&live_binder(), &REGISTRY, &mut linker).expect("binding succeeds");
+
+    let err = run_guest(&engine, &linker, (), REUSE_GUEST).expect_err("reuse must trap");
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("unknown handle") || msg.contains("consumed") || msg.contains("stale"),
+        "got: {msg}"
+    );
+}
+
+/// Passing a `counter` handle to a `point` member: both resources share one
+/// host representation, so the cross-type misuse is caught by the binder's
+/// dynamic type check (or wasmtime's handle table) and traps.
+const CROSS_TYPE_GUEST: &str = r#"
+(component
+  (import "haphe:demo/geometry" (instance $geo
+    (export "point" (type $point (sub resource)))
+    (export "counter" (type $counter (sub resource)))
+    (export "[method]point.x" (func (param "self" (borrow $point)) (result f64)))
+    (export "[constructor]counter" (func (result (own $counter))))
+  ))
+  (core func $cctor (canon lower (func $geo "[constructor]counter")))
+  (core func $getx (canon lower (func $geo "[method]point.x")))
+  (core module $m
+    (import "geo" "cctor" (func $cctor (result i32)))
+    (import "geo" "getx" (func $getx (param i32) (result f64)))
+    (func (export "run") (result f64)
+      (call $getx (call $cctor)))
+  )
+  (core instance $mi (instantiate $m
+    (with "geo" (instance
+      (export "cctor" (func $cctor))
+      (export "getx" (func $getx))))
+  ))
+  (func (export "run") (result f64) (canon lift (core func $mi "run")))
+)
+"#;
+
+#[test]
+fn cross_type_handle_misuse_traps() {
+    let engine = Engine::default();
+    let mut linker = Linker::new(&engine);
+    haphe::bind(&live_binder(), &REGISTRY, &mut linker).expect("binding succeeds");
+
+    let err = run_guest(&engine, &linker, (), CROSS_TYPE_GUEST).expect_err("must trap");
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("belongs to") || msg.contains("resource type") || msg.contains("handle"),
+        "got: {msg}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Record trait projections (value semantics)
+// ---------------------------------------------------------------------------
+
+haphe::registry! {
+    pub static PAIR_REGISTRY = {
+        structs: [Pair],
+    };
+}
+
+/// `pair-eq` compares two records by value: eq((1,2), (1,2)) -> true.
+const PAIR_EQ_GUEST: &str = r#"
+(component
+  (import "haphe:demo/types" (instance $t
+    (type $pair-def (record (field "a" f64) (field "b" f64)))
+    (export "pair" (type $pair (eq $pair-def)))
+    (export "pair-eq" (func (param "this" $pair) (param "other" $pair) (result bool)))
+  ))
+  (core module $libc (memory (export "mem") 1))
+  (core instance $libc (instantiate $libc))
+  (core func $eq (canon lower (func $t "pair-eq")))
+  (core module $m
+    (import "t" "eq" (func $eq (param f64 f64 f64 f64) (result i32)))
+    (func (export "run") (result f64)
+      (if (result f64)
+        (call $eq (f64.const 1) (f64.const 2) (f64.const 1) (f64.const 2))
+        (then (f64.const 1)) (else (f64.const 0))))
+  )
+  (core instance $mi (instantiate $m
+    (with "t" (instance (export "eq" (func $eq))))
+  ))
+  (func (export "run") (result f64) (canon lift (core func $mi "run")))
+)
+"#;
+
+#[test]
+fn record_projection_dispatches_by_value() {
+    let engine = Engine::default();
+    let mut linker = Linker::new(&engine);
+    let mut binder = WasmBinder::<()>::new(WitGenerator::new("haphe:demo"));
+    binder.register_record::<Pair>().unwrap();
+    haphe::bind(&binder, &PAIR_REGISTRY, &mut linker).expect("binding succeeds");
+
+    let result = run_guest(&engine, &linker, (), PAIR_EQ_GUEST).expect("guest runs");
+    match result {
+        Val::Float64(v) => assert!((v - 1.0).abs() < 1e-12, "got: {v}"),
+        other => panic!("expected f64, got: {other:?}"),
+    }
+}
+
+/// Unregistered records keep descriptive projection stubs.
+#[test]
+fn unregistered_record_projection_traps_descriptively() {
+    let engine = Engine::default();
+    let mut linker = Linker::new(&engine);
+    let binder = WasmBinder::<()>::new(WitGenerator::new("haphe:demo"));
+    haphe::bind(&binder, &PAIR_REGISTRY, &mut linker).expect("binding succeeds");
+
+    let err = run_guest(&engine, &linker, (), PAIR_EQ_GUEST).expect_err("stub should trap");
+    let msg = format!("{err:?}");
+    assert!(msg.contains("not registered"), "got: {msg}");
+}
+
+// ---------------------------------------------------------------------------
+// Generic instance live dispatch (`generics` feature)
+// ---------------------------------------------------------------------------
+
+/// A generic holder resource.
+#[cfg(feature = "generics")]
+#[derive(Script, Clone)]
+#[script(thread_safety = send_sync, methods)]
+struct Holder<T: haphe::FromScript + haphe::IntoScript + Clone + Send + Sync + 'static> {
+    #[script(skip)]
+    v: T,
+}
+
+#[cfg(feature = "generics")]
+#[haphe::script]
+impl<T: haphe::FromScript + haphe::IntoScript + Clone + Send + Sync + 'static> Holder<T> {
+    #[script(constructor)]
+    fn new(v: T) -> Self {
+        Holder { v }
+    }
+
+    fn get(&self) -> T {
+        self.v.clone()
+    }
+}
+
+#[cfg(feature = "generics")]
+haphe::registry! {
+    pub static HOLDER_REGISTRY = {
+        structs: [Holder<f64>],
+    };
+}
+
+#[cfg(feature = "generics")]
+const HOLDER_LIVE_GUEST: &str = r#"
+(component
+  (import "haphe:demo/types" (instance $t
+    (export "holder-f64" (type $h (sub resource)))
+    (export "[constructor]holder-f64" (func (param "v" f64) (result (own $h))))
+    (export "[method]holder-f64.get" (func (param "self" (borrow $h)) (result f64)))
+  ))
+  (core func $ctor (canon lower (func $t "[constructor]holder-f64")))
+  (core func $get (canon lower (func $t "[method]holder-f64.get")))
+  (core module $m
+    (import "t" "ctor" (func $ctor (param f64) (result i32)))
+    (import "t" "get" (func $get (param i32) (result f64)))
+    (func (export "run") (result f64) (call $get (call $ctor (f64.const 2.5))))
+  )
+  (core instance $mi (instantiate $m
+    (with "t" (instance
+      (export "ctor" (func $ctor))
+      (export "get" (func $get))))
+  ))
+  (func (export "run") (result f64) (canon lift (core func $mi "run")))
+)
+"#;
+
+/// A registered monomorphized instance dispatches under its mangled name.
+#[cfg(feature = "generics")]
+#[test]
+fn generic_instance_dispatches_live() {
+    static F64_ARGS: [haphe::TypeDescriptor<'static>; 1] =
+        [haphe::TypeDescriptor::Primitive(haphe::PrimitiveType::F64)];
+
+    let engine = Engine::default();
+    let mut linker = Linker::new(&engine);
+    let mut binder = WasmBinder::<()>::new(WitGenerator::new("haphe:demo"));
+    binder
+        .register_type_instance::<Holder<f64>>(&F64_ARGS)
+        .unwrap();
+    haphe::bind(&binder, &HOLDER_REGISTRY, &mut linker).expect("binding succeeds");
+
+    let result = run_guest(&engine, &linker, (), HOLDER_LIVE_GUEST).expect("guest runs");
+    match result {
+        Val::Float64(v) => assert!((v - 2.5).abs() < 1e-12, "got: {v}"),
+        other => panic!("expected f64, got: {other:?}"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Foreign-direction guest resources
+// ---------------------------------------------------------------------------
+
+/// Guest exporting its own resource type: `make` returns an own handle,
+/// `value` borrows it, `consume` takes ownership.
+const STORE_GUEST: &str = r#"
+(component
+  (core module $m
+    (import "h" "new" (func $new (param i32) (result i32)))
+    (import "h" "rep" (func $rep (param i32) (result i32)))
+    (import "h" "drop" (func $drop (param i32)))
+    (func (export "make") (param i32) (result i32) (call $new (local.get 0)))
+    ;; Borrow params lower into the defining component as raw reps; own
+    ;; params re-enter its handle table (the definer regains ownership).
+    (func (export "value") (param i32) (result i32) (local.get 0))
+    (func (export "consume") (param i32) (result i32) (local i32)
+      (local.set 1 (call $rep (local.get 0)))
+      (call $drop (local.get 0))
+      (local.get 1))
+  )
+  (type $r (resource (rep i32)))
+  (core func $new (canon resource.new $r))
+  (core func $rep (canon resource.rep $r))
+  (core func $drop (canon resource.drop $r))
+  (core instance $mi (instantiate $m
+    (with "h" (instance
+      (export "new" (func $new))
+      (export "rep" (func $rep))
+      (export "drop" (func $drop))))))
+  (func $make (param "n" s32) (result (own $r)) (canon lift (core func $mi "make")))
+  (func $value (param "h" (borrow $r)) (result s32) (canon lift (core func $mi "value")))
+  (func $consume (param "h" (own $r)) (result s32) (canon lift (core func $mi "consume")))
+  (instance $i
+    (export "r" (type $r))
+    (export "make" (func $make))
+    (export "value" (func $value))
+    (export "consume" (func $consume)))
+  (export "haphe:demo/store" (instance $i))
+)
+"#;
+
+/// Hand-built foreign descriptor: names drive resolution; parameter and
+/// return shapes come from the guest's reflected types at dispatch time.
+fn store_descriptor() -> &'static haphe::ForeignInterfaceDescriptor<'static> {
+    use haphe::{
+        ForeignInterfaceDescriptor, FunctionDescriptor, Ownership, Receiver, ThreadSafety,
+        TypeDescriptor, TypeId,
+    };
+    const UNIT: TypeDescriptor<'static> = TypeDescriptor::Unit;
+    const I64_PARAM: [haphe::ParamDescriptor<'static>; 1] = [haphe::ParamDescriptor {
+        name: "n",
+        ty: &TypeDescriptor::Primitive(haphe::PrimitiveType::I32),
+        ownership: Ownership::Owned,
+    }];
+    const fn f(
+        name: &'static str,
+        params: &'static [haphe::ParamDescriptor<'static>],
+    ) -> FunctionDescriptor<'static> {
+        FunctionDescriptor {
+            name,
+            doc: None,
+            receiver: Some(Receiver::Ref),
+            generic_params: &[],
+            instantiations: &[],
+            params,
+            return_type: &UNIT,
+            return_ownership: Ownership::Owned,
+            is_async: false,
+            error_kind: None,
+        }
+    }
+    static FNS: [FunctionDescriptor<'static>; 3] = [
+        f("make", &I64_PARAM),
+        f("value", &I64_PARAM),
+        f("consume", &I64_PARAM),
+    ];
+    static DESC: ForeignInterfaceDescriptor<'static> = ForeignInterfaceDescriptor {
+        id: TypeId::new("Store"),
+        name: "Store",
+        doc: None,
+        generic_params: &[],
+        functions: &FNS,
+        thread_safety: ThreadSafety::NONE,
+    };
+    &DESC
+}
+
+#[test]
+fn foreign_guest_resources_roundtrip() {
+    use haphe::ScriptValue;
+
+    let engine = Engine::default();
+    let component = Component::new(&engine, wat::parse_str(STORE_GUEST).unwrap()).unwrap();
+    let linker: Linker<()> = Linker::new(&engine);
+    let mut store = wasmtime::Store::new(&engine, ());
+    let instance = linker.instantiate(&mut store, &component).unwrap();
+    let store = std::sync::Arc::new(std::sync::Mutex::new(store));
+    let caller =
+        haphe_wit::foreign_caller("haphe:demo", store, &instance, store_descriptor(), &[]).unwrap();
+
+    // Own handle lifts into a GuestResource userdata.
+    let h = caller
+        .call("make", &[], &[ScriptValue::I64(41)])
+        .expect("make succeeds");
+    assert!(matches!(h, ScriptValue::UserData(_)), "got: {h:?}");
+
+    // Borrow positions never consume: the same handle works repeatedly.
+    for _ in 0..2 {
+        let v = caller
+            .call("value", &[], std::slice::from_ref(&h))
+            .expect("value succeeds");
+        assert!(matches!(v, ScriptValue::I64(41)), "got: {v:?}");
+    }
+
+    // Own transfer is single-use: the first `consume` takes the handle,
+    // reuse errors descriptively.
+    let v = caller
+        .call("consume", &[], std::slice::from_ref(&h))
+        .expect("consume succeeds");
+    assert!(matches!(v, ScriptValue::I64(41)), "got: {v:?}");
+    let err = caller
+        .call("consume", &[], &[h])
+        .expect_err("transferred handle cannot be reused");
+    assert!(
+        format!("{err}").contains("already-transferred"),
+        "got: {err}"
+    );
+
+    // Dropped wrappers queue their handles; the next dispatch drains the
+    // queue without error.
+    let dropped = caller
+        .call("make", &[], &[ScriptValue::I64(7)])
+        .expect("make succeeds");
+    drop(dropped);
+    let v = caller
+        .call("make", &[], &[ScriptValue::I64(1)])
+        .expect("dispatch drains the drop queue");
+    assert!(matches!(v, ScriptValue::UserData(_)));
 }

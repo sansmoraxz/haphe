@@ -198,6 +198,7 @@ fn empty_enum_rejected() {
         trait_impls: &[],
         thread_safety: ThreadSafety::SEND_SYNC,
         generic_params: &[],
+        repr: None,
         is_flags: false,
     }];
     static REGISTRY: TypeRegistry = TypeRegistry::new(&[], &ENUMS, &[], &[], &[], &[]);
@@ -207,6 +208,55 @@ fn empty_enum_rejected() {
         matches!(err, WitGenError::InvalidWit { .. }),
         "got: {err:?}"
     );
+}
+
+#[test]
+fn flags_with_gap_bearing_bits_rejected() {
+    // Bits 0 and 2 (values 1 and 4): WIT flags are position-based and would
+    // assign bit 1 (value 2) to the second flag — a misrepresented mask.
+    static VARIANTS: [haphe::EnumVariant; 2] = [
+        haphe::EnumVariant {
+            name: "READ",
+            doc: None,
+            kind: haphe::VariantKind::Unit,
+            discriminant: Some(1),
+        },
+        haphe::EnumVariant {
+            name: "EXEC",
+            doc: None,
+            kind: haphe::VariantKind::Unit,
+            discriminant: Some(4),
+        },
+    ];
+    static ENUMS: [haphe::EnumDescriptor; 1] = [haphe::EnumDescriptor {
+        id: TypeId::new("test::GappyPerm"),
+        name: "GappyPerm",
+        doc: None,
+        variants: &VARIANTS,
+        methods: &[],
+        trait_impls: &[],
+        thread_safety: ThreadSafety::SEND_SYNC,
+        generic_params: &[],
+        repr: Some(haphe::PrimitiveType::U8),
+        is_flags: true,
+    }];
+    static REGISTRY: TypeRegistry = TypeRegistry::new(&[], &ENUMS, &[], &[], &[], &[]);
+
+    let err = generate_err(&REGISTRY);
+    match err {
+        WitGenError::FlagsBitMismatch {
+            name,
+            flag,
+            expected,
+            actual,
+        } => {
+            assert_eq!(name, "GappyPerm");
+            assert_eq!(flag, "EXEC");
+            assert_eq!(expected, 2);
+            assert_eq!(actual, 4);
+        }
+        other => panic!("expected FlagsBitMismatch, got: {other:?}"),
+    }
 }
 
 #[test]
@@ -620,6 +670,83 @@ fn registry_instantiated_generic_fn_rejected_without_feature() {
     let err = generate_err(&REGISTRY);
     assert!(
         matches!(err, WitGenError::GenericFunction { .. }),
+        "got: {err:?}"
+    );
+}
+
+/// A user method named `at` collides with the `Index` trait projection —
+/// same per-resource NameMap, descriptive error.
+#[test]
+fn projection_name_collision_with_user_method() {
+    static AT_METHOD: [FunctionDescriptor; 1] = [FunctionDescriptor {
+        name: "at",
+        doc: None,
+        receiver: Some(Receiver::Ref),
+        generic_params: &[],
+        instantiations: &[],
+        params: &[],
+        return_type: &F64,
+        return_ownership: Ownership::Owned,
+        is_async: false,
+        error_kind: None,
+    }];
+    static S64: TypeDescriptor = TypeDescriptor::Primitive(PrimitiveType::I64);
+    static TRAITS: [haphe::TraitImpl; 1] = [haphe::TraitImpl::Index {
+        index: &S64,
+        output: &S64,
+    }];
+    static STRUCTS: [StructDescriptor; 1] = [StructDescriptor {
+        methods: &AT_METHOD,
+        trait_impls: &TRAITS,
+        ..plain_struct("t::Grid", "Grid")
+    }];
+    static REGISTRY: TypeRegistry = TypeRegistry::new(&STRUCTS, &[], &[], &[], &[], &[]);
+
+    let err = generate_err(&REGISTRY);
+    assert!(
+        matches!(err, WitGenError::NameCollision { ref kebab, .. } if kebab == "at"),
+        "got: {err:?}"
+    );
+}
+
+/// Declaring both `Call` and `AsyncCall` cannot project uniquely.
+#[test]
+fn both_call_traits_rejected_in_projection() {
+    static S64: TypeDescriptor = TypeDescriptor::Primitive(PrimitiveType::I64);
+    static ARGS: [TypeDescriptor; 1] = [S64];
+    static TRAITS: [haphe::TraitImpl; 2] = [
+        haphe::TraitImpl::Call {
+            args: &ARGS,
+            output: &S64,
+        },
+        haphe::TraitImpl::AsyncCall {
+            args: &ARGS,
+            output: &S64,
+        },
+    ];
+    static CTOR: [FunctionDescriptor; 1] = [FunctionDescriptor {
+        name: "new",
+        doc: None,
+        receiver: None,
+        generic_params: &[],
+        instantiations: &[],
+        params: &[],
+        return_type: &UNIT,
+        return_ownership: Ownership::Owned,
+        is_async: false,
+        error_kind: None,
+    }];
+    static STRUCTS: [StructDescriptor; 1] = [StructDescriptor {
+        constructors: &CTOR,
+        trait_impls: &TRAITS,
+        ..plain_struct("t::Fx", "Fx")
+    }];
+    static REGISTRY: TypeRegistry = TypeRegistry::new(&STRUCTS, &[], &[], &[], &[], &[]);
+
+    let err = generate_err(&REGISTRY);
+    assert!(
+        matches!(err, WitGenError::UnrepresentableType { ref detail, .. }
+            if detail.contains("both `Call` and `AsyncCall`")),
         "got: {err:?}"
     );
 }

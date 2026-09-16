@@ -50,10 +50,73 @@ impl Point {
 }
 
 /// A plain data record with no behavior.
-#[derive(Script)]
+#[derive(Script, PartialEq)]
+#[script(traits(PartialEq))]
 struct Size {
     width: u32,
     height: u32,
+}
+
+/// A buffer resource exercising the full trait-projection table.
+#[derive(Script, Clone, Default, PartialEq, Debug, Hash)]
+#[script(
+    thread_safety = send_sync,
+    traits(
+        PartialEq,
+        Default,
+        Debug,
+        Hash,
+        Add,
+        Index(index = i64, output = i64),
+        IndexMut(index = i64, output = i64),
+        IntoIterator(item = i64)
+    ),
+    methods
+)]
+struct Buffer {
+    #[script(skip)]
+    data: Vec<i64>,
+}
+
+impl std::ops::Add for Buffer {
+    type Output = Buffer;
+    fn add(mut self, rhs: Buffer) -> Buffer {
+        self.data.extend(rhs.data);
+        self
+    }
+}
+
+impl std::ops::Index<i64> for Buffer {
+    type Output = i64;
+    fn index(&self, i: i64) -> &i64 {
+        &self.data[i as usize]
+    }
+}
+
+impl std::ops::IndexMut<i64> for Buffer {
+    fn index_mut(&mut self, i: i64) -> &mut i64 {
+        &mut self.data[i as usize]
+    }
+}
+
+impl IntoIterator for Buffer {
+    type Item = i64;
+    type IntoIter = std::vec::IntoIter<i64>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.data.into_iter()
+    }
+}
+
+#[script]
+impl Buffer {
+    #[script(constructor)]
+    fn new() -> Self {
+        Buffer { data: Vec::new() }
+    }
+
+    fn push(&mut self, v: i64) {
+        self.data.push(v);
+    }
 }
 
 /// A named color.
@@ -156,7 +219,7 @@ impl From<Point> for haphe::ScriptValue {
 
 haphe::registry! {
     pub static REGISTRY = {
-        structs: [Point, Size],
+        structs: [Point, Size, Buffer],
         enums: [Color, Direction],
         foreign: [NotifierHandle],
         modules: [
@@ -590,4 +653,55 @@ fn world_lists_foreign_interfaces_per_perspective() {
     let wit = String::from_utf8(output.files[0].content.clone()).unwrap();
     assert!(wit.contains("export geometry;"), "got:\n{wit}");
     assert!(wit.contains("import notifier;"), "got:\n{wit}");
+}
+
+// ---------------------------------------------------------------------------
+// Trait projections (interusability)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn resource_trait_projections_emit() {
+    let wit = generate();
+    // Point: PartialEq + Display project as members.
+    assert!(
+        wit.contains("eq: func(other: borrow<point>) -> bool;"),
+        "got:\n{wit}"
+    );
+    assert!(wit.contains("to-string: func() -> string;"), "got:\n{wit}");
+    // Buffer: the full table.
+    assert!(
+        wit.contains("add: func(rhs: borrow<buffer>) -> buffer;"),
+        "got:\n{wit}"
+    );
+    assert!(
+        wit.contains("eq: func(other: borrow<buffer>) -> bool;"),
+        "got:\n{wit}"
+    );
+    assert!(
+        wit.contains("to-debug-string: func() -> string;"),
+        "got:\n{wit}"
+    );
+    assert!(wit.contains("hash: func() -> u64;"), "got:\n{wit}");
+    assert!(wit.contains("at: func(index: s64) -> s64;"), "got:\n{wit}");
+    assert!(
+        wit.contains("set-at: func(index: s64, value: s64);"),
+        "got:\n{wit}"
+    );
+    assert!(wit.contains("items: func() -> list<s64>;"), "got:\n{wit}");
+    assert!(wit.contains("length: func() -> u64;"), "got:\n{wit}");
+    assert!(
+        wit.contains("default: static func() -> buffer;"),
+        "got:\n{wit}"
+    );
+    // The snapshot semantics are documented in the output.
+    assert!(wit.contains("Eager snapshot"), "got:\n{wit}");
+}
+
+#[test]
+fn record_trait_projections_emit_as_interface_functions() {
+    let wit = generate();
+    assert!(
+        wit.contains("size-eq: func(this: size, other: size) -> bool;"),
+        "got:\n{wit}"
+    );
 }

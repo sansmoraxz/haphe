@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use haphe::{
     ConstantDescriptor, FnInstantiation, FunctionDescriptor, ModuleDescriptor, PrimitiveType,
-    TypeDescriptor, TypeKind, ValidatedRegistry, VariantKind,
+    StructDescriptor, TraitImpl, TypeDescriptor, TypeKind, ValidatedRegistry, VariantKind,
 };
 
 use crate::WitGenError;
@@ -745,4 +745,226 @@ fn flatten_module<'a>(
         flatten_module(sub, &name, interfaces, owner_of, iface_names, generics)?;
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Trait projection (interusability): every declared TraitImpl surfaces as a
+// WIT-native named function. Single source of truth consumed by both the
+// emitter and the live runtime dispatch.
+// ---------------------------------------------------------------------------
+
+/// One projected trait member's dispatch shape.
+pub(crate) enum ProjKind<'a> {
+    /// Binary operator whose rhs is the type itself (`meta_arith_self`).
+    /// `op` keys the runtime dispatch table (`runtime` feature).
+    ArithSelf {
+        #[cfg_attr(not(feature = "runtime"), allow(dead_code))]
+        op: &'static str,
+        output: &'a TypeDescriptor<'a>,
+    },
+    /// Binary operator with a non-self rhs (`meta_arith_scalar`).
+    ArithScalar {
+        #[cfg_attr(not(feature = "runtime"), allow(dead_code))]
+        op: &'static str,
+        rhs: &'a TypeDescriptor<'a>,
+        output: &'a TypeDescriptor<'a>,
+    },
+    /// Unary negation (`meta_unm`).
+    Neg {
+        output: &'a TypeDescriptor<'a>,
+    },
+    /// Bitwise not (`meta_bnot`).
+    BNot {
+        output: &'a TypeDescriptor<'a>,
+    },
+    Eq,
+    Lt,
+    Le,
+    /// `to-string` (Display/ToString, deduplicated).
+    ToString,
+    /// `to-debug-string` (Debug).
+    DebugString,
+    /// `hash: func() -> u64`.
+    Hash,
+    /// `call` (`meta_call` / `meta_call_async`).
+    Call {
+        args: &'a [TypeDescriptor<'a>],
+        output: &'a TypeDescriptor<'a>,
+        is_async: bool,
+    },
+    /// `at` (`meta_index`).
+    IndexGet {
+        index: &'a TypeDescriptor<'a>,
+        output: &'a TypeDescriptor<'a>,
+    },
+    /// `set-at` (`meta_newindex`). For records (value semantics) the
+    /// projection returns the updated record.
+    IndexSet {
+        index: &'a TypeDescriptor<'a>,
+        output: &'a TypeDescriptor<'a>,
+    },
+    /// `items: func() -> list<ITEM>` — an EAGER SNAPSHOT of the iteration
+    /// (`meta_iter`); lazy iterators are not WIT-native.
+    Items {
+        item: &'a TypeDescriptor<'a>,
+    },
+    /// `length: func() -> u64` (`meta_len`).
+    Length,
+    /// `default: static func() -> T` (`Default`, through the constructor
+    /// channel; never the `constructor(...)` slot).
+    Default,
+}
+
+/// One projected trait member: `source_name` runs through the same
+/// kebab-cased [`NameMap`] as user members, so collisions with user-declared
+/// names are descriptive generation errors.
+pub(crate) struct Projected<'a> {
+    pub source_name: &'static str,
+    pub kind: ProjKind<'a>,
+}
+
+/// Whether a trait operand descriptor denotes the type itself.
+fn is_self_ty(ty: &TypeDescriptor<'_>, self_id: &str) -> bool {
+    match ty {
+        TypeDescriptor::Ref(id) => id.as_str() == self_id,
+        TypeDescriptor::Instance { id, .. } => id.as_str() == self_id,
+        _ => false,
+    }
+}
+
+/// The deterministic projection of a struct's declared trait impls into
+/// WIT members (documented in the crate README). Errors on shapes that
+/// cannot project uniquely: multiple overloads of one operator, or both
+/// `Call` and `AsyncCall` (one `call` member can exist).
+pub(crate) fn projected_trait_members<'a>(
+    s: &StructDescriptor<'a>,
+) -> Result<Vec<Projected<'a>>, WitGenError> {
+    let mut out: Vec<Projected<'a>> = Vec::new();
+    let mut seen: HashSet<&'static str> = HashSet::new();
+    let mut push = |name: &'static str, kind: ProjKind<'a>| -> Result<(), WitGenError> {
+        if !seen.insert(name) {
+            return Err(WitGenError::UnrepresentableType {
+                context: s.name.to_string(),
+                detail: format!(
+                    "declares multiple trait impls projecting to WIT member `{name}`; \
+                     expose a named method instead"
+                ),
+            });
+        }
+        out.push(Projected {
+            source_name: name,
+            kind,
+        });
+        Ok(())
+    };
+
+    let self_id = s.id.as_str();
+    let mut has_eq = false;
+    let mut has_ord = false;
+    let mut has_to_string = false;
+    let mut has_iter = false;
+    let mut has_call = false;
+    for ti in s.trait_impls {
+        match ti {
+            TraitImpl::Add { rhs, output }
+            | TraitImpl::Sub { rhs, output }
+            | TraitImpl::Mul { rhs, output }
+            | TraitImpl::Div { rhs, output }
+            | TraitImpl::Rem { rhs, output }
+            | TraitImpl::IDiv { rhs, output }
+            | TraitImpl::Mod { rhs, output }
+            | TraitImpl::Pow { rhs, output }
+            | TraitImpl::BitAnd { rhs, output }
+            | TraitImpl::BitOr { rhs, output }
+            | TraitImpl::BitXor { rhs, output }
+            | TraitImpl::Shl { rhs, output }
+            | TraitImpl::Shr { rhs, output } => {
+                let op: &'static str = match ti {
+                    TraitImpl::Add { .. } => "add",
+                    TraitImpl::Sub { .. } => "sub",
+                    TraitImpl::Mul { .. } => "mul",
+                    TraitImpl::Div { .. } => "div",
+                    TraitImpl::Rem { .. } => "rem",
+                    TraitImpl::IDiv { .. } => "idiv",
+                    TraitImpl::Mod { .. } => "mod",
+                    TraitImpl::Pow { .. } => "pow",
+                    TraitImpl::BitAnd { .. } => "bitand",
+                    TraitImpl::BitOr { .. } => "bitor",
+                    TraitImpl::BitXor { .. } => "bitxor",
+                    TraitImpl::Shl { .. } => "shl",
+                    TraitImpl::Shr { .. } => "shr",
+                    _ => unreachable!(),
+                };
+                if is_self_ty(rhs, self_id) {
+                    push(op, ProjKind::ArithSelf { op, output })?;
+                } else {
+                    push(op, ProjKind::ArithScalar { op, rhs, output })?;
+                }
+            }
+            TraitImpl::Neg { output } => push("neg", ProjKind::Neg { output })?,
+            TraitImpl::Not { output } => push("not", ProjKind::BNot { output })?,
+            TraitImpl::PartialEq | TraitImpl::Eq => {
+                if !has_eq {
+                    has_eq = true;
+                    push("eq", ProjKind::Eq)?;
+                }
+            }
+            TraitImpl::PartialOrd | TraitImpl::Ord => {
+                if !has_ord {
+                    has_ord = true;
+                    push("lt", ProjKind::Lt)?;
+                    push("le", ProjKind::Le)?;
+                }
+            }
+            TraitImpl::Display | TraitImpl::ToString => {
+                if !has_to_string {
+                    has_to_string = true;
+                    push("to_string", ProjKind::ToString)?;
+                }
+            }
+            TraitImpl::Debug => push("to_debug_string", ProjKind::DebugString)?,
+            TraitImpl::Hash => push("hash", ProjKind::Hash)?,
+            TraitImpl::Call { args, output } | TraitImpl::AsyncCall { args, output } => {
+                if has_call {
+                    return Err(WitGenError::UnrepresentableType {
+                        context: s.name.to_string(),
+                        detail: "declares both `Call` and `AsyncCall`; only one `call` \
+                                 projection can exist"
+                            .to_string(),
+                    });
+                }
+                has_call = true;
+                push(
+                    "call",
+                    ProjKind::Call {
+                        args,
+                        output,
+                        is_async: matches!(ti, TraitImpl::AsyncCall { .. }),
+                    },
+                )?;
+            }
+            TraitImpl::Index { index, output } => push("at", ProjKind::IndexGet { index, output })?,
+            TraitImpl::IndexMut { index, output } => {
+                push("set_at", ProjKind::IndexSet { index, output })?
+            }
+            TraitImpl::Iterator { item } | TraitImpl::IntoIterator { item } => {
+                if !has_iter {
+                    has_iter = true;
+                    push("items", ProjKind::Items { item })?;
+                    push("length", ProjKind::Length)?;
+                }
+            }
+            TraitImpl::Default => push("default", ProjKind::Default)?,
+            // `Clone` is deliberately unprojected: handles give guests
+            // sharing, and value types copy structurally.
+            TraitImpl::Clone => {}
+            _ => {
+                return Err(WitGenError::UnrepresentableType {
+                    context: s.name.to_string(),
+                    detail: format!("trait impl {ti:?} has no WIT projection"),
+                });
+            }
+        }
+    }
+    Ok(out)
 }

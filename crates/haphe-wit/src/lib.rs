@@ -19,12 +19,16 @@
 //! instance, and a package address.
 
 mod emit;
+#[cfg(feature = "runtime")]
+mod host;
 mod model;
 pub mod names;
 #[cfg(feature = "runtime")]
 mod runtime;
 mod types;
 
+#[cfg(feature = "runtime")]
+pub use host::GuestResource;
 #[cfg(feature = "runtime")]
 pub use runtime::{
     WasmBindError, WasmBinder, foreign_caller, foreign_caller_async, foreign_caller_in,
@@ -40,7 +44,7 @@ use haphe::{
 };
 
 use emit::Printer;
-use model::{Direction, Env, Plan};
+use model::{Direction, Env, Plan, ProjKind, Projected, projected_trait_members};
 use names::{NameMap, to_kebab};
 use types::{Pos, render_return, render_type};
 
@@ -160,6 +164,19 @@ pub enum WitGenError {
         /// The second source identifier.
         second: String,
     },
+    /// A flags enum records a bit value that does not equal
+    /// `1 << declaration_index`: WIT `flags` are position-based, so a
+    /// gap-bearing or out-of-order mask cannot be represented faithfully.
+    FlagsBitMismatch {
+        /// The flags enum's exposed name.
+        name: String,
+        /// The offending flag.
+        flag: String,
+        /// The bit value WIT would assign (`1 << declaration_index`).
+        expected: i64,
+        /// The recorded bit value.
+        actual: i64,
+    },
     /// The generated document failed WIT resolution (e.g. recursive value
     /// types, cyclic interface `use`s, empty enums or records). Caught at
     /// generation time by validating the output through `wit-parser`.
@@ -215,6 +232,17 @@ impl fmt::Display for WitGenError {
             } => write!(
                 f,
                 "identifiers `{first}` and `{second}` both map to WIT name `{kebab}`"
+            ),
+            Self::FlagsBitMismatch {
+                name,
+                flag,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "flags enum `{name}`: flag `{flag}` records bit value {actual}, but WIT flags \
+                 are position-based and would assign {expected}; gap-bearing or reordered \
+                 masks cannot be represented"
             ),
             Self::InvalidWit { message } => {
                 write!(f, "generated document is not valid WIT: {message}")
@@ -409,6 +437,47 @@ impl WitGenerator {
             }
         }
 
+        // Trait projections of RECORDS (value types keep value semantics):
+        // interface-level functions named `{type}-{member}`, taking `this`
+        // by value; mutating projections return the updated record.
+        for id in &iface.type_ids {
+            if let Some(TypeKind::Struct(s)) = registry.get_type(&haphe::TypeId::new(id))
+                && !plan.is_resource(id)
+            {
+                let rec_name = plan.type_name(id).to_string();
+                for proj in projected_trait_members(s)? {
+                    let raw = format!("{}_{}", s.name, proj.source_name);
+                    let fn_name =
+                        member_names.insert_as(&raw, &format!("trait projection `{raw}`"))?;
+                    emit_projection(p, &proj, &fn_name, &rec_name, false, plan, None, s.name)?;
+                }
+            }
+        }
+        for &i in &iface.instance_indices {
+            let inst = &plan.instances[i];
+            if let Some(TypeKind::Struct(s)) =
+                registry.get_type(&haphe::TypeId::new(inst.erased_id))
+                && !plan.is_resource(inst.erased_id)
+            {
+                let env = plan.env_for(registry, inst);
+                for proj in projected_trait_members(s)? {
+                    let raw = format!("{}-{}", inst.wit_name, proj.source_name);
+                    let fn_name =
+                        member_names.insert_as(&raw, &format!("trait projection `{raw}`"))?;
+                    emit_projection(
+                        p,
+                        &proj,
+                        &fn_name,
+                        &inst.wit_name,
+                        false,
+                        plan,
+                        Some(&env),
+                        s.name,
+                    )?;
+                }
+            }
+        }
+
         for func in iface.functions {
             if func.generic_params.is_empty() {
                 let name = member_names.insert(func.name)?;
@@ -568,7 +637,155 @@ fn emit_resource(
         }
     }
 
+    // Trait projections: every declared trait impl surfaces as a named
+    // member (interusability). Same NameMap as user members, so a
+    // user-declared `add`/`at`/`call`/... collides descriptively.
+    for proj in projected_trait_members(s)? {
+        let name = members.insert_as(
+            proj.source_name,
+            &format!("trait projection `{}`", proj.source_name),
+        )?;
+        emit_projection(p, &proj, &name, wit_name, true, plan, env, s.name)?;
+    }
+
     p.close();
+    Ok(())
+}
+
+/// Renders one trait projection. `receiver` is the WIT self type name; for
+/// resources (`as_resource`) members are methods/statics on the resource,
+/// for records they are interface-level functions taking `this` by value
+/// (mutating projections then return the updated record).
+#[allow(clippy::too_many_arguments)]
+fn emit_projection(
+    p: &mut Printer,
+    proj: &Projected<'_>,
+    name: &str,
+    receiver: &str,
+    as_resource: bool,
+    plan: &Plan<'_>,
+    env: Option<&Env<'_, '_>>,
+    context: &str,
+) -> Result<(), WitGenError> {
+    let context = format!("{context}::{name}");
+    // Receiver rendering differs: resources dispatch on the handle
+    // implicitly (methods) or via `this` (statics); records take `this` by
+    // value as the first parameter.
+    let this_param = |empty: bool| {
+        if as_resource {
+            String::new()
+        } else if empty {
+            format!("this: {receiver}")
+        } else {
+            format!("this: {receiver}, ")
+        }
+    };
+    let rhs_self = if as_resource {
+        format!("borrow<{receiver}>")
+    } else {
+        receiver.to_string()
+    };
+    let ret_ty = |ty: &TypeDescriptor<'_>| -> Result<String, WitGenError> {
+        render_type(ty, Pos::Return(Ownership::Owned), plan, env, &context)
+    };
+    let param_ty = |ty: &TypeDescriptor<'_>| -> Result<String, WitGenError> {
+        render_type(ty, Pos::Param(Ownership::Owned), plan, env, &context)
+    };
+    match &proj.kind {
+        ProjKind::ArithSelf { output, .. } => {
+            let out = ret_ty(output)?;
+            p.line(&format!(
+                "{name}: func({}rhs: {rhs_self}) -> {out};",
+                this_param(false)
+            ));
+        }
+        ProjKind::ArithScalar { rhs, output, .. } => {
+            let rhs = param_ty(rhs)?;
+            let out = ret_ty(output)?;
+            p.line(&format!(
+                "{name}: func({}rhs: {rhs}) -> {out};",
+                this_param(false)
+            ));
+        }
+        ProjKind::Neg { output } | ProjKind::BNot { output } => {
+            let out = ret_ty(output)?;
+            p.line(&format!("{name}: func({}) -> {out};", this_param(true)));
+        }
+        ProjKind::Eq | ProjKind::Lt | ProjKind::Le => {
+            p.line(&format!(
+                "{name}: func({}other: {rhs_self}) -> bool;",
+                this_param(false)
+            ));
+        }
+        ProjKind::ToString | ProjKind::DebugString => {
+            p.line(&format!("{name}: func({}) -> string;", this_param(true)));
+        }
+        ProjKind::Hash => {
+            p.line(&format!("{name}: func({}) -> u64;", this_param(true)));
+        }
+        ProjKind::Call {
+            args,
+            output,
+            is_async,
+        } => {
+            let mut params: Vec<String> = Vec::new();
+            if !as_resource {
+                params.push(format!("this: {receiver}"));
+            }
+            for (i, a) in args.iter().enumerate() {
+                params.push(format!("a{i}: {}", param_ty(a)?));
+            }
+            let kw = if *is_async { "async func" } else { "func" };
+            let ret = match output {
+                TypeDescriptor::Unit => String::new(),
+                other => format!(" -> {}", ret_ty(other)?),
+            };
+            p.line(&format!("{name}: {kw}({}){ret};", params.join(", ")));
+        }
+        ProjKind::IndexGet { index, output } => {
+            let idx = param_ty(index)?;
+            let out = ret_ty(output)?;
+            p.line(&format!(
+                "{name}: func({}index: {idx}) -> {out};",
+                this_param(false)
+            ));
+        }
+        ProjKind::IndexSet { index, output } => {
+            let idx = param_ty(index)?;
+            let val = param_ty(output)?;
+            // Value semantics for records: the updated record comes back.
+            let ret = if as_resource {
+                String::new()
+            } else {
+                format!(" -> {receiver}")
+            };
+            p.line(&format!(
+                "{name}: func({}index: {idx}, value: {val}){ret};",
+                this_param(false)
+            ));
+        }
+        ProjKind::Items { item } => {
+            p.doc(Some(
+                "Eager snapshot of the iteration: materializes every item at \
+                 call time (lazy iteration is not WIT-native).",
+            ));
+            let item = ret_ty(item)?;
+            p.line(&format!(
+                "{name}: func({}) -> list<{item}>;",
+                this_param(true)
+            ));
+        }
+        ProjKind::Length => {
+            p.line(&format!("{name}: func({}) -> u64;", this_param(true)));
+        }
+        ProjKind::Default => {
+            if as_resource {
+                p.line(&format!("{name}: static func() -> {receiver};"));
+            } else {
+                p.line(&format!("{name}: func() -> {receiver};"));
+            }
+        }
+    }
     Ok(())
 }
 
@@ -608,14 +825,36 @@ fn emit_enum(
     p.doc(e.doc);
     let mut case_names = NameMap::new();
     if e.is_flags {
-        // Validated upstream: flags enums have only unit variants. Bit
-        // positions follow declaration order.
+        // Validated upstream: flags enums have only unit variants. WIT
+        // `flags` assign bits by declaration order, so a recorded real bit
+        // value must equal `1 << index` — anything else would silently
+        // misrepresent the mask. (No recorded value = positional by
+        // definition, accepted.)
         p.open(&format!("flags {wit_name}"));
-        for v in e.variants {
+        for (i, v) in e.variants.iter().enumerate() {
+            if let Some(actual) = v.discriminant {
+                let expected = 1i64.checked_shl(i as u32).unwrap_or(0);
+                if actual != expected {
+                    return Err(WitGenError::FlagsBitMismatch {
+                        name: e.name.to_string(),
+                        flag: v.name.to_string(),
+                        expected,
+                        actual,
+                    });
+                }
+            }
             p.doc(v.doc);
             p.line(&format!("{},", case_names.insert(v.name)?));
         }
     } else if unit_only {
+        // WIT enums are name-based with no numeric-repr slot; an enum with a
+        // Rust `#[repr]` integer type still emits by case name, and the
+        // exact-type propagation is noted for readers.
+        if let Some(repr) = e.repr {
+            p.doc(Some(&format!(
+                "Numeric representation in the source API: {repr:?}."
+            )));
+        }
         p.open(&format!("enum {wit_name}"));
         for v in e.variants {
             p.doc(v.doc);
