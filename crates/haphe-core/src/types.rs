@@ -190,6 +190,9 @@ pub enum PrimitiveType {
 pub enum TraitImpl<'a> {
     // Formatting / comparison (no associated types)
     Display,
+    /// String conversion (`std::string::ToString`); backends map it to their
+    /// concatenation construct.
+    ToString,
     Debug,
     Hash,
     PartialEq,

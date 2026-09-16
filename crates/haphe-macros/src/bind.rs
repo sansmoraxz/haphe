@@ -311,6 +311,10 @@ fn gen_field_registrations(
 fn gen_metamethod_registrations(self_ty: &Type, traits: &[TraitDecl]) -> TokenStream {
     let mut tokens = TokenStream::new();
     let has_display = traits.iter().any(|t| t.name == "Display");
+    // `Eq` implies `PartialEq` and `Ord` implies `PartialOrd`: either marker
+    // yields the comparison metamethods, deduplicated when both are declared.
+    let has_partial_eq = traits.iter().any(|t| t.name == "PartialEq");
+    let has_partial_ord = traits.iter().any(|t| t.name == "PartialOrd");
 
     let ctx = crate::ty_map::TyCtx {
         generic_params: &[],
@@ -327,6 +331,13 @@ fn gen_metamethod_registrations(self_ty: &Type, traits: &[TraitDecl]) -> TokenSt
                     )?;
                 });
             }
+            "ToString" => {
+                tokens.extend(quote! {
+                    __b.meta_concat(
+                        (|__t: &#self_ty| ::std::string::ToString::to_string(__t)) as fn(&#self_ty) -> ::std::string::String,
+                    )?;
+                });
+            }
             "Debug" if !has_display => {
                 tokens.extend(quote! {
                     __b.meta_tostring(
@@ -334,14 +345,20 @@ fn gen_metamethod_registrations(self_ty: &Type, traits: &[TraitDecl]) -> TokenSt
                     )?;
                 });
             }
-            "PartialEq" => {
+            "PartialEq" | "Eq" => {
+                if name == "Eq" && has_partial_eq {
+                    continue;
+                }
                 tokens.extend(quote! {
                     __b.meta_eq(
                         (|__a: &#self_ty, __b_val: &#self_ty| __a == __b_val) as fn(&#self_ty, &#self_ty) -> bool,
                     )?;
                 });
             }
-            "PartialOrd" => {
+            "PartialOrd" | "Ord" => {
+                if name == "Ord" && has_partial_ord {
+                    continue;
+                }
                 tokens.extend(quote! {
                     __b.meta_lt(
                         (|__a: &#self_ty, __b_val: &#self_ty| __a < __b_val) as fn(&#self_ty, &#self_ty) -> bool,

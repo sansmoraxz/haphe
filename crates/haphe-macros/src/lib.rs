@@ -50,8 +50,9 @@ mod verify;
 /// assert_eq!(<Meters as HapheType>::DESCRIPTOR, <f64 as HapheType>::DESCRIPTOR);
 /// ```
 /// - `traits(...)` — standard traits to expose, verified at compile time:
-///   `Display`, `Debug`, `Hash`, `PartialEq`, `Eq`, `PartialOrd`, `Ord`,
-///   `Clone`, `Default`, `Add`, `Sub`, `Mul`, `Div`, `Rem`, `Neg`, `Index`,
+///   `Display`, `ToString` (string concatenation), `Debug`, `Hash`,
+///   `PartialEq`, `Eq`, `PartialOrd`, `Ord`, `Clone`, `Default`, `Add`,
+///   `Sub`, `Mul`, `Div`, `Rem`, `Neg`, `Index`,
 ///   `IndexMut`, `Iterator`, `IntoIterator`. Operator traits accept named
 ///   type arguments (e.g. `Add(rhs = f64, output = Self)`), defaulting to
 ///   `Self`; `Index`/`IndexMut` require `index` and `output`;

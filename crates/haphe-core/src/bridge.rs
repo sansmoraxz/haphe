@@ -464,6 +464,13 @@ pub trait TypeBinder<T>: Sized {
     /// Register a `Display` / `__tostring` metamethod.
     fn meta_tostring(&mut self, f: fn(&T) -> String) -> Result<(), Self::Error>;
 
+    /// Register a `ToString`-derived concatenation metamethod.
+    ///
+    /// Concatenation is string-producing: the backend formats the value
+    /// operand(s) with `f` and accepts only string-like counterparts
+    /// (strings and numbers), erroring on anything else.
+    fn meta_concat(&mut self, f: fn(&T) -> String) -> Result<(), Self::Error>;
+
     /// Register a `PartialEq` / `__eq` metamethod.
     fn meta_eq(&mut self, f: fn(&T, &T) -> bool) -> Result<(), Self::Error>;
 

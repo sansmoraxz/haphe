@@ -608,6 +608,7 @@ fn collect_dangling_refs_in_trait_impls<'a>(
                 collect_dangling_refs(owner, item, known, errors);
             }
             TraitImpl::Display
+            | TraitImpl::ToString
             | TraitImpl::Debug
             | TraitImpl::Hash
             | TraitImpl::PartialEq

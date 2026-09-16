@@ -172,6 +172,7 @@ fn trait_impl_expr(
 
     let markers: &[(&str, TokenStream)] = &[
         ("Display", quote!(::core::fmt::Display)),
+        ("ToString", quote!(::std::string::ToString)),
         ("Debug", quote!(::core::fmt::Debug)),
         ("Hash", quote!(::core::hash::Hash)),
         ("PartialEq", quote!(::core::cmp::PartialEq)),
