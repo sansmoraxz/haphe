@@ -212,6 +212,33 @@ pub fn bind_type<
     binder.register(lua, type_table)
 }
 
+/// Binds a methods-bearing enum as full userdata: methods and trait
+/// metamethods become callable on enum VALUES delivered as userdata (a
+/// plain unit enum without methods needs no binding — its cases cross as
+/// native string/integer values and the module case table names them).
+///
+/// The value boundary is unchanged: unit-enum arguments and returns still
+/// convert by case name / discriminant. Userdata produced here is the
+/// receiver surface for methods; a bound function returning the enum still
+/// yields the lightweight value. Constructing userdata from a case is done
+/// through the enum's own methods or bound functions.
+pub fn bind_enum_type<
+    E: ScriptBind + haphe::ScriptEnum + Clone + mlua::MaybeSend + mlua::MaybeSync + 'static,
+>(
+    lua: &mlua::Lua,
+    type_table: &mlua::Table,
+) -> Result<(), LuaBindError> {
+    let mut binder = binder::LuaTypeBinder::<E>::new();
+    binder.set_pairing(declared_iter_pairing(
+        <E as haphe::ScriptEnum>::DESCRIPTOR.trait_impls,
+    ));
+    binder.set_idiv_fallback(declared_idiv_fallback(
+        <E as haphe::ScriptEnum>::DESCRIPTOR.trait_impls,
+    ));
+    E::bind(&mut binder)?;
+    binder.register(lua, type_table)
+}
+
 /// Whether `//` should fall back to the type's `Div` registration: only for
 /// integer-typed `Div` declarations (integer-primitive rhs, and an output
 /// that is not some other primitive shape), and never when an explicit

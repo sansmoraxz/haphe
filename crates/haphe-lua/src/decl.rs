@@ -6,7 +6,8 @@
 //! - structs → `---@class` with `---@field`s (readonly noted in the field
 //!   description), colon-syntax methods, constructors as dot functions on
 //!   the module's type table, operator traits as `---@operator` lines;
-//! - unit-only enums → `---@alias Name "Case"|...` with declared case names
+//! - unit-only enums → `---@enum Name` on a table literal mirroring the
+//!   runtime case table (string names, or numeric discriminants per repr)
 //!   (payload enums are an opaque `---@class`; enum methods are not exposed
 //!   by the runtime binder and are omitted here too);
 //! - type aliases → `---@alias` to the underlying type;
@@ -408,12 +409,23 @@ fn emit_enum(out: &mut String, e: &EnumDescriptor<'_>) -> Result<(), LuaDeclErro
         .iter()
         .all(|v| matches!(v.kind, VariantKind::Unit));
     if unit_only {
-        let cases: Vec<String> = e
-            .variants
-            .iter()
-            .map(|v| format!("\"{}\"", v.name))
-            .collect();
-        let _ = writeln!(out, "---@alias {} {}\n", e.name, cases.join("|"));
+        // LuaLS `---@enum` attaches to a real table literal mirroring the
+        // runtime case table: string case names for string-represented
+        // enums, integer discriminants for numeric ones (exact Rust
+        // `#[repr]` type; flags carry their real bit values).
+        let _ = writeln!(out, "---@enum {}", e.name);
+        let _ = writeln!(out, "local {} = {{", e.name);
+        for v in e.variants {
+            match v.discriminant {
+                Some(value) => {
+                    let _ = writeln!(out, "    {} = {},", v.name, value);
+                }
+                None => {
+                    let _ = writeln!(out, "    {} = \"{}\",", v.name, v.name);
+                }
+            }
+        }
+        let _ = writeln!(out, "}}\n");
     } else {
         let _ = writeln!(
             out,

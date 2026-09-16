@@ -19,10 +19,16 @@ pub(crate) fn bind_module(
         table.set(constant.name, value)?;
     }
 
-    // Type stubs: an empty table per type, keyed by the type's short name.
+    // Type tables, keyed by the type's short name. Structs and aliases get
+    // an empty stub; enums get a populated CASE TABLE: `Table.Case = value`
+    // for every unit case, where the value is the case-name string for
+    // string-represented enums and the integer discriminant for numeric
+    // ones (a Rust `#[repr]` integer type; flags carry their real bit
+    // values).
     for type_id in module.type_ids {
-        let name = registry
-            .get_type(type_id)
+        let type_kind = registry.get_type(type_id);
+        let name = type_kind
+            .as_ref()
             .map(|tk| match tk {
                 haphe::TypeKind::Struct(s) => s.name,
                 haphe::TypeKind::Enum(e) => e.name,
@@ -34,6 +40,23 @@ pub(crate) fn bind_module(
         // function with the same name.
         if table.get::<Value>(name)?.is_nil() {
             let type_table = lua.create_table()?;
+            if let Some(haphe::TypeKind::Enum(e)) = type_kind {
+                for variant in e.variants {
+                    if !matches!(variant.kind, haphe::VariantKind::Unit) {
+                        continue;
+                    }
+                    if !type_table.get::<Value>(variant.name)?.is_nil() {
+                        return Err(LuaBindError::DuplicateEnumCase {
+                            enum_name: name.to_owned(),
+                            case: variant.name.to_owned(),
+                        });
+                    }
+                    match variant.discriminant {
+                        Some(value) => type_table.set(variant.name, value)?,
+                        None => type_table.set(variant.name, variant.name)?,
+                    }
+                }
+            }
             table.set(name, type_table)?;
         }
     }

@@ -127,9 +127,14 @@ pub(crate) fn script_to_lua(lua: &Lua, v: ScriptValue) -> mlua::Result<mlua::Val
         ScriptValue::Optional(None) => Ok(mlua::Value::Nil),
         ScriptValue::Optional(Some(inner)) => script_to_lua(lua, *inner),
         ScriptValue::UserData(ud) => lua.create_any_userdata(ud).map(mlua::Value::UserData),
-        // Unit-enum cases travel as their case-name string: the declared
-        // exposed names, passed through verbatim and matched exactly.
-        ScriptValue::Enum { case } => Ok(mlua::Value::String(lua.create_string(&case)?)),
+        // Unit-enum cases: NUMERIC enums (a Rust `#[repr]` integer type)
+        // carry their discriminant and cross as Lua integers; string enums
+        // travel as their case-name string — the declared exposed names,
+        // passed through verbatim and matched exactly.
+        ScriptValue::Enum { case, discriminant } => match discriminant {
+            Some(value) => Ok(mlua::Value::Integer(value)),
+            None => Ok(mlua::Value::String(lua.create_string(&case)?)),
+        },
         _ => Err(mlua::Error::runtime("unsupported ScriptValue variant")),
     }
 }

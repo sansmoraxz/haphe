@@ -46,6 +46,14 @@ pub enum LuaBindError {
         /// The colliding constructor name.
         name: &'static str,
     },
+    /// Two unit cases of an enum resolve to the same name in its Lua case
+    /// table.
+    DuplicateEnumCase {
+        /// The enum's exposed name.
+        enum_name: String,
+        /// The colliding case name.
+        case: String,
+    },
     /// An operator was declared that the configured Lua version has no
     /// metamethod for (the bitwise family requires Lua 5.3+; Lua 5.1/5.2,
     /// LuaJIT, and Luau cannot represent it).
@@ -117,6 +125,9 @@ impl std::fmt::Display for LuaBindError {
                      backend registers for the declared trait; rename the method"
                 )
             }
+            Self::DuplicateEnumCase { enum_name, case } => {
+                write!(f, "enum `{enum_name}` case table already contains `{case}`")
+            }
             Self::DuplicateConstructor { name } => {
                 write!(
                     f,
@@ -167,6 +178,7 @@ impl std::error::Error for LuaBindError {
             Self::GenericForeignInterface { .. } => None,
             Self::ReservedMethod { .. } => None,
             Self::DuplicateConstructor { .. } => None,
+            Self::DuplicateEnumCase { .. } => None,
             Self::UnsupportedOperator { .. } => None,
             Self::UnsupportedAsyncCall { .. } => None,
             Self::AmbiguousCall => None,

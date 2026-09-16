@@ -186,9 +186,11 @@ fn constructors_live_on_the_module_type_table() {
 }
 
 #[test]
-fn unit_enum_alias_uses_declared_case_names() {
+fn unit_enum_emits_luals_enum_table() {
     let s = generate();
-    assert!(s.contains("---@alias Color \"Red\"|\"grey\""), "got:\n{s}");
+    assert!(s.contains("---@enum Color"), "got:\n{s}");
+    assert!(s.contains("    Red = \"Red\","), "got:\n{s}");
+    assert!(s.contains("    grey = \"grey\","), "got:\n{s}");
 }
 
 #[test]
