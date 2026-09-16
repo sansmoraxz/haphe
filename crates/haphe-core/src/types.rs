@@ -223,7 +223,50 @@ pub enum TraitImpl<'a> {
         rhs: &'a TypeDescriptor<'a>,
         output: &'a TypeDescriptor<'a>,
     },
+    /// Floor modulo via the haphe-provided [`ops::Mod`](crate::ops::Mod)
+    /// trait (std defines none); the result takes the divisor's sign.
+    Mod {
+        rhs: &'a TypeDescriptor<'a>,
+        output: &'a TypeDescriptor<'a>,
+    },
+    /// Floor division via the haphe-provided [`ops::IDiv`](crate::ops::IDiv)
+    /// trait (std defines none); quotient rounds toward negative infinity.
+    IDiv {
+        rhs: &'a TypeDescriptor<'a>,
+        output: &'a TypeDescriptor<'a>,
+    },
+    /// Exponentiation via the haphe-provided [`ops::Pow`](crate::ops::Pow)
+    /// trait (std defines none).
+    Pow {
+        rhs: &'a TypeDescriptor<'a>,
+        output: &'a TypeDescriptor<'a>,
+    },
     Neg {
+        output: &'a TypeDescriptor<'a>,
+    },
+
+    // Bitwise operators (with associated types)
+    BitAnd {
+        rhs: &'a TypeDescriptor<'a>,
+        output: &'a TypeDescriptor<'a>,
+    },
+    BitOr {
+        rhs: &'a TypeDescriptor<'a>,
+        output: &'a TypeDescriptor<'a>,
+    },
+    BitXor {
+        rhs: &'a TypeDescriptor<'a>,
+        output: &'a TypeDescriptor<'a>,
+    },
+    Shl {
+        rhs: &'a TypeDescriptor<'a>,
+        output: &'a TypeDescriptor<'a>,
+    },
+    Shr {
+        rhs: &'a TypeDescriptor<'a>,
+        output: &'a TypeDescriptor<'a>,
+    },
+    Not {
         output: &'a TypeDescriptor<'a>,
     },
 

@@ -68,7 +68,11 @@ pub fn gen_derive_bind(
     } else {
         &[]
     };
-    let field_regs = gen_field_registrations(self_ty, fields, field_generic_params);
+    // Any generic parameter (type or lifetime) rules out dispatch blocks,
+    // whose local trait impls cannot reference outer parameters.
+    let self_is_generic = !generics.params.is_empty();
+    let field_regs =
+        gen_field_registrations(self_ty, fields, field_generic_params, self_is_generic);
     let meta_regs = gen_metamethod_registrations(self_ty, traits);
 
     // For bridge types (has_methods), add FromScript + IntoScript bounds on
@@ -176,11 +180,15 @@ pub fn gen_impl_bind_methods(
     ident: &Ident,
     self_ty: &Type,
     methods: &[BindMethod],
+    dispatch_methods: &[BindMethod],
     constructors: &[BindMethod],
     generics: &Generics,
 ) -> TokenStream {
     let mod_ident = hidden_mod_ident(ident);
     let method_regs = methods.iter().map(|m| gen_method_registration(self_ty, m));
+    let dispatch_regs = dispatch_methods
+        .iter()
+        .map(|m| gen_dispatched_method_registration(self_ty, m));
     let ctor_regs = constructors
         .iter()
         .map(|c| gen_constructor_registration(self_ty, c));
@@ -203,6 +211,7 @@ pub fn gen_impl_bind_methods(
             ) -> ::core::result::Result<(), __B::Error> {
                 #(#ctor_regs)*
                 #(#method_regs)*
+                #(#dispatch_regs)*
                 ::core::result::Result::Ok(())
             }
         }
@@ -269,11 +278,123 @@ fn is_generic_type_param(ty: &Type, params: &[String]) -> bool {
     }
 }
 
+/// Owned, bare single-ident path type that isn't a known primitive: its
+/// bridgeability can't be judged syntactically (it may be a transparent
+/// primitive newtype), so registration goes through compile-time trait
+/// dispatch instead.
+fn needs_bridge_dispatch(ty: &Type, generic_params: &[String]) -> bool {
+    if is_bridge_primitive(ty) || is_generic_type_param(ty, generic_params) {
+        return false;
+    }
+    // Fields must be owned; references never dispatch.
+    !is_reference(ty) && is_dispatchable_path(ty)
+}
+
+/// An owned bare single-ident path type (or one behind a single reference)
+/// whose bridgeability is decided by trait presence rather than the
+/// syntactic whitelist.
+pub fn is_dispatchable_path(ty: &Type) -> bool {
+    let stripped = strip_ref(ty);
+    let Type::Path(p) = &stripped else {
+        return false;
+    };
+    p.qself.is_none() && p.path.get_ident().is_some()
+}
+
+/// A field registration that compiles to a real registration when the field
+/// type implements the bridge traits (e.g. a transparent primitive newtype)
+/// and to a no-op otherwise — decided at compile time via autoref
+/// specialization, never at runtime.
+fn gen_dispatched_field_registration(self_ty: &Type, f: &BindField) -> TokenStream {
+    let ident = &f.ident;
+    let name = &f.name;
+    let ty = &f.ty;
+    let (set_decl, set_impl, setter) = if f.readonly {
+        (
+            TokenStream::new(),
+            TokenStream::new(),
+            quote! { ::core::option::Option::None },
+        )
+    } else {
+        (
+            quote! { fn __set(&mut self, __v: Self::__V); },
+            quote! { fn __set(&mut self, __v: #ty) { self.#ident = __v; } },
+            quote! {
+                ::core::option::Option::Some(
+                    (|__t: &mut __T, __v: __T::__V| __T::__set(__t, __v))
+                        as fn(&mut __T, __T::__V)
+                )
+            },
+        )
+    };
+    quote! {
+        {
+            #[allow(non_camel_case_types)]
+            trait __FieldAccess {
+                type __V;
+                fn __get(&self) -> &Self::__V;
+                #set_decl
+            }
+            impl __FieldAccess for #self_ty {
+                type __V = #ty;
+                fn __get(&self) -> &#ty {
+                    &self.#ident
+                }
+                #set_impl
+            }
+            #[allow(non_camel_case_types)]
+            trait __Go<__T> {
+                fn __haphe_bind<__B: ::haphe::TypeBinder<__T>>(
+                    &self,
+                    __b: &mut __B,
+                ) -> ::core::result::Result<(), __B::Error>;
+            }
+            impl<__T> __Go<__T> for &::haphe::BridgeProbe<__T>
+            where
+                __T: __FieldAccess,
+                __T::__V: ::haphe::IntoScript
+                    + ::haphe::FromScript
+                    + ::core::clone::Clone
+                    + 'static,
+            {
+                fn __haphe_bind<__B: ::haphe::TypeBinder<__T>>(
+                    &self,
+                    __b: &mut __B,
+                ) -> ::core::result::Result<(), __B::Error> {
+                    __b.field::<__T::__V>(
+                        #name,
+                        (|__t: &__T| ::core::clone::Clone::clone(__T::__get(__t)))
+                            as fn(&__T) -> __T::__V,
+                        #setter,
+                    )
+                }
+            }
+            #[allow(unused_imports)]
+            use ::haphe::SkipBind as _;
+            (&&::haphe::BridgeProbe::<#self_ty>(::core::marker::PhantomData))
+                .__haphe_bind(__b)?;
+        }
+    }
+}
+
 fn gen_field_registrations(
     self_ty: &Type,
     fields: &[BindField],
     generic_params: &[String],
+    self_is_generic: bool,
 ) -> TokenStream {
+    // Dispatch blocks define local trait impls on the self type, which
+    // cannot reference outer generic parameters — generic types keep the
+    // syntactic fast path only.
+    let dispatched: Vec<TokenStream> = if self_is_generic {
+        Vec::new()
+    } else {
+        fields
+            .iter()
+            .filter(|f| needs_bridge_dispatch(&f.ty, generic_params))
+            .map(|f| gen_dispatched_field_registration(self_ty, f))
+            .collect()
+    };
     let regs = fields
         .iter()
         .filter(|f| is_bridge_primitive(&f.ty) || is_generic_type_param(&f.ty, generic_params))
@@ -301,7 +422,7 @@ fn gen_field_registrations(
             }
         });
 
-    quote! { #(#regs)* }
+    quote! { #(#regs)* #(#dispatched)* }
 }
 
 // ---------------------------------------------------------------------------
@@ -369,14 +490,27 @@ fn gen_metamethod_registrations(self_ty: &Type, traits: &[TraitDecl]) -> TokenSt
                     )?;
                 });
             }
-            "Neg" => {
+            "Neg" | "Not" => {
+                let variant = &decl.name;
+                let path = quote! { ::haphe::ops::#variant };
+                let method = Ident::new(&name.to_lowercase(), decl.name.span());
+                let register = Ident::new(
+                    if name == "Neg" {
+                        "meta_unm"
+                    } else {
+                        "meta_bnot"
+                    },
+                    decl.name.span(),
+                );
                 tokens.extend(quote! {
-                    __b.meta_unm(
-                        (|__t: &#self_ty| -__t.clone()) as fn(&#self_ty) -> #self_ty,
+                    __b.#register(
+                        (|__t: &#self_ty| <#self_ty as #path>::#method(__t.clone()))
+                            as fn(&#self_ty) -> #self_ty,
                     )?;
                 });
             }
-            "Add" | "Sub" | "Mul" | "Div" | "Rem" => {
+            "Add" | "Sub" | "Mul" | "Div" | "Rem" | "IDiv" | "Mod" | "BitAnd" | "BitOr"
+            | "BitXor" | "Shl" | "Shr" | "Pow" => {
                 let rhs_ty = decl
                     .args
                     .iter()
@@ -385,8 +519,15 @@ fn gen_metamethod_registrations(self_ty: &Type, traits: &[TraitDecl]) -> TokenSt
                     .unwrap_or_else(|| self_ty.clone());
 
                 let op_name_str = name.to_lowercase();
-                let op_method = Ident::new(&op_name_str, decl.name.span());
+                // `mod` is a Rust keyword; the trait's method is `modulo`.
+                let method_str = if name == "Mod" {
+                    "modulo"
+                } else {
+                    &op_name_str
+                };
+                let op_method = Ident::new(method_str, decl.name.span());
                 let op_trait = &decl.name;
+                let trait_path = quote! { ::haphe::ops::#op_trait };
                 let rhs_is_self = quote!(#rhs_ty).to_string() == quote!(#self_ty).to_string();
 
                 if rhs_is_self {
@@ -394,7 +535,7 @@ fn gen_metamethod_registrations(self_ty: &Type, traits: &[TraitDecl]) -> TokenSt
                         __b.meta_arith_self(
                             #op_name_str,
                             |__a: #self_ty, __b_val: #self_ty| -> #self_ty {
-                                <#self_ty as ::core::ops::#op_trait>::#op_method(__a, __b_val)
+                                <#self_ty as #trait_path>::#op_method(__a, __b_val)
                             },
                         )?;
                     });
@@ -408,7 +549,7 @@ fn gen_metamethod_registrations(self_ty: &Type, traits: &[TraitDecl]) -> TokenSt
                                     __args.first().cloned().unwrap_or(::haphe::ScriptValue::Unit)
                                 )?;
                                 ::core::result::Result::Ok(
-                                    <#self_ty as ::core::ops::#op_trait<#rhs_ty>>::#op_method(__self, __rhs)
+                                    <#self_ty as #trait_path<#rhs_ty>>::#op_method(__self, __rhs)
                                 )
                             },
                         )?;
@@ -448,6 +589,8 @@ fn gen_metamethod_registrations(self_ty: &Type, traits: &[TraitDecl]) -> TokenSt
                 let (Some(idx_ty), Some(out_ty)) = (arg("index"), arg("output")) else {
                     continue;
                 };
+                let variant = &decl.name;
+                let trait_path = quote! { ::haphe::ops::#variant };
                 if name == "Index" {
                     tokens.extend(quote! {
                         __b.meta_index(
@@ -457,7 +600,7 @@ fn gen_metamethod_registrations(self_ty: &Type, traits: &[TraitDecl]) -> TokenSt
                                 )?;
                                 ::core::result::Result::Ok(::haphe::IntoScript::into_script(
                                     ::core::clone::Clone::clone(
-                                        <#self_ty as ::core::ops::Index<#idx_ty>>::index(__t, __idx)
+                                        <#self_ty as #trait_path<#idx_ty>>::index(__t, __idx)
                                     )
                                 ))
                             }) as fn(&#self_ty, &[::haphe::ScriptValue]) -> ::core::result::Result<::haphe::ScriptValue, ::haphe::ScriptConvertError>,
@@ -473,7 +616,7 @@ fn gen_metamethod_registrations(self_ty: &Type, traits: &[TraitDecl]) -> TokenSt
                                 let __val = <#out_ty as ::haphe::FromScript>::from_script(
                                     __args.get(1).cloned().unwrap_or(::haphe::ScriptValue::Unit)
                                 )?;
-                                *<#self_ty as ::core::ops::IndexMut<#idx_ty>>::index_mut(__t, __idx) = __val;
+                                *<#self_ty as #trait_path<#idx_ty>>::index_mut(__t, __idx) = __val;
                                 ::core::result::Result::Ok(())
                             }) as fn(&mut #self_ty, &[::haphe::ScriptValue]) -> ::core::result::Result<(), ::haphe::ScriptConvertError>,
                         )?;
@@ -518,6 +661,124 @@ fn gen_call_args(params: &[(Ident, Type)]) -> Vec<TokenStream> {
             }
         })
         .collect()
+}
+
+/// A method registration that compiles to a real registration when every
+/// stripped param type implements `FromScript` and the return type
+/// implements `IntoScript` (e.g. transparent primitive newtypes), and to a
+/// no-op otherwise — compile-time autoref-specialization dispatch, mirroring
+/// [`gen_dispatched_field_registration`]. Non-generic self types only.
+pub fn gen_dispatched_method_registration(self_ty: &Type, method: &BindMethod) -> TokenStream {
+    let name = &method.name;
+    let ident = &method.ident;
+
+    let stripped: Vec<Type> = method.params.iter().map(|(_, t)| strip_ref(t)).collect();
+    let p_assoc: Vec<Ident> = (0..stripped.len())
+        .map(|i| format_ident!("__P{i}"))
+        .collect();
+    let p_vars: Vec<Ident> = (0..stripped.len())
+        .map(|i| format_ident!("__p{i}"))
+        .collect();
+    let call_args: Vec<TokenStream> = method
+        .params
+        .iter()
+        .zip(&p_vars)
+        .map(|((_, t), v)| {
+            if is_reference(t) {
+                quote! { &#v }
+            } else {
+                quote! { #v }
+            }
+        })
+        .collect();
+    let ret_ty: TokenStream = match (&method.return_ty, method.has_return) {
+        (Some(t), true) => quote! { #t },
+        _ => quote! { () },
+    };
+    let idx: Vec<usize> = (0..stripped.len()).collect();
+
+    let (recv_decl, recv_call, wrapper_recv, wrapper_recv_ty, register) = match method.receiver {
+        ReceiverShape::RefMut => (
+            quote! { __t: &mut Self },
+            quote! { __t.#ident(#(#call_args),*) },
+            quote! { __t: &mut __T },
+            quote! { &mut __T },
+            format_ident!("method_mut"),
+        ),
+        ReceiverShape::Owned => (
+            quote! { __t: Self },
+            quote! { __t.#ident(#(#call_args),*) },
+            quote! { __t: __T },
+            quote! { __T },
+            format_ident!("method_owned"),
+        ),
+        // `None` mirrors gen_method_registration's associated-fn handling.
+        ReceiverShape::Ref | ReceiverShape::None => (
+            quote! { __t: &Self },
+            quote! { __t.#ident(#(#call_args),*) },
+            quote! { __t: &__T },
+            quote! { &__T },
+            format_ident!("method_ref"),
+        ),
+    };
+    let recv_decl2 = recv_decl.clone();
+
+    quote! {
+        {
+            #[allow(non_camel_case_types)]
+            trait __Call {
+                #( type #p_assoc; )*
+                type __R;
+                fn __invoke(#recv_decl, #( #p_vars: Self::#p_assoc ),*) -> Self::__R;
+            }
+            impl __Call for #self_ty {
+                #( type #p_assoc = #stripped; )*
+                type __R = #ret_ty;
+                #[allow(unused_variables)]
+                fn __invoke(#recv_decl2, #( #p_vars: #stripped ),*) -> #ret_ty {
+                    #recv_call
+                }
+            }
+            #[allow(non_camel_case_types)]
+            trait __Go<__T> {
+                fn __haphe_bind<__B: ::haphe::TypeBinder<__T>>(
+                    &self,
+                    __b: &mut __B,
+                ) -> ::core::result::Result<(), __B::Error>;
+            }
+            impl<__T> __Go<__T> for &::haphe::BridgeProbe<__T>
+            where
+                __T: __Call,
+                #( __T::#p_assoc: ::haphe::FromScript, )*
+                ::haphe::ScriptValue: ::core::convert::From<__T::__R>,
+            {
+                fn __haphe_bind<__B: ::haphe::TypeBinder<__T>>(
+                    &self,
+                    __b: &mut __B,
+                ) -> ::core::result::Result<(), __B::Error> {
+                    __b.#register(
+                        #name,
+                        (|#wrapper_recv, __args: &[::haphe::ScriptValue]|
+                            -> ::core::result::Result<::haphe::ScriptValue, ::haphe::ScriptConvertError> {
+                            #(
+                                let #p_vars = <__T::#p_assoc as ::haphe::FromScript>::from_script(
+                                    __args.get(#idx).cloned().unwrap_or(::haphe::ScriptValue::Unit)
+                                )?;
+                            )*
+                            ::core::result::Result::Ok(::haphe::ScriptValue::from(
+                                __T::__invoke(__t, #( #p_vars ),*)
+                            ))
+                        }) as fn(#wrapper_recv_ty, &[::haphe::ScriptValue])
+                            -> ::core::result::Result<::haphe::ScriptValue, ::haphe::ScriptConvertError>,
+                    )
+                }
+            }
+            #[allow(unused_imports)]
+            use ::haphe::SkipBind as _;
+            (&&::haphe::BridgeProbe::<#self_ty>(::core::marker::PhantomData))
+                .__haphe_bind(__b)?;
+        }
+    }
 }
 
 fn gen_method_registration(self_ty: &Type, method: &BindMethod) -> TokenStream {

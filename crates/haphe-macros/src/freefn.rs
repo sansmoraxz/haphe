@@ -225,12 +225,48 @@ pub fn expand(mut item: ItemFn) -> TokenStream {
             quote! { #(#registrations)* ::core::result::Result::Ok(()) },
         )
     } else {
-        let can = !info.is_async && cfgs.is_empty() && compatible(&empty_subst);
-        let wrapper = make_wrapper(&empty_subst);
-        (
-            can,
-            quote! { __binder.function(#exposed_name, &[], #wrapper) },
-        )
+        let whitelisted = compatible(&empty_subst);
+        let dispatch_eligible = !whitelisted
+            && param_info.iter().all(|(_, ty)| {
+                crate::bind::is_bridge_compatible_type(ty) || crate::bind::is_dispatchable_path(ty)
+            })
+            && info.return_ty.as_ref().is_none_or(|t| {
+                !matches!(t, Type::Reference(_))
+                    && (crate::bind::is_bridge_compatible_type(t)
+                        || crate::bind::is_dispatchable_path(t))
+            });
+        let can = !info.is_async && cfgs.is_empty() && (whitelisted || dispatch_eligible);
+        let body = if whitelisted {
+            let wrapper = make_wrapper(&empty_subst);
+            quote! { __binder.function(#exposed_name, &[], #wrapper) }
+        } else {
+            // Types the whitelist can't judge (e.g. transparent primitive
+            // newtypes): registration is decided by compile-time
+            // trait-presence dispatch — real registration when the bridge
+            // bounds hold, no-op otherwise.
+            {
+                let param_is_ref: Vec<bool> = item
+                    .sig
+                    .inputs
+                    .iter()
+                    .filter_map(|input| match input {
+                        syn::FnArg::Typed(pat_ty) => {
+                            Some(matches!(pat_ty.ty.as_ref(), Type::Reference(_)))
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                gen_dispatched_fn_registration(
+                    ident,
+                    fn_ident,
+                    exposed_name,
+                    &param_info,
+                    &param_is_ref,
+                    &info,
+                )
+            }
+        };
+        (can, body)
     };
 
     let bind_fn = if can_bind {
@@ -284,4 +320,101 @@ fn substitute_type_params(ty: &Type, subst: &std::collections::HashMap<String, T
     let mut ty = ty.clone();
     syn::visit_mut::VisitMut::visit_type_mut(&mut Replace(subst), &mut ty);
     ty
+}
+
+/// A free-fn registration decided by compile-time trait-presence dispatch
+/// (autoref specialization): registers when every stripped param implements
+/// `FromScript` and the return converts to `ScriptValue`, no-ops otherwise.
+/// Mirrors `bind::gen_dispatched_method_registration`; the hidden descriptor
+/// struct doubles as the dispatch carrier. Non-generic functions only.
+fn gen_dispatched_fn_registration(
+    carrier: &syn::Ident,
+    fn_ident: &syn::Ident,
+    exposed_name: &str,
+    param_info: &[(syn::Ident, Type)],
+    param_is_ref: &[bool],
+    info: &crate::fn_desc::FnInfo,
+) -> TokenStream {
+    // param_info types are already stripped of outer references.
+    let stripped: Vec<Type> = param_info.iter().map(|(_, t)| t.clone()).collect();
+    let p_assoc: Vec<syn::Ident> = (0..stripped.len())
+        .map(|i| quote::format_ident!("__P{i}"))
+        .collect();
+    let p_vars: Vec<syn::Ident> = (0..stripped.len())
+        .map(|i| quote::format_ident!("__p{i}"))
+        .collect();
+    let call_args: Vec<TokenStream> = param_is_ref
+        .iter()
+        .zip(&p_vars)
+        .map(|(is_ref, v)| {
+            if *is_ref {
+                quote! { &#v }
+            } else {
+                quote! { #v }
+            }
+        })
+        .collect();
+    let ret_ty: TokenStream = match &info.return_ty {
+        Some(t) => quote! { #t },
+        None => quote! { () },
+    };
+    let idx: Vec<usize> = (0..stripped.len()).collect();
+
+    quote! {
+        {
+            #[allow(non_camel_case_types)]
+            trait __Call {
+                #( type #p_assoc; )*
+                type __R;
+                fn __invoke(#( #p_vars: Self::#p_assoc ),*) -> Self::__R;
+            }
+            impl __Call for #carrier {
+                #( type #p_assoc = #stripped; )*
+                type __R = #ret_ty;
+                #[allow(unused_variables)]
+                fn __invoke(#( #p_vars: #stripped ),*) -> #ret_ty {
+                    #fn_ident(#(#call_args),*)
+                }
+            }
+            #[allow(non_camel_case_types)]
+            trait __Go {
+                fn __haphe_bind_fn<__B: ::haphe::FnBinder>(
+                    &self,
+                    __b: &mut __B,
+                ) -> ::core::result::Result<(), __B::Error>;
+            }
+            impl<__T> __Go for &::haphe::BridgeProbe<__T>
+            where
+                __T: __Call,
+                #( __T::#p_assoc: ::haphe::FromScript, )*
+                ::haphe::ScriptValue: ::core::convert::From<__T::__R>,
+            {
+                fn __haphe_bind_fn<__B: ::haphe::FnBinder>(
+                    &self,
+                    __b: &mut __B,
+                ) -> ::core::result::Result<(), __B::Error> {
+                    __b.function(
+                        #exposed_name,
+                        &[],
+                        (|__args: &[::haphe::ScriptValue]|
+                            -> ::core::result::Result<::haphe::ScriptValue, ::haphe::ScriptConvertError> {
+                            #(
+                                let #p_vars = <__T::#p_assoc as ::haphe::FromScript>::from_script(
+                                    __args.get(#idx).cloned().unwrap_or(::haphe::ScriptValue::Unit)
+                                )?;
+                            )*
+                            ::core::result::Result::Ok(::haphe::ScriptValue::from(
+                                __T::__invoke(#( #p_vars ),*)
+                            ))
+                        }) as fn(&[::haphe::ScriptValue])
+                            -> ::core::result::Result<::haphe::ScriptValue, ::haphe::ScriptConvertError>,
+                    )
+                }
+            }
+            #[allow(unused_imports)]
+            use ::haphe::SkipBindFn as _;
+            (&&::haphe::BridgeProbe::<#carrier>(::core::marker::PhantomData))
+                .__haphe_bind_fn(__binder)
+        }
+    }
 }

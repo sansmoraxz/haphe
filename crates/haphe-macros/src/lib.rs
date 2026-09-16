@@ -49,14 +49,21 @@ mod verify;
 ///
 /// assert_eq!(<Meters as HapheType>::DESCRIPTOR, <f64 as HapheType>::DESCRIPTOR);
 /// ```
-/// - `traits(...)` — standard traits to expose, verified at compile time:
-///   `Display`, `ToString` (string concatenation), `Debug`, `Hash`,
-///   `PartialEq`, `Eq`, `PartialOrd`, `Ord`, `Clone`, `Default`, `Add`,
-///   `Sub`, `Mul`, `Div`, `Rem`, `Neg`, `Index`,
-///   `IndexMut`, `Iterator`, `IntoIterator`. Operator traits accept named
-///   type arguments (e.g. `Add(rhs = f64, output = Self)`), defaulting to
-///   `Self`; `Index`/`IndexMut` require `index` and `output`;
+/// - `traits(...)` — traits to expose, verified at compile time: `Display`,
+///   `ToString` (string concatenation), `Debug`, `Hash`, `PartialEq`, `Eq`,
+///   `PartialOrd`, `Ord`, `Clone`, `Default`, `Add`, `Sub`, `Mul`, `Div`,
+///   `Rem`, `IDiv`, `Mod`, `Neg`, `BitAnd`, `BitOr`, `BitXor`, `Shl`, `Shr`,
+///   `Not`, `Pow`, `Index`, `IndexMut`, `Iterator`, `IntoIterator`. Operator traits accept
+///   named type arguments (e.g. `Add(rhs = f64, output = Self)`), defaulting
+///   to `Self`; `Index`/`IndexMut` require `index` and `output`;
 ///   `Iterator`/`IntoIterator` require `item`.
+///
+///   Operator declarations bind against haphe's `ops` traits, each a blanket
+///   extension of its `core::ops` counterpart — implementing the std trait
+///   is all a type needs. `Pow`, `IDiv` (floor division), and `Mod` (floor
+///   modulo) have no std counterpart: implement the `haphe::ops` trait
+///   directly (all provided for the standard numeric types), forwarding to
+///   a third-party impl if that is where the behavior lives.
 /// - `methods` — include the type's `#[script] impl` block.
 ///
 /// # Field attributes

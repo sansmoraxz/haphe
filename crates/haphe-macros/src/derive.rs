@@ -222,8 +222,9 @@ fn trait_impl_expr(
             }
         }
         let known_args: &[&str] = match name_str.as_str() {
-            "Add" | "Sub" | "Mul" | "Div" | "Rem" => &["rhs", "output"],
-            "Neg" => &["output"],
+            "Add" | "Sub" | "Mul" | "Div" | "Rem" | "IDiv" | "Mod" | "BitAnd" | "BitOr"
+            | "BitXor" | "Shl" | "Shr" | "Pow" => &["rhs", "output"],
+            "Neg" | "Not" => &["output"],
             "Index" | "IndexMut" => &["index", "output"],
             "Iterator" | "IntoIterator" => &["item"],
             other => {
@@ -232,7 +233,8 @@ fn trait_impl_expr(
                     format!(
                         "unsupported trait `{other}` (expected one of: Display, Debug, Hash, \
                          PartialEq, Eq, PartialOrd, Ord, Clone, Default, Add, Sub, Mul, Div, Rem, \
-                         Neg, Index, IndexMut, Iterator, IntoIterator)"
+                         IDiv, Mod, Neg, BitAnd, BitOr, BitXor, Shl, Shr, Not, Pow, Index, \
+                         IndexMut, Iterator, IntoIterator)"
                     ),
                 );
                 return None;
@@ -262,21 +264,22 @@ fn trait_impl_expr(
         let variant = Ident::new(&name_str, span);
 
         match name_str.as_str() {
-            "Add" | "Sub" | "Mul" | "Div" | "Rem" => {
+            "Add" | "Sub" | "Mul" | "Div" | "Rem" | "IDiv" | "Mod" | "BitAnd" | "BitOr"
+            | "BitXor" | "Shl" | "Shr" | "Pow" => {
                 let rhs_ty = lookup(decl, self_ty, span, errors, "rhs", true)?;
                 let out_ty = lookup(decl, self_ty, span, errors, "output", true)?;
                 let (rhs, output) = (desc(&rhs_ty, errors), desc(&out_ty, errors));
                 let (rhs_sub, out_sub) =
                     (substitute_self(&rhs_ty, ctx), substitute_self(&out_ty, ctx));
                 expr = quote! { ::haphe::TraitImpl::#variant { rhs: #rhs, output: #output } };
-                bound = quote! { ::core::ops::#variant<#rhs_sub, Output = #out_sub> };
+                bound = quote! { ::haphe::ops::#variant<#rhs_sub, Output = #out_sub> };
             }
-            "Neg" => {
+            "Neg" | "Not" => {
                 let out_ty = lookup(decl, self_ty, span, errors, "output", true)?;
                 let output = desc(&out_ty, errors);
                 let out_sub = substitute_self(&out_ty, ctx);
-                expr = quote! { ::haphe::TraitImpl::Neg { output: #output } };
-                bound = quote! { ::core::ops::Neg<Output = #out_sub> };
+                expr = quote! { ::haphe::TraitImpl::#variant { output: #output } };
+                bound = quote! { ::haphe::ops::#variant<Output = #out_sub> };
             }
             "Index" | "IndexMut" => {
                 let idx_ty = lookup(decl, self_ty, span, errors, "index", false)?;
@@ -285,7 +288,7 @@ fn trait_impl_expr(
                 let (idx_sub, out_sub) =
                     (substitute_self(&idx_ty, ctx), substitute_self(&out_ty, ctx));
                 expr = quote! { ::haphe::TraitImpl::#variant { index: #index, output: #output } };
-                bound = quote! { ::core::ops::#variant<#idx_sub, Output = #out_sub> };
+                bound = quote! { ::haphe::ops::#variant<#idx_sub, Output = #out_sub> };
             }
             "Iterator" | "IntoIterator" => {
                 let item_ty = lookup(decl, self_ty, span, errors, "item", false)?;
@@ -821,7 +824,50 @@ fn expand_newtype(
         quote! { ::haphe::TypeDescriptor::Ref(<Self as ::haphe::ScriptType>::ID) }
     };
 
+    // Transparent newtypes over value-convertible types cross the bridge as
+    // the inner value itself, so runtimes see their native primitive — e.g.
+    // a `bool` newtype participates in Lua truthiness. The conversions
+    // delegate through the inner type's own `From`/`FromScript`, so chains
+    // of transparent newtypes recurse down to the primitive; a transparent
+    // newtype over a non-convertible inner is a compile error. Opaque
+    // newtypes stay distinct named types with no generated conversions.
+    let is_value_convertible = match &field.ty {
+        syn::Type::Path(p) => p
+            .path
+            .segments
+            .last()
+            .is_some_and(|seg| seg.arguments.is_none()),
+        _ => false,
+    };
+    let conversions = if transparent && is_value_convertible && field_args.bytes.is_none() {
+        let inner_ty = &field.ty;
+        let (access, construct) = match &field.ident {
+            Some(fid) => (quote! { __value.#fid }, quote! { Self { #fid: __inner } }),
+            None => (quote! { __value.0 }, quote! { Self(__inner) }),
+        };
+        quote! {
+            #[automatically_derived]
+            impl ::core::convert::From<#ident> for ::haphe::ScriptValue {
+                fn from(__value: #ident) -> Self {
+                    ::haphe::ScriptValue::from(#access)
+                }
+            }
+            #[automatically_derived]
+            impl ::haphe::FromScript for #ident {
+                fn from_script(
+                    __v: ::haphe::ScriptValue,
+                ) -> ::core::result::Result<Self, ::haphe::ScriptConvertError> {
+                    let __inner = <#inner_ty as ::haphe::FromScript>::from_script(__v)?;
+                    ::core::result::Result::Ok(#construct)
+                }
+            }
+        }
+    } else {
+        TokenStream::new()
+    };
+
     Ok(quote! {
+        #conversions
         #[automatically_derived]
         impl ::haphe::HapheType for #ident {
             const DESCRIPTOR: ::haphe::TypeDescriptor<'static> = #haphe_type_desc;

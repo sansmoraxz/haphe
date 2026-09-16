@@ -29,6 +29,7 @@ pub mod foreign;
 pub mod function;
 pub mod haphe_type;
 pub mod module;
+pub mod ops;
 pub mod registry;
 pub mod script;
 #[cfg(any(feature = "streams", feature = "futures"))]
@@ -49,9 +50,9 @@ pub use backend::{
     RuntimeBinder,
 };
 pub use bridge::{
-    BindTarget, FnBinder, ForeignCaller, ForeignError, ForeignErrorKind, ForeignHandle, FromScript,
-    IntoScript, OpaqueUserData, ScriptBind, ScriptBindFn, ScriptConvertError, ScriptIter,
-    ScriptValue, TypeBinder,
+    BindTarget, BridgeProbe, FnBinder, ForeignCaller, ForeignError, ForeignErrorKind,
+    ForeignHandle, FromScript, IntoScript, OpaqueUserData, ScriptBind, ScriptBindFn,
+    ScriptConvertError, ScriptIter, ScriptValue, SkipBind, SkipBindFn, TypeBinder,
 };
 pub use foreign::ForeignInterfaceDescriptor;
 pub use function::{FunctionDescriptor, Ownership, ParamDescriptor, Receiver, any_async};

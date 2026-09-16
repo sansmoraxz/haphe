@@ -483,10 +483,25 @@ pub trait TypeBinder<T>: Sized {
     /// Register a unary negation metamethod.
     fn meta_unm(&mut self, f: fn(&T) -> T) -> Result<(), Self::Error>;
 
-    /// Register a binary arithmetic metamethod where both operands are `T`.
+    /// Register a bitwise-not metamethod, from `std::ops::Not`.
+    ///
+    /// A backend whose runtime has no bitwise-operator construct (or not in
+    /// the configured version) rejects the registration with a descriptive
+    /// error rather than dropping it.
+    fn meta_bnot(&mut self, f: fn(&T) -> T) -> Result<(), Self::Error>;
+
+    /// Register a binary operator metamethod where both operands are `T`.
+    ///
+    /// `op` is the Rust trait method name: `add`, `sub`, `mul`, `div`, `rem`
+    /// for arithmetic, `idiv` for floor division ([`crate::ops::IDiv`]),
+    /// `mod` for floor modulo ([`crate::ops::Mod`]), `pow` for
+    /// exponentiation ([`crate::ops::Pow`]), and `bitand`, `bitor`,
+    /// `bitxor`, `shl`, `shr` for the bitwise family. A backend whose runtime lacks a construct for an op
+    /// (or not in the configured version) rejects the registration with a
+    /// descriptive error rather than dropping it.
     fn meta_arith_self(&mut self, op: &'static str, f: fn(T, T) -> T) -> Result<(), Self::Error>;
 
-    /// Register a binary arithmetic metamethod where the rhs is a primitive.
+    /// Register a binary operator metamethod where the rhs is a primitive.
     /// The backend handles commutativity (tries `T op rhs` then `rhs op T`).
     ///
     /// `rhs` describes the scalar operand's declared type so backends with
@@ -612,6 +627,40 @@ pub trait FnBinder: Sized {
         f: fn(&[ScriptValue]) -> Result<ScriptValue, ScriptConvertError>,
     ) -> Result<(), Self::Error>;
 }
+
+// ---------------------------------------------------------------------------
+// Compile-time bridgeability dispatch (macro plumbing)
+// ---------------------------------------------------------------------------
+
+/// Carrier for compile-time bridgeability dispatch (autoref
+/// specialization): macro-generated registration code probes whether a
+/// signature's types implement the bridge traits and registers only when
+/// they do, falling back to a no-op otherwise.
+#[doc(hidden)]
+pub struct BridgeProbe<S: ?Sized>(pub core::marker::PhantomData<S>);
+
+/// The no-op fallback arm of bridgeability dispatch. Macro-generated `__Go`
+/// traits on `&BridgeProbe<S>` take precedence when the signature's bridge
+/// bounds hold.
+#[doc(hidden)]
+pub trait SkipBind<T> {
+    fn __haphe_bind<B: TypeBinder<T>>(&self, _b: &mut B) -> Result<(), B::Error> {
+        Ok(())
+    }
+}
+
+impl<S: ?Sized, T> SkipBind<T> for BridgeProbe<S> {}
+
+/// The no-op fallback arm of bridgeability dispatch for free functions
+/// (mirrors [`SkipBind`] against [`FnBinder`]).
+#[doc(hidden)]
+pub trait SkipBindFn {
+    fn __haphe_bind_fn<B: FnBinder>(&self, _b: &mut B) -> Result<(), B::Error> {
+        Ok(())
+    }
+}
+
+impl<S: ?Sized> SkipBindFn for BridgeProbe<S> {}
 
 /// Identifies a type for [`TypeBinder`] dispatch.
 #[derive(Debug, Clone, Copy)]

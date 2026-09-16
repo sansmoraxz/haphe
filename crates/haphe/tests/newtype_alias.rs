@@ -102,3 +102,72 @@ fn named_single_field_structs() {
     assert_eq!(desc.fields.len(), 1);
     assert_eq!(desc.fields[0].name, "inner");
 }
+
+// Transparent newtypes over primitive-valued types cross the bridge as the
+// inner value — a bool newtype is a native boolean to a runtime. Opaque
+// newtypes get no generated conversions.
+#[derive(Script)]
+#[script(transparent)]
+pub struct Toggle(bool);
+
+#[derive(Script)]
+#[script(transparent)]
+pub struct Label {
+    text: String,
+}
+
+#[test]
+fn primitive_newtypes_cross_as_native_values() {
+    use haphe::{FromScript, ScriptValue};
+
+    assert!(matches!(
+        ScriptValue::from(Toggle(false)),
+        ScriptValue::Bool(false)
+    ));
+    let t = Toggle::from_script(ScriptValue::Bool(true)).unwrap();
+    assert!(t.0);
+    assert!(Toggle::from_script(ScriptValue::I64(1)).is_err());
+
+    assert!(matches!(
+        ScriptValue::from(Meters(1.5)),
+        ScriptValue::F64(f) if f == 1.5
+    ));
+    // Opaque newtypes (`RawHandle`) deliberately get no conversions —
+    // enforced by the compile-time absence of `From`/`FromScript` impls.
+}
+
+#[test]
+fn named_single_field_string_newtype_converts() {
+    use haphe::{FromScript, ScriptValue};
+    assert!(matches!(
+        ScriptValue::from(Label { text: "hi".into() }),
+        ScriptValue::String(s) if s == "hi"
+    ));
+    let l = Label::from_script(ScriptValue::String("ok".into())).unwrap();
+    assert_eq!(l.text, "ok");
+}
+
+// Chains of transparent newtypes delegate conversions link by link down to
+// the primitive.
+#[derive(Script)]
+#[script(transparent)]
+pub struct Altitude(Meters);
+
+#[derive(Script)]
+#[script(transparent)]
+pub struct CruisingLevel(Altitude);
+
+#[test]
+fn transparent_chains_convert_to_the_primitive() {
+    use haphe::{FromScript, ScriptValue};
+    assert_eq!(
+        <CruisingLevel as HapheType>::DESCRIPTOR,
+        TypeDescriptor::Primitive(PrimitiveType::F64),
+    );
+    assert!(matches!(
+        ScriptValue::from(CruisingLevel(Altitude(Meters(11000.0)))),
+        ScriptValue::F64(f) if f == 11000.0
+    ));
+    let lvl = CruisingLevel::from_script(ScriptValue::F64(1.5)).unwrap();
+    assert_eq!(lvl.0.0.0, 1.5);
+}

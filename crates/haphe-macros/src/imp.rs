@@ -100,6 +100,7 @@ pub fn expand(mut item: ItemImpl) -> TokenStream {
 
     // Bridge: collect method/constructor info for ScriptBind generation.
     let mut bind_methods: Vec<crate::bind::BindMethod> = Vec::new();
+    let mut dispatch_methods: Vec<crate::bind::BindMethod> = Vec::new();
     let mut bind_constructors: Vec<crate::bind::BindMethod> = Vec::new();
 
     for impl_item in &mut item.items {
@@ -274,11 +275,15 @@ pub fn expand(mut item: ItemImpl) -> TokenStream {
             // Bridge: register non-async, non-cfg-gated methods with
             // bridge-compatible signatures. Generic impls bypass the
             // compatibility check — bounds are enforced at monomorphization.
-            if !info.is_async
-                && cfgs.is_empty()
-                && (has_type_params || is_bind_compatible(func, &info))
-            {
-                bind_methods.push(extract_bind_method(func, &info));
+            if !info.is_async && cfgs.is_empty() {
+                if has_type_params || is_bind_compatible(func, &info) {
+                    bind_methods.push(extract_bind_method(func, &info));
+                } else if !has_type_params && is_dispatch_eligible(func, &info) {
+                    // Types the whitelist can't judge (e.g. transparent
+                    // primitive newtypes): registration is decided by
+                    // compile-time trait-presence dispatch instead.
+                    dispatch_methods.push(extract_bind_method(func, &info));
+                }
             }
             methods.push(Entry {
                 cfgs,
@@ -382,6 +387,7 @@ pub fn expand(mut item: ItemImpl) -> TokenStream {
             &seg.ident,
             &self_ty,
             &bind_methods,
+            &dispatch_methods,
             &bind_constructors,
             &item.generics,
         )
@@ -411,6 +417,37 @@ pub fn expand(mut item: ItemImpl) -> TokenStream {
 
 /// Checks whether a method's param and return types are all bridge-compatible
 /// (primitives that implement IntoScript/FromScript).
+/// A signature the syntactic whitelist rejected but whose bridgeability can
+/// be decided by trait presence: every param (stripped of one reference) and
+/// the return type is either whitelisted or an owned bare-ident path type,
+/// and the method has a receiver.
+fn is_dispatch_eligible(func: &syn::ImplItemFn, info: &crate::fn_desc::FnInfo) -> bool {
+    use crate::bind::{is_bridge_compatible_type, is_dispatchable_path};
+    let has_receiver = func
+        .sig
+        .inputs
+        .first()
+        .is_some_and(|a| matches!(a, syn::FnArg::Receiver(_)));
+    if !has_receiver {
+        return false;
+    }
+    for input in &func.sig.inputs {
+        if let syn::FnArg::Typed(pat_ty) = input
+            && !is_bridge_compatible_type(&pat_ty.ty)
+            && !is_dispatchable_path(&pat_ty.ty)
+        {
+            return false;
+        }
+    }
+    if let Some(ret) = &info.return_ty
+        && !is_bridge_compatible_type(ret)
+        && !is_dispatchable_path(ret)
+    {
+        return false;
+    }
+    true
+}
+
 fn is_bind_compatible(func: &syn::ImplItemFn, info: &crate::fn_desc::FnInfo) -> bool {
     use crate::bind::is_bridge_compatible_type;
     for input in &func.sig.inputs {

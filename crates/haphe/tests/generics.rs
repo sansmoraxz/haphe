@@ -236,3 +236,38 @@ fn registry_records_instantiations_and_dedupes_erased_descriptor() {
         ]
     );
 }
+
+// Operator claims on generic types: the bound lives on the struct's
+// generics, `rhs = T` stays symbolic in the erased descriptor, and the
+// registration code monomorphizes with the rest of the bind machinery.
+#[derive(Script, Clone)]
+#[script(traits(Mul(rhs = T, output = Self)))]
+struct Scaled<T>
+where
+    T: std::ops::Mul<Output = T> + haphe::HapheType + haphe::FromScript + Clone + 'static,
+{
+    #[script(skip)]
+    value: T,
+}
+
+impl<T> std::ops::Mul<T> for Scaled<T>
+where
+    T: std::ops::Mul<Output = T> + haphe::HapheType + haphe::FromScript + Clone + 'static,
+{
+    type Output = Scaled<T>;
+    fn mul(self, rhs: T) -> Scaled<T> {
+        Scaled {
+            value: self.value * rhs,
+        }
+    }
+}
+
+#[test]
+fn operator_claim_with_generic_rhs_stays_symbolic() {
+    let desc = <Scaled<i64> as haphe::ScriptStruct>::DESCRIPTOR;
+    let [haphe::TraitImpl::Mul { rhs, output }] = desc.trait_impls else {
+        panic!("expected one Mul claim, got {:?}", desc.trait_impls);
+    };
+    assert_eq!(**rhs, TypeDescriptor::GenericParam("T"));
+    assert!(matches!(**output, TypeDescriptor::Ref(_)));
+}

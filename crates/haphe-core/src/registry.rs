@@ -619,11 +619,19 @@ fn collect_dangling_refs_in_trait_impls<'a>(
             | TraitImpl::Sub { rhs, output }
             | TraitImpl::Mul { rhs, output }
             | TraitImpl::Div { rhs, output }
-            | TraitImpl::Rem { rhs, output } => {
+            | TraitImpl::Rem { rhs, output }
+            | TraitImpl::Mod { rhs, output }
+            | TraitImpl::IDiv { rhs, output }
+            | TraitImpl::Pow { rhs, output }
+            | TraitImpl::BitAnd { rhs, output }
+            | TraitImpl::BitOr { rhs, output }
+            | TraitImpl::BitXor { rhs, output }
+            | TraitImpl::Shl { rhs, output }
+            | TraitImpl::Shr { rhs, output } => {
                 collect_dangling_refs(owner, rhs, known, errors);
                 collect_dangling_refs(owner, output, known, errors);
             }
-            TraitImpl::Neg { output } => {
+            TraitImpl::Neg { output } | TraitImpl::Not { output } => {
                 collect_dangling_refs(owner, output, known, errors);
             }
             TraitImpl::Index { index, output } | TraitImpl::IndexMut { index, output } => {

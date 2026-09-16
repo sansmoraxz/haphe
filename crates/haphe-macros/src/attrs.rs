@@ -287,7 +287,19 @@ pub fn parse_container_args(attrs: &[Attribute], errors: &mut Errors) -> Contain
                     // unique.
                     let is_operator = matches!(
                         name.to_string().as_str(),
-                        "Add" | "Sub" | "Mul" | "Div" | "Rem"
+                        "Add"
+                            | "Sub"
+                            | "Mul"
+                            | "Div"
+                            | "Rem"
+                            | "BitAnd"
+                            | "BitOr"
+                            | "BitXor"
+                            | "Shl"
+                            | "Shr"
+                            | "Pow"
+                            | "IDiv"
+                            | "Mod"
                     );
                     if !is_operator && args.traits.iter().any(|t| t.name == name) {
                         return Err(syn::Error::new(
