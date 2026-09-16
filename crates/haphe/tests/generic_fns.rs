@@ -37,6 +37,32 @@ haphe::registry! {
     };
 }
 
+/// Generic with no fn-site instantiations: registry-level entries alone
+/// satisfy validation and capability checks.
+#[script]
+pub fn relay<T>(value: T) -> T {
+    value
+}
+
+haphe::registry! {
+    pub static REGISTRY_LEVEL = {
+        modules: [
+            // A duplicate mention dedupes; a second distinct instantiation
+            // is recorded alongside.
+            mod util { functions: [relay<i64>, relay<i64>, relay<String>] },
+        ],
+    };
+}
+
+// Both sources on one function: the union dedupes the shared entry.
+haphe::registry! {
+    pub static MIXED_SOURCES = {
+        modules: [
+            mod util { functions: [echo<i64>, echo<bool>] },
+        ],
+    };
+}
+
 #[test]
 fn descriptor_records_params_and_instantiations() {
     let desc = <echo as ScriptFunction>::DESCRIPTOR;
@@ -80,6 +106,43 @@ fn registry_validates_and_capabilities_gate() {
             fn_name: "lonely"
         }
     )));
+}
+
+#[test]
+fn registry_level_instantiations_recorded_and_gate_capabilities() {
+    let module = &REGISTRY_LEVEL.modules()[0];
+    assert_eq!(module.function_instantiations.len(), 2);
+    assert_eq!(module.function_instantiations[0].function, "relay");
+    assert_eq!(
+        module.function_instantiations[0].args,
+        &[TypeDescriptor::Primitive(PrimitiveType::I64)]
+    );
+    assert_eq!(
+        module.function_instantiations[1].args,
+        &[TypeDescriptor::String]
+    );
+
+    let validated = REGISTRY_LEVEL.validate().expect("registry validates");
+    BackendCapabilities::ALL
+        .check(&validated)
+        .expect("registry-level instantiations satisfy the capability check");
+}
+
+#[test]
+fn union_dedupes_across_sources() {
+    let module = &MIXED_SOURCES.modules()[0];
+    let desc = &module.functions[0];
+    assert_eq!(desc.name, "echo");
+    // fn-site: [i64, String]; registry-level: [i64 (dup), bool].
+    let union: Vec<_> = module.instantiations_of(desc).collect();
+    assert_eq!(
+        union,
+        vec![
+            &[TypeDescriptor::Primitive(PrimitiveType::I64)] as &[_],
+            &[TypeDescriptor::String] as &[_],
+            &[TypeDescriptor::Primitive(PrimitiveType::Bool)] as &[_],
+        ]
+    );
 }
 
 type Wrapper = fn(&[ScriptValue]) -> Result<ScriptValue, ScriptConvertError>;

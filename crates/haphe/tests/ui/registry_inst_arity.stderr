@@ -1,0 +1,5 @@
+error[E0080]: evaluation panicked: wrong number of type arguments for function `relay` (does not match its declared generic parameters)
+  --> tests/ui/registry_inst_arity.rs:11:36
+   |
+11 |             mod util { functions: [relay<i64, bool>] },
+   |                                    ^^^^^ evaluation of `REGISTRY::_` failed here

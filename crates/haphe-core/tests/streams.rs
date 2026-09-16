@@ -77,6 +77,7 @@ fn module_stream_fn_rejected_without_capability() {
         type_ids: &[],
         submodules: &[],
         constants: &[],
+        function_instantiations: &[],
     }];
     static REGISTRY: TypeRegistry = TypeRegistry::new(&[], &[], &[], &MODULES, &[], &[]);
 

@@ -234,6 +234,7 @@ fn module_tree() {
         type_ids: &[],
         submodules: &[],
         constants: &[],
+        function_instantiations: &[],
     }];
     static TYPE_IDS: [TypeId<'static>; 2] = [TypeId::new("Point"), TypeId::new("Color")];
     static MODULES: [ModuleDescriptor<'static>; 1] = [ModuleDescriptor {
@@ -243,6 +244,7 @@ fn module_tree() {
         type_ids: &TYPE_IDS,
         submodules: &SHAPES,
         constants: &CONSTS,
+        function_instantiations: &[],
     }];
 
     let registry = TypeRegistry::new(&[], &[], &[], &MODULES, &[], &[]);
