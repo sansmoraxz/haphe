@@ -355,7 +355,7 @@ impl BackendCapabilities {
                         module: module.name,
                         fn_name: function.name,
                     });
-                } else if function.instantiations.is_empty() {
+                } else if module.instantiations_of(function).next().is_none() {
                     errors.push(CompatibilityError::UninstantiatedModuleGeneric {
                         module: module.name,
                         fn_name: function.name,

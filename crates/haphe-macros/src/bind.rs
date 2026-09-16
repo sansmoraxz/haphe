@@ -315,6 +315,7 @@ fn gen_metamethod_registrations(self_ty: &Type, traits: &[TraitDecl]) -> TokenSt
     // yields the comparison metamethods, deduplicated when both are declared.
     let has_partial_eq = traits.iter().any(|t| t.name == "PartialEq");
     let has_partial_ord = traits.iter().any(|t| t.name == "PartialOrd");
+    let has_into_iterator = traits.iter().any(|t| t.name == "IntoIterator");
 
     let ctx = crate::ty_map::TyCtx {
         generic_params: &[],
@@ -410,6 +411,71 @@ fn gen_metamethod_registrations(self_ty: &Type, traits: &[TraitDecl]) -> TokenSt
                                     <#self_ty as ::core::ops::#op_trait<#rhs_ty>>::#op_method(__self, __rhs)
                                 )
                             },
+                        )?;
+                    });
+                }
+            }
+            // `Iterator` bridges through the blanket `IntoIterator` impl
+            // (`t.into_iter()` is `t` itself) — the consuming registration
+            // owns the value, so advancing needs no shared access. Deduped
+            // when both are declared.
+            "IntoIterator" | "Iterator" => {
+                if name == "Iterator" && has_into_iterator {
+                    continue;
+                }
+                tokens.extend(quote! {
+                    __b.meta_iter(
+                        (|__t: #self_ty| ::haphe::ScriptIter::new(
+                            ::core::iter::IntoIterator::into_iter(__t)
+                                .map(|__item| ::haphe::ScriptValue::from(__item))
+                        )) as fn(#self_ty) -> ::haphe::ScriptIter,
+                    )?;
+                    __b.meta_len(
+                        (|__t: #self_ty| ::core::iter::Iterator::size_hint(
+                            &::core::iter::IntoIterator::into_iter(__t)
+                        ).0) as fn(#self_ty) -> usize,
+                    )?;
+                });
+            }
+            "Index" | "IndexMut" => {
+                let arg = |key: &str| {
+                    decl.args
+                        .iter()
+                        .find(|(n, _)| n == key)
+                        .map(|(_, ty)| substitute_self(ty, &ctx))
+                };
+                // Missing args already errored in the descriptor pass.
+                let (Some(idx_ty), Some(out_ty)) = (arg("index"), arg("output")) else {
+                    continue;
+                };
+                if name == "Index" {
+                    tokens.extend(quote! {
+                        __b.meta_index(
+                            (|__t: &#self_ty, __args: &[::haphe::ScriptValue]| -> ::core::result::Result<::haphe::ScriptValue, ::haphe::ScriptConvertError> {
+                                let __idx = <#idx_ty as ::haphe::FromScript>::from_script(
+                                    __args.first().cloned().unwrap_or(::haphe::ScriptValue::Unit)
+                                )?;
+                                ::core::result::Result::Ok(::haphe::IntoScript::into_script(
+                                    ::core::clone::Clone::clone(
+                                        <#self_ty as ::core::ops::Index<#idx_ty>>::index(__t, __idx)
+                                    )
+                                ))
+                            }) as fn(&#self_ty, &[::haphe::ScriptValue]) -> ::core::result::Result<::haphe::ScriptValue, ::haphe::ScriptConvertError>,
+                        )?;
+                    });
+                } else {
+                    tokens.extend(quote! {
+                        __b.meta_newindex(
+                            (|__t: &mut #self_ty, __args: &[::haphe::ScriptValue]| -> ::core::result::Result<(), ::haphe::ScriptConvertError> {
+                                let __idx = <#idx_ty as ::haphe::FromScript>::from_script(
+                                    __args.first().cloned().unwrap_or(::haphe::ScriptValue::Unit)
+                                )?;
+                                let __val = <#out_ty as ::haphe::FromScript>::from_script(
+                                    __args.get(1).cloned().unwrap_or(::haphe::ScriptValue::Unit)
+                                )?;
+                                *<#self_ty as ::core::ops::IndexMut<#idx_ty>>::index_mut(__t, __idx) = __val;
+                                ::core::result::Result::Ok(())
+                            }) as fn(&mut #self_ty, &[::haphe::ScriptValue]) -> ::core::result::Result<(), ::haphe::ScriptConvertError>,
                         )?;
                     });
                 }

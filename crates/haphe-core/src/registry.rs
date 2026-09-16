@@ -72,6 +72,9 @@ pub enum RegistryError<'a> {
         module: &'a str,
         param_name: &'a str,
     },
+    /// A module-level function instantiation names a function that does not
+    /// exist in the module.
+    DanglingFunctionInstantiation { module: &'a str, function: &'a str },
 }
 
 impl std::fmt::Display for RegistryError<'_> {
@@ -140,6 +143,10 @@ impl std::fmt::Display for RegistryError<'_> {
             Self::UndeclaredModuleGenericParam { module, param_name } => write!(
                 f,
                 "module `{module}` has a function using undeclared generic parameter `{param_name}`"
+            ),
+            Self::DanglingFunctionInstantiation { module, function } => write!(
+                f,
+                "module `{module}` declares an instantiation of `{function}`, which is not a function of the module"
             ),
         }
     }
@@ -548,6 +555,25 @@ fn validate_module<'a>(
         }
     }
     validate_fn_instantiations(module.functions, errors);
+    for inst in module.function_instantiations {
+        let Some(function) = module.functions.iter().find(|f| f.name == inst.function) else {
+            errors.push(RegistryError::DanglingFunctionInstantiation {
+                module: module.name,
+                function: inst.function,
+            });
+            continue;
+        };
+        if function.generic_params.is_empty() {
+            errors.push(RegistryError::InstantiationOnNonGenericFunction {
+                function: function.name,
+            });
+            continue;
+        }
+        validate_one_fn_instantiation(function, inst.args, errors);
+        for arg in inst.args {
+            collect(arg, errors);
+        }
+    }
     for constant in module.constants {
         collect(constant.ty, errors);
     }
@@ -673,22 +699,30 @@ fn validate_fn_instantiations<'a>(
             continue;
         }
         for inst in function.instantiations {
-            if inst.len() != function.generic_params.len() {
-                errors.push(RegistryError::FunctionInstantiationArityMismatch {
-                    function: function.name,
-                    expected: function.generic_params.len(),
-                    found: inst.len(),
-                });
-            }
-            for arg in *inst {
-                walk_generic_params(arg, &mut |name| {
-                    errors.push(RegistryError::NonConcreteFunctionInstantiation {
-                        function: function.name,
-                        param_name: name,
-                    });
-                });
-            }
+            validate_one_fn_instantiation(function, inst, errors);
         }
+    }
+}
+
+fn validate_one_fn_instantiation<'a>(
+    function: &'a FunctionDescriptor<'a>,
+    args: &'a [TypeDescriptor<'a>],
+    errors: &mut Vec<RegistryError<'a>>,
+) {
+    if args.len() != function.generic_params.len() {
+        errors.push(RegistryError::FunctionInstantiationArityMismatch {
+            function: function.name,
+            expected: function.generic_params.len(),
+            found: args.len(),
+        });
+    }
+    for arg in args {
+        walk_generic_params(arg, &mut |name| {
+            errors.push(RegistryError::NonConcreteFunctionInstantiation {
+                function: function.name,
+                param_name: name,
+            });
+        });
     }
 }
 

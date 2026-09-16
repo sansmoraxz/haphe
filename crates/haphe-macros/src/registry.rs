@@ -238,14 +238,75 @@ fn module_expr(module: &ModuleInput) -> TokenStream {
     // Functions resolve through the `ScriptFunction` trait on the hidden type
     // `#[script]` emits next to each free fn; the type shares the fn's name,
     // so imports and re-exports work and unannotated fns get a guided error.
-    let functions: Vec<_> = module
-        .functions
-        .iter()
-        .flatten()
-        .map(|path: &Path| {
-            quote_spanned! {path.span()=> <#path as ::haphe::ScriptFunction>::DESCRIPTOR }
-        })
-        .collect();
+    // A mention with type arguments (`echo<i64>`) additionally records a
+    // module-level instantiation; the erased descriptor dedupes by stripped
+    // path across mentions.
+    let mut seen_fn_paths = std::collections::HashSet::new();
+    let mut seen_fn_insts = std::collections::HashSet::new();
+    let mut functions = Vec::new();
+    let mut fn_instantiations = Vec::new();
+    for path in module.functions.iter().flatten() {
+        let mut stripped: Path = path.clone();
+        let args = stripped
+            .segments
+            .last_mut()
+            .map(|last| std::mem::replace(&mut last.arguments, syn::PathArguments::None))
+            .unwrap_or(syn::PathArguments::None);
+        if seen_fn_paths.insert(stripped.to_token_stream().to_string()) {
+            functions.push(quote_spanned! {path.span()=>
+                <#stripped as ::haphe::ScriptFunction>::DESCRIPTOR
+            });
+        }
+        let syn::PathArguments::AngleBracketed(bracketed) = &args else {
+            continue;
+        };
+        if !seen_fn_insts.insert(path.to_token_stream().to_string()) {
+            continue;
+        }
+        let mut arg_tys = Vec::new();
+        let mut bad_arg = None;
+        for arg in &bracketed.args {
+            match arg {
+                syn::GenericArgument::Type(ty) => arg_tys.push(ty),
+                other => {
+                    bad_arg = Some(syn::Error::new(
+                        other.span(),
+                        "function instantiations take type arguments only",
+                    ));
+                    break;
+                }
+            }
+        }
+        if let Some(err) = bad_arg {
+            fn_instantiations.push(err.to_compile_error());
+            continue;
+        }
+        let arity = arg_tys.len();
+        let fn_name = stripped
+            .segments
+            .last()
+            .map(|s| s.ident.unraw().to_string())
+            .unwrap_or_default();
+        let non_generic_msg =
+            format!("function `{fn_name}` is not generic but is given type arguments");
+        let arity_msg = format!(
+            "wrong number of type arguments for function `{fn_name}` (does not match its declared generic parameters)"
+        );
+        fn_instantiations.push(quote_spanned! {path.span()=>
+            {
+                const _: () = {
+                    const __PARAMS: usize =
+                        <#stripped as ::haphe::ScriptFunction>::DESCRIPTOR.generic_params.len();
+                    ::core::assert!(__PARAMS != 0, #non_generic_msg);
+                    ::core::assert!(__PARAMS == #arity, #arity_msg);
+                };
+                ::haphe::FnInstantiation {
+                    function: <#stripped as ::haphe::ScriptFunction>::DESCRIPTOR.name,
+                    args: &[#(<#arg_tys as ::haphe::HapheType>::DESCRIPTOR),*],
+                }
+            }
+        });
+    }
     let type_ids: Vec<_> = module
         .types
         .iter()
@@ -310,6 +371,7 @@ fn module_expr(module: &ModuleInput) -> TokenStream {
             type_ids: &[#(#type_ids),*],
             submodules: &[#(#submodules),*],
             constants: &[#(#constants),*],
+            function_instantiations: &[#(#fn_instantiations),*],
         }
     }
 }

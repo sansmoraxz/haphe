@@ -499,6 +499,82 @@ pub trait TypeBinder<T>: Sized {
         rhs: &'static crate::types::TypeDescriptor<'static>,
         f: fn(T, &[ScriptValue]) -> Result<T, ScriptConvertError>,
     ) -> Result<(), Self::Error>;
+
+    /// Register an iteration metamethod, from `IntoIterator`.
+    ///
+    /// `f` consumes an owned value and yields an owned lazy iterator over its
+    /// contents; the backend holds the iterator and drives its runtime's
+    /// native iteration protocol with it. How the backend obtains the owned
+    /// value (cloning, taking) is its own policy — the bridge enforces no
+    /// acquisition strategy.
+    fn meta_iter(&mut self, f: fn(T) -> ScriptIter) -> Result<(), Self::Error>;
+
+    /// Register a length metamethod, derived from the iterator's
+    /// [`size_hint`](Iterator::size_hint) lower bound: exact for standard
+    /// containers (their owned iterators are exact-size), a lower bound
+    /// otherwise. Consuming, like [`meta_iter`](Self::meta_iter).
+    ///
+    /// Computing the length constructs one iterator (plus the backend's
+    /// value-acquisition cost).
+    fn meta_len(&mut self, f: fn(T) -> usize) -> Result<(), Self::Error>;
+
+    /// Register an indexed-read metamethod, from `std::ops::Index`.
+    ///
+    /// `f` converts the single key argument to the declared index type,
+    /// indexes, and returns the output clone-at-boundary. The key converts
+    /// verbatim — no base adjustment between the runtime's and Rust's
+    /// indexing conventions. An out-of-bounds Rust panic surfaces as the
+    /// backend's runtime error.
+    fn meta_index(
+        &mut self,
+        f: fn(&T, &[ScriptValue]) -> Result<ScriptValue, ScriptConvertError>,
+    ) -> Result<(), Self::Error>;
+
+    /// Register an indexed-write metamethod, from `std::ops::IndexMut`.
+    ///
+    /// `f` receives `[key, value]`, converts both to the declared index and
+    /// output types, and assigns in place. Same verbatim-key and panic
+    /// semantics as [`meta_index`](Self::meta_index).
+    fn meta_newindex(
+        &mut self,
+        f: fn(&mut T, &[ScriptValue]) -> Result<(), ScriptConvertError>,
+    ) -> Result<(), Self::Error>;
+}
+
+/// Owned iterator over a value's contents.
+///
+/// Produced from `IntoIterator` on an owned value, so it borrows nothing and
+/// a backend can hold it across its runtime's iteration steps. Items are
+/// plain values — any pairing or enumeration a runtime's iteration protocol
+/// needs is the backend's job.
+///
+/// Intentionally not `Send`; a backend whose threading model demands `Send`
+/// handles that at its own boundary.
+pub struct ScriptIter(Box<dyn Iterator<Item = ScriptValue>>);
+
+impl ScriptIter {
+    /// Wraps an owned iterator whose items are already converted.
+    pub fn new(inner: impl Iterator<Item = ScriptValue> + 'static) -> Self {
+        Self(Box::new(inner))
+    }
+}
+
+impl Iterator for ScriptIter {
+    type Item = ScriptValue;
+
+    fn next(&mut self) -> Option<ScriptValue> {
+        self.0.next()
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.0.size_hint()
+    }
+}
+
+impl std::fmt::Debug for ScriptIter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ScriptIter").finish_non_exhaustive()
+    }
 }
 
 // ---------------------------------------------------------------------------
