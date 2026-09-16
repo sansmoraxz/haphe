@@ -1046,3 +1046,62 @@ fn package_address_forms() {
         "got: {err:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Registry-level instantiations: guest stub parity (`generics` feature)
+// ---------------------------------------------------------------------------
+
+/// Relays a value; no fn-site `instantiate` attrs — the registry declares
+/// the concrete uses.
+#[cfg(feature = "generics")]
+#[script]
+fn relay<T>(value: T) -> T {
+    value
+}
+
+#[cfg(feature = "generics")]
+haphe::registry! {
+    static RELAY_REGISTRY = {
+        modules: [
+            mod pipes { functions: [relay<i64>] },
+        ],
+    };
+}
+
+/// Guest importing the registry-level monomorph under the same mangled name
+/// the generator emits.
+#[cfg(feature = "generics")]
+const RELAY_GUEST: &str = r#"
+(component
+  (import "haphe:demo/pipes" (instance $p
+    (export "relay-s64" (func (param "value" s64) (result s64)))
+  ))
+  (core func $relay (canon lower (func $p "relay-s64")))
+  (core module $m
+    (import "p" "relay-s64" (func $relay (param i64) (result i64)))
+    (func (export "run") (result i64) (call $relay (i64.const 7)))
+  )
+  (core instance $mi (instantiate $m
+    (with "p" (instance (export "relay-s64" (func $relay))))
+  ))
+  (func (export "run") (result s64) (canon lift (core func $mi "run")))
+)
+"#;
+
+/// The binder defines a stub for a monomorph declared only at the registry
+/// level: the guest links and instantiates (parity with the generated WIT),
+/// and calling it traps at stub depth.
+#[cfg(feature = "generics")]
+#[test]
+fn registry_level_monomorph_stub_links_but_traps() {
+    let engine = Engine::default();
+    let mut linker = Linker::new(&engine);
+    haphe::bind(&binder(), &RELAY_REGISTRY, &mut linker).expect("binding succeeds");
+
+    let err = run_guest(&engine, &linker, (), RELAY_GUEST).expect_err("stub should trap");
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("haphe-wit: `relay-s64` not yet implemented"),
+        "got: {msg}"
+    );
+}

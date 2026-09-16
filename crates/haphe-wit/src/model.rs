@@ -1,8 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use haphe::{
-    ConstantDescriptor, FunctionDescriptor, ModuleDescriptor, PrimitiveType, TypeDescriptor,
-    TypeKind, ValidatedRegistry, VariantKind,
+    ConstantDescriptor, FnInstantiation, FunctionDescriptor, ModuleDescriptor, PrimitiveType,
+    TypeDescriptor, TypeKind, ValidatedRegistry, VariantKind,
 };
 
 use crate::WitGenError;
@@ -29,6 +29,10 @@ pub(crate) struct Iface<'a> {
     pub name: String,
     pub doc: Option<&'a str>,
     pub functions: &'a [FunctionDescriptor<'a>],
+    /// Registry-level instantiations of this interface's generic functions
+    /// (a flattened module's `function_instantiations`; empty elsewhere).
+    /// Always consumed unioned with the fn-site declarations.
+    pub fn_instantiations: &'a [FnInstantiation<'a>],
     pub constants: &'a [ConstantDescriptor<'a>],
     /// TypeIds (as strings) of concrete types defined in this interface.
     pub type_ids: Vec<&'a str>,
@@ -137,6 +141,7 @@ impl<'a> Plan<'a> {
             name: to_kebab(default_interface),
             doc: None,
             functions: &[],
+            fn_instantiations: &[],
             constants: &[],
             type_ids: Vec::new(),
             instance_indices: Vec::new(),
@@ -178,6 +183,7 @@ impl<'a> Plan<'a> {
                 name: iface_names.insert(fi.name)?,
                 doc: fi.doc,
                 functions: fi.functions,
+                fn_instantiations: &[],
                 constants: &[],
                 type_ids: Vec::new(),
                 instance_indices: Vec::new(),
@@ -252,6 +258,7 @@ impl<'a> Plan<'a> {
                     name: wit_name,
                     doc: fi.doc,
                     functions: fi.functions,
+                    fn_instantiations: &[],
                     constants: &[],
                     type_ids: Vec::new(),
                     instance_indices: Vec::new(),
@@ -495,7 +502,7 @@ impl<'a> Plan<'a> {
             if f.generic_params.is_empty() {
                 self.collect_fn_uses(f, base_env.as_ref(), &mut refs)?;
             } else {
-                for args in f.instantiations {
+                for args in haphe::union_instantiations(f, iface.fn_instantiations) {
                     let env = self.fn_env(f, args, base_env.as_ref());
                     self.collect_fn_uses(f, Some(&env), &mut refs)?;
                 }
@@ -727,6 +734,7 @@ fn flatten_module<'a>(
         name: name.clone(),
         doc: module.doc,
         functions: module.functions,
+        fn_instantiations: module.function_instantiations,
         constants: module.constants,
         type_ids,
         instance_indices: Vec::new(),

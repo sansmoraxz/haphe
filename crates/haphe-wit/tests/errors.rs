@@ -312,6 +312,7 @@ fn cyclic_interface_use_rejected() {
             type_ids: &[TypeId::new("test::R1")],
             submodules: &[],
             constants: &[],
+            function_instantiations: &[],
         },
         haphe::ModuleDescriptor {
             name: "beta",
@@ -320,6 +321,7 @@ fn cyclic_interface_use_rejected() {
             type_ids: &[TypeId::new("test::R2")],
             submodules: &[],
             constants: &[],
+            function_instantiations: &[],
         },
     ];
     static REGISTRY: TypeRegistry = TypeRegistry::new(&STRUCTS, &[], &[], &MODULES, &[], &[]);
@@ -534,6 +536,7 @@ fn foreign_interface_name_collision_with_module() {
         type_ids: &[],
         submodules: &[],
         constants: &[],
+        function_instantiations: &[],
     }];
     static REGISTRY: TypeRegistry = TypeRegistry::new(&[], &[], &[], &MODULES, &[], &FOREIGN);
 
@@ -584,6 +587,35 @@ fn generic_foreign_function_rejected_without_feature() {
     static FOREIGN: [haphe::ForeignInterfaceDescriptor; 1] =
         [foreign_iface("test::Hooks", "Hooks", &[], &FNS)];
     static REGISTRY: TypeRegistry = TypeRegistry::new(&[], &[], &[], &[], &[], &FOREIGN);
+
+    let err = generate_err(&REGISTRY);
+    assert!(
+        matches!(err, WitGenError::GenericFunction { .. }),
+        "got: {err:?}"
+    );
+}
+
+/// A generic module function whose only instantiations are registry-level
+/// is still rejected without the `generics` feature — the gate keys on the
+/// declared generic parameters, not on where instantiations come from.
+#[cfg(not(feature = "generics"))]
+#[test]
+fn registry_instantiated_generic_fn_rejected_without_feature() {
+    static FNS: [FunctionDescriptor; 1] = [foreign_fn("relay", &FGN_T_PARAM, &[], &FGN_T_TYPE)];
+    static INSTS: [haphe::FnInstantiation; 1] = [haphe::FnInstantiation {
+        function: "relay",
+        args: &S64_ARGS,
+    }];
+    static MODULES: [haphe::ModuleDescriptor; 1] = [haphe::ModuleDescriptor {
+        name: "util",
+        doc: None,
+        functions: &FNS,
+        type_ids: &[],
+        submodules: &[],
+        constants: &[],
+        function_instantiations: &INSTS,
+    }];
+    static REGISTRY: TypeRegistry = TypeRegistry::new(&[], &[], &[], &MODULES, &[], &[]);
 
     let err = generate_err(&REGISTRY);
     assert!(

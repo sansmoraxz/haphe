@@ -416,9 +416,9 @@ impl WitGenerator {
                 continue;
             }
             // One deterministically-named monomorph per declared
-            // instantiation (`generics` feature; rejected in `Plan::build`
-            // otherwise).
-            for args in func.instantiations {
+            // instantiation — fn-site and registry-level sources unioned
+            // (`generics` feature; rejected in `Plan::build` otherwise).
+            for args in haphe::union_instantiations(func, iface.fn_instantiations) {
                 let mangled = plan.mangle_fn_instance(func.name, args, base_env.as_ref())?;
                 let name = member_names.insert(&mangled)?;
                 let env = plan.fn_env(func, args, base_env.as_ref());

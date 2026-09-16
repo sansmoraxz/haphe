@@ -206,10 +206,11 @@ impl<T: 'static> RuntimeBinder for WasmBinder<T> {
                     stub_func(&mut inst, &name)?;
                     continue;
                 }
-                // One stub per declared instantiation, same mangled names
-                // the generator emits (`generics` feature; rejected in
+                // One stub per declared instantiation — fn-site and
+                // registry-level sources unioned, same mangled names the
+                // generator emits (`generics` feature; rejected in
                 // `Plan::build` otherwise).
-                for args in func.instantiations {
+                for args in haphe::union_instantiations(func, iface.fn_instantiations) {
                     let mangled = plan.mangle_fn_instance(func.name, args, None)?;
                     let name = member_names.insert(&mangled)?;
                     stub_func(&mut inst, &name)?;
