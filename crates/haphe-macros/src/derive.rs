@@ -472,16 +472,41 @@ fn expand_inner(input: DeriveInput) -> syn::Result<TokenStream> {
         Data::Enum(data) => {
             let is_flags = container.flags.is_some();
             let mut variant_exprs = Vec::new();
+            let mut unit_cases: Vec<(syn::Ident, String)> = Vec::new();
+            let mut any_skipped = false;
+            let mut all_unit = true;
             for variant in &data.variants {
                 let args = parse_variant_args(&variant.attrs, &mut errors);
                 if args.skip.is_some() {
+                    any_skipped = true;
                     continue;
+                }
+                // Case names cross backend boundaries: renames must stay
+                // identifier-shaped (Rust conventions) so each backend can
+                // derive its own optimal native spelling deterministically.
+                if let Some(rename) = &args.rename {
+                    let value = rename.value();
+                    let mut chars = value.chars();
+                    let valid = matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_')
+                        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_');
+                    if !valid {
+                        errors.spanned(
+                            rename.span(),
+                            "enum variant renames must follow Rust identifier conventions \
+                             (ASCII letters, digits, and `_`, not starting with a digit)",
+                        );
+                    }
                 }
                 let vname = args
                     .rename
                     .as_ref()
                     .map(|r| r.value())
                     .unwrap_or_else(|| variant.ident.unraw().to_string());
+                if matches!(variant.fields, Fields::Unit) {
+                    unit_cases.push((variant.ident.clone(), vname.clone()));
+                } else {
+                    all_unit = false;
+                }
                 let vdoc = doc_tokens(&extract_doc(&variant.attrs));
                 if container.flags.is_some() && !matches!(variant.fields, Fields::Unit) {
                     errors.spanned(
@@ -521,6 +546,60 @@ fn expand_inner(input: DeriveInput) -> syn::Result<TokenStream> {
                     ::haphe::EnumVariant { name: #vname, doc: #vdoc, kind: #kind }
                 });
             }
+            // Unit-only, non-flags, non-generic enums with no skipped
+            // variants get value conversions: cases cross the bridge as
+            // `ScriptValue::Enum` carrying the declared name, matched
+            // exactly — backends translate native spellings at their own
+            // boundary.
+            let case_conversions =
+                if all_unit && !any_skipped && !is_flags && !is_generic && !unit_cases.is_empty() {
+                    let vidents: Vec<&syn::Ident> = unit_cases.iter().map(|(i, _)| i).collect();
+                    let vnames: Vec<&str> = unit_cases.iter().map(|(_, n)| n.as_str()).collect();
+                    let expected = ident_str.clone();
+                    quote! {
+                        #[automatically_derived]
+                        impl ::core::convert::From<#ident> for ::haphe::ScriptValue {
+                            fn from(value: #ident) -> Self {
+                                let case = match value {
+                                    #( #ident::#vidents => #vnames, )*
+                                };
+                                ::haphe::ScriptValue::Enum {
+                                    case: ::std::string::String::from(case),
+                                }
+                            }
+                        }
+                        #[automatically_derived]
+                        impl ::haphe::FromScript for #ident {
+                            fn from_script(
+                                value: ::haphe::ScriptValue,
+                            ) -> ::core::result::Result<Self, ::haphe::ScriptConvertError> {
+                                let case = match &value {
+                                    ::haphe::ScriptValue::Enum { case } => case.as_str(),
+                                    ::haphe::ScriptValue::String(s) => s.as_str(),
+                                    other => {
+                                        return ::core::result::Result::Err(
+                                            ::haphe::ScriptConvertError {
+                                                expected: #expected,
+                                                got: other.variant_name(),
+                                            },
+                                        );
+                                    }
+                                };
+                                #(
+                                    if case == #vnames {
+                                        return ::core::result::Result::Ok(#ident::#vidents);
+                                    }
+                                )*
+                                ::core::result::Result::Err(::haphe::ScriptConvertError {
+                                    expected: #expected,
+                                    got: "unknown enum case",
+                                })
+                            }
+                        }
+                    }
+                } else {
+                    TokenStream::new()
+                };
             let enum_asserts = container.methods.map(|span| {
                 quote_spanned! {span=>
                     const _: () = ::core::assert!(
@@ -535,6 +614,7 @@ fn expand_inner(input: DeriveInput) -> syn::Result<TokenStream> {
             });
             quote! {
                 #enum_asserts
+                #case_conversions
                 #[automatically_derived]
                 impl #desc_impl_g ::haphe::ScriptEnum for #ident #desc_ty_g #desc_where_c {
                     const DESCRIPTOR: ::haphe::EnumDescriptor<'static> = ::haphe::EnumDescriptor {

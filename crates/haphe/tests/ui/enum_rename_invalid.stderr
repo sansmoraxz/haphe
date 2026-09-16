@@ -1,0 +1,11 @@
+error: enum variant renames must follow Rust identifier conventions (ASCII letters, digits, and `_`, not starting with a digit)
+ --> tests/ui/enum_rename_invalid.rs:5:23
+  |
+5 |     #[script(rename = "dark-blue")]
+  |                       ^^^^^^^^^^^
+
+error: enum variant renames must follow Rust identifier conventions (ASCII letters, digits, and `_`, not starting with a digit)
+ --> tests/ui/enum_rename_invalid.rs:7:23
+  |
+7 |     #[script(rename = "1st")]
+  |                       ^^^^^

@@ -230,6 +230,7 @@ pub fn build_fn_info(
         });
     }
     let mut inst_exprs = Vec::new();
+    let mut seen_instantiations: Vec<String> = Vec::new();
     for (types, span) in &fn_args.instantiate {
         if fn_type_param_count == 0 {
             errors.spanned(
@@ -238,6 +239,19 @@ pub fn build_fn_info(
             );
             continue;
         }
+        let key = types
+            .iter()
+            .map(|ty| quote!(#ty).to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        if seen_instantiations.contains(&key) {
+            errors.spanned(
+                *span,
+                format!("duplicate `instantiate({key})`: this instantiation is already declared"),
+            );
+            continue;
+        }
+        seen_instantiations.push(key);
         if types.len() != fn_type_param_count {
             errors.spanned(
                 *span,

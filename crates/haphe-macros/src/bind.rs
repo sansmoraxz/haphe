@@ -384,6 +384,7 @@ fn gen_metamethod_registrations(self_ty: &Type, traits: &[TraitDecl]) -> TokenSt
                     tokens.extend(quote! {
                         __b.meta_arith_scalar(
                             #op_name_str,
+                            &<#rhs_ty as ::haphe::HapheType>::DESCRIPTOR,
                             |__self: #self_ty, __args: &[::haphe::ScriptValue]| -> ::core::result::Result<#self_ty, ::haphe::ScriptConvertError> {
                                 let __rhs = <#rhs_ty as ::haphe::FromScript>::from_script(
                                     __args.first().cloned().unwrap_or(::haphe::ScriptValue::Unit)

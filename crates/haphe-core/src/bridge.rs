@@ -64,6 +64,17 @@ pub enum ScriptValue {
     Map(Vec<(String, ScriptValue)>),
     Optional(Option<Box<ScriptValue>>),
     UserData(OpaqueUserData),
+    /// A unit-enum value, identified by its declared case name.
+    ///
+    /// The case always carries the *declared* exposed spelling
+    /// (identifier-shaped, Rust conventions: ASCII letters, digits, `_`) and
+    /// is matched exactly. A backend whose native convention spells cases
+    /// differently translates to and from the declared name at its own
+    /// boundary, with a comparison policy of its choosing.
+    Enum {
+        /// The declared case name.
+        case: String,
+    },
 }
 
 /// Error returned when a [`ScriptValue`] variant doesn't match the expected
@@ -100,6 +111,7 @@ impl ScriptValue {
             Self::Map(_) => "map",
             Self::Optional(_) => "optional",
             Self::UserData(_) => "userdata",
+            Self::Enum { .. } => "enum",
         }
     }
 }
@@ -312,6 +324,59 @@ impl<V: FromScript> FromScript for HashMap<String, V> {
     }
 }
 
+// Tuples cross the bridge as fixed-length lists, matching their descriptor
+// shape (`TypeDescriptor::Tuple`).
+macro_rules! impl_tuple_bridge {
+    ($( ($($t:ident $idx:tt),+) ),+ $(,)?) => {$(
+        impl<$($t),+> From<($($t,)+)> for ScriptValue
+        where
+            $(ScriptValue: From<$t>,)+
+        {
+            fn from(value: ($($t,)+)) -> Self {
+                Self::List(vec![$(ScriptValue::from(value.$idx)),+])
+            }
+        }
+
+        impl<$($t: FromScript),+> FromScript for ($($t,)+) {
+            fn from_script(v: ScriptValue) -> Result<Self, ScriptConvertError> {
+                const ARITY: usize = 0 $(+ impl_tuple_bridge!(@one $t))+;
+                match v {
+                    ScriptValue::List(items) => {
+                        if items.len() != ARITY {
+                            return Err(ScriptConvertError {
+                                expected: "tuple",
+                                got: "list of mismatched length",
+                            });
+                        }
+                        let mut items = items.into_iter();
+                        Ok(($($t::from_script(items.next().expect("length checked"))?,)+))
+                    }
+                    other => Err(ScriptConvertError {
+                        expected: "tuple",
+                        got: other.variant_name(),
+                    }),
+                }
+            }
+        }
+    )+};
+    (@one $t:ident) => { 1 };
+}
+
+impl_tuple_bridge! {
+    (A 0),
+    (A 0, B 1),
+    (A 0, B 1, C 2),
+    (A 0, B 1, C 2, D 3),
+    (A 0, B 1, C 2, D 3, E 4),
+    (A 0, B 1, C 2, D 3, E 4, F 5),
+    (A 0, B 1, C 2, D 3, E 4, F 5, G 6),
+    (A 0, B 1, C 2, D 3, E 4, F 5, G 6, H 7),
+    (A 0, B 1, C 2, D 3, E 4, F 5, G 6, H 7, I 8),
+    (A 0, B 1, C 2, D 3, E 4, F 5, G 6, H 7, I 8, J 9),
+    (A 0, B 1, C 2, D 3, E 4, F 5, G 6, H 7, I 8, J 9, K 10),
+    (A 0, B 1, C 2, D 3, E 4, F 5, G 6, H 7, I 8, J 9, K 10, L 11),
+}
+
 impl<T> From<Option<T>> for ScriptValue
 where
     ScriptValue: From<T>,
@@ -416,9 +481,15 @@ pub trait TypeBinder<T>: Sized {
 
     /// Register a binary arithmetic metamethod where the rhs is a primitive.
     /// The backend handles commutativity (tries `T op rhs` then `rhs op T`).
+    ///
+    /// `rhs` describes the scalar operand's declared type so backends with
+    /// dynamic dispatch can rank overloads (e.g. prefer an exact type match
+    /// over the first lossy conversion that succeeds); the ranking policy is
+    /// the backend's own.
     fn meta_arith_scalar(
         &mut self,
         op: &'static str,
+        rhs: &'static crate::types::TypeDescriptor<'static>,
         f: fn(T, &[ScriptValue]) -> Result<T, ScriptConvertError>,
     ) -> Result<(), Self::Error>;
 }
