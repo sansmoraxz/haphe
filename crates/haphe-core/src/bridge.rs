@@ -74,6 +74,12 @@ pub enum ScriptValue {
     Enum {
         /// The declared case name.
         case: String,
+        /// The numeric discriminant, when the enum has a numeric script
+        /// representation ([`repr`](crate::EnumDescriptor::repr)); `None`
+        /// for string-represented enums. The case NAME remains the
+        /// canonical identity; the discriminant is carried data backends
+        /// may render natively.
+        discriminant: Option<i64>,
     },
 }
 

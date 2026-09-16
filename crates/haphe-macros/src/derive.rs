@@ -512,11 +512,107 @@ fn expand_inner(input: DeriveInput) -> syn::Result<TokenStream> {
         }
         Data::Enum(data) => {
             let is_flags = container.flags.is_some();
+            // Numeric script representation propagates the EXACT Rust
+            // `#[repr]` integer type; without one, the enum crosses as its
+            // declared case names.
+            let repr_prim: Option<&str> = input.attrs.iter().find_map(|attr| {
+                if !attr.path().is_ident("repr") {
+                    return None;
+                }
+                let mut found = None;
+                let _ = attr.parse_nested_meta(|meta| {
+                    if let Some(ident) = meta.path.get_ident() {
+                        let name = ident.to_string();
+                        if matches!(
+                            name.as_str(),
+                            "i8" | "i16" | "i32" | "i64" | "u8" | "u16" | "u32" | "u64"
+                        ) {
+                            found = Some(match name.as_str() {
+                                "i8" => "I8",
+                                "i16" => "I16",
+                                "i32" => "I32",
+                                "i64" => "I64",
+                                "u8" => "U8",
+                                "u16" => "U16",
+                                "u32" => "U32",
+                                _ => "U64",
+                            });
+                        }
+                    }
+                    Ok(())
+                });
+                found
+            });
+            let numeric = repr_prim.is_some() && !is_flags;
+            let repr_expr = match (repr_prim, is_flags) {
+                (Some(prim), false) => {
+                    let ident = Ident::new(prim, proc_macro2::Span::call_site());
+                    quote! { ::core::option::Option::Some(::haphe::PrimitiveType::#ident) }
+                }
+                _ => quote! { ::core::option::Option::None },
+            };
+            let mut next_discriminant: i64 = 0;
             let mut variant_exprs = Vec::new();
-            let mut unit_cases: Vec<(syn::Ident, String)> = Vec::new();
+            let mut unit_cases: Vec<(syn::Ident, String, Option<i64>)> = Vec::new();
             let mut any_skipped = false;
             let mut all_unit = true;
             for variant in &data.variants {
+                // Explicit discriminants must be integer literals so the IR
+                // can record them; the implicit chain follows Rust's rules.
+                let explicit: Option<i64> = match &variant.discriminant {
+                    Some((_, expr)) => match expr {
+                        syn::Expr::Lit(syn::ExprLit {
+                            lit: syn::Lit::Int(lit),
+                            ..
+                        }) => match lit.base10_parse::<i64>() {
+                            Ok(v) => Some(v),
+                            Err(_) => {
+                                errors.spanned(
+                                    lit.span(),
+                                    "script enum discriminants must fit in 64 bits (i64)",
+                                );
+                                None
+                            }
+                        },
+                        syn::Expr::Unary(syn::ExprUnary {
+                            op: syn::UnOp::Neg(_),
+                            expr,
+                            ..
+                        }) => match expr.as_ref() {
+                            syn::Expr::Lit(syn::ExprLit {
+                                lit: syn::Lit::Int(lit),
+                                ..
+                            }) => lit.base10_parse::<i64>().ok().map(|v| -v),
+                            _ => {
+                                errors.spanned(
+                                    expr.span(),
+                                    "script enums support integer-literal discriminants only",
+                                );
+                                None
+                            }
+                        },
+                        other => {
+                            errors.spanned(
+                                other.span(),
+                                "script enums support integer-literal discriminants only",
+                            );
+                            None
+                        }
+                    },
+                    None => None,
+                };
+                let discriminant: Option<i64> = if numeric {
+                    let value = explicit.unwrap_or(next_discriminant);
+                    next_discriminant = value.wrapping_add(1);
+                    Some(value)
+                } else {
+                    if let Some(value) = explicit {
+                        next_discriminant = value.wrapping_add(1);
+                    } else {
+                        next_discriminant = next_discriminant.wrapping_add(1);
+                    }
+                    None
+                };
                 let args = parse_variant_args(&variant.attrs, &mut errors);
                 if args.skip.is_some() {
                     any_skipped = true;
@@ -544,7 +640,7 @@ fn expand_inner(input: DeriveInput) -> syn::Result<TokenStream> {
                     .map(|r| r.value())
                     .unwrap_or_else(|| variant.ident.unraw().to_string());
                 if matches!(variant.fields, Fields::Unit) {
-                    unit_cases.push((variant.ident.clone(), vname.clone()));
+                    unit_cases.push((variant.ident.clone(), vname.clone(), discriminant));
                 } else {
                     all_unit = false;
                 }
@@ -583,8 +679,17 @@ fn expand_inner(input: DeriveInput) -> syn::Result<TokenStream> {
                         quote! { ::haphe::VariantKind::Struct(&[#(#fields),*]) }
                     }
                 };
+                let disc_expr = match discriminant {
+                    Some(v) => quote! { ::core::option::Option::Some(#v) },
+                    None => quote! { ::core::option::Option::None },
+                };
                 variant_exprs.push(quote! {
-                    ::haphe::EnumVariant { name: #vname, doc: #vdoc, kind: #kind }
+                    ::haphe::EnumVariant {
+                        name: #vname,
+                        doc: #vdoc,
+                        kind: #kind,
+                        discriminant: #disc_expr,
+                    }
                 });
             }
             // Unit-only, non-flags, non-generic enums with no skipped
@@ -594,18 +699,47 @@ fn expand_inner(input: DeriveInput) -> syn::Result<TokenStream> {
             // boundary.
             let case_conversions =
                 if all_unit && !any_skipped && !is_flags && !is_generic && !unit_cases.is_empty() {
-                    let vidents: Vec<&syn::Ident> = unit_cases.iter().map(|(i, _)| i).collect();
-                    let vnames: Vec<&str> = unit_cases.iter().map(|(_, n)| n.as_str()).collect();
+                    let vidents: Vec<&syn::Ident> = unit_cases.iter().map(|(i, _, _)| i).collect();
+                    let vnames: Vec<&str> = unit_cases.iter().map(|(_, n, _)| n.as_str()).collect();
+                    let vdiscs: Vec<TokenStream> = unit_cases
+                        .iter()
+                        .map(|(_, _, d)| match d {
+                            Some(v) => quote! { ::core::option::Option::Some(#v) },
+                            None => quote! { ::core::option::Option::None },
+                        })
+                        .collect();
                     let expected = ident_str.clone();
+                    // Numeric enums additionally accept their discriminant as
+                    // a plain integer.
+                    let numeric_arm = if numeric {
+                        let discs: Vec<i64> =
+                            unit_cases.iter().map(|(_, _, d)| d.unwrap_or(0)).collect();
+                        quote! {
+                            if let ::haphe::ScriptValue::I64(__n) = &value {
+                                #(
+                                    if *__n == #discs {
+                                        return ::core::result::Result::Ok(#ident::#vidents);
+                                    }
+                                )*
+                                return ::core::result::Result::Err(::haphe::ScriptConvertError {
+                                    expected: #expected,
+                                    got: "unknown enum discriminant",
+                                });
+                            }
+                        }
+                    } else {
+                        TokenStream::new()
+                    };
                     quote! {
                         #[automatically_derived]
                         impl ::core::convert::From<#ident> for ::haphe::ScriptValue {
                             fn from(value: #ident) -> Self {
-                                let case = match value {
-                                    #( #ident::#vidents => #vnames, )*
+                                let (case, discriminant) = match value {
+                                    #( #ident::#vidents => (#vnames, #vdiscs), )*
                                 };
                                 ::haphe::ScriptValue::Enum {
                                     case: ::std::string::String::from(case),
+                                    discriminant,
                                 }
                             }
                         }
@@ -614,8 +748,9 @@ fn expand_inner(input: DeriveInput) -> syn::Result<TokenStream> {
                             fn from_script(
                                 value: ::haphe::ScriptValue,
                             ) -> ::core::result::Result<Self, ::haphe::ScriptConvertError> {
+                                #numeric_arm
                                 let case = match &value {
-                                    ::haphe::ScriptValue::Enum { case } => case.as_str(),
+                                    ::haphe::ScriptValue::Enum { case, .. } => case.as_str(),
                                     ::haphe::ScriptValue::String(s) => s.as_str(),
                                     other => {
                                         return ::core::result::Result::Err(
@@ -667,6 +802,7 @@ fn expand_inner(input: DeriveInput) -> syn::Result<TokenStream> {
                         trait_impls: &[#(#trait_exprs),*],
                         thread_safety: #thread_safety,
                         generic_params: &[#(#generic_params),*],
+                        repr: #repr_expr,
                         is_flags: #is_flags,
                     };
                 }

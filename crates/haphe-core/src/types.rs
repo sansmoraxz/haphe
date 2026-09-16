@@ -426,12 +426,24 @@ pub struct EnumDescriptor<'a> {
     /// Whether this enum is a bitflags set: each (unit) variant names one
     /// independent bit, in declaration order. Backends map it to their native
     /// bitset construct.
+    /// Numeric script representation, propagated from the Rust `#[repr]`
+    /// integer type (the exact type — backends that can express `u8`
+    /// should). `None` means the enum crosses as its declared case names
+    /// (the default).
+    pub repr: Option<PrimitiveType>,
     pub is_flags: bool,
 }
 
 /// A single variant of an enum.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EnumVariant<'a> {
+    /// Numeric discriminant for enums with a numeric script representation
+    /// ([`EnumDescriptor::repr`]): the explicit Rust discriminant, the
+    /// Rust-rule implicit value (previous + 1, starting at 0), or the flag's
+    /// actual bit value for bitflags. `None` on string-represented enums and
+    /// payload variants. Stored as the `i64` bit pattern (`u64` values wrap;
+    /// discriminants must fit 64 bits).
+    pub discriminant: Option<i64>,
     /// Variant name.
     pub name: &'a str,
     /// Optional documentation string.

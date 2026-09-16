@@ -81,16 +81,19 @@ static COLOR_VARIANTS: [EnumVariant<'static>; 3] = [
         name: "Red",
         doc: None,
         kind: VariantKind::Unit,
+        discriminant: None,
     },
     EnumVariant {
         name: "Rgb",
         doc: None,
         kind: VariantKind::Tuple(&RGB_FIELDS),
+        discriminant: None,
     },
     EnumVariant {
         name: "Named",
         doc: None,
         kind: VariantKind::Struct(&NAMED_FIELDS),
+        discriminant: None,
     },
 ];
 
@@ -103,6 +106,7 @@ static COLOR_DESC: EnumDescriptor<'static> = EnumDescriptor {
     trait_impls: &[],
     thread_safety: ThreadSafety::SEND_SYNC,
     generic_params: &[],
+    repr: None,
     is_flags: false,
 };
 
@@ -292,6 +296,7 @@ fn duplicate_enum_registration_errors() {
         trait_impls: &[],
         thread_safety: ThreadSafety::SEND_SYNC,
         generic_params: &[],
+        repr: None,
         is_flags: false,
     });
     assert!(matches!(result, Err(RegistryError::DuplicateType { .. })));
@@ -311,6 +316,7 @@ fn cross_kind_duplicate_errors() {
         trait_impls: &[],
         thread_safety: ThreadSafety::SEND_SYNC,
         generic_params: &[],
+        repr: None,
         is_flags: false,
     });
     assert!(matches!(result, Err(RegistryError::DuplicateType { .. })));
@@ -1230,6 +1236,7 @@ fn enum_with_all_new_fields() {
         name: "Some",
         doc: None,
         kind: VariantKind::Tuple(&[]),
+        discriminant: None,
     }];
     static ENUMS: [EnumDescriptor<'static>; 1] = [EnumDescriptor {
         id: TypeId::new("MyOption"),
@@ -1240,6 +1247,7 @@ fn enum_with_all_new_fields() {
         trait_impls: &TRAITS,
         thread_safety: ThreadSafety::SEND,
         generic_params: &GENERICS,
+        repr: None,
         is_flags: false,
     }];
 
@@ -1512,11 +1520,13 @@ fn flags_enum_with_payload_variant_fails_validation() {
             name: "Read",
             doc: None,
             kind: VariantKind::Unit,
+            discriminant: None,
         },
         EnumVariant {
             name: "Custom",
             doc: None,
             kind: VariantKind::Tuple(&PAYLOAD),
+            discriminant: None,
         },
     ];
     static ENUMS: [EnumDescriptor<'static>; 1] = [EnumDescriptor {
@@ -1528,6 +1538,7 @@ fn flags_enum_with_payload_variant_fails_validation() {
         trait_impls: &[],
         thread_safety: ThreadSafety::SEND_SYNC,
         generic_params: &[],
+        repr: None,
         is_flags: true,
     }];
     static REGISTRY: TypeRegistry<'static> = TypeRegistry::new(&[], &ENUMS, &[], &[], &[], &[]);

@@ -29,6 +29,18 @@
 /// assert_eq!(Perms::DESCRIPTOR.variants.len(), 3);
 /// assert_eq!(Perms::DESCRIPTOR.variants[0].name, "READ");
 /// ```
+/// Maps a bitflags `Bits` width to the propagated unsigned primitive.
+#[doc(hidden)]
+pub const fn bitflags_repr(size: usize) -> crate::types::PrimitiveType {
+    match size {
+        1 => crate::types::PrimitiveType::U8,
+        2 => crate::types::PrimitiveType::U16,
+        4 => crate::types::PrimitiveType::U32,
+        8 => crate::types::PrimitiveType::U64,
+        _ => panic!("script_bitflags!: unsupported flags width"),
+    }
+}
+
 #[macro_export]
 macro_rules! script_bitflags {
     ($ty:ty) => {
@@ -42,6 +54,7 @@ macro_rules! script_bitflags {
                     name: "",
                     doc: None,
                     kind: $crate::VariantKind::Unit,
+                    discriminant: None,
                 }; N];
                 let mut i = 0;
                 while i < N {
@@ -51,10 +64,18 @@ macro_rules! script_bitflags {
                         "script_bitflags!: every named flag must set exactly one bit; \
                          composite or empty masks cannot be represented as independent flags"
                     );
+                    // Real bit VALUE (not declaration order) — stored as the
+                    // i64 bit pattern; flags wider than 64 bits are rejected.
+                    let value = bits as u128;
+                    assert!(
+                        value <= u64::MAX as u128,
+                        "script_bitflags!: flag bits beyond 64 bits cannot be represented"
+                    );
                     out[i] = $crate::EnumVariant {
                         name: FLAGS[i].name(),
                         doc: None,
                         kind: $crate::VariantKind::Unit,
+                        discriminant: Some(value as u64 as i64),
                     };
                     i += 1;
                 }
@@ -71,6 +92,9 @@ macro_rules! script_bitflags {
                     trait_impls: &[],
                     thread_safety: $crate::ThreadSafety::SEND_SYNC,
                     generic_params: &[],
+                    repr: Some($crate::bitflags_repr(::core::mem::size_of::<
+                        <$ty as $crate::bitflags::Flags>::Bits,
+                    >())),
                     is_flags: true,
                 };
             }

@@ -39,3 +39,17 @@ fn adapter_descriptor() {
 fn adapter_registry_validates() {
     REGISTRY.validate().expect("flags enum validates");
 }
+
+#[test]
+fn flags_record_real_bit_values_and_repr() {
+    use haphe::{PrimitiveType, ScriptEnum};
+    let desc = <Perms as ScriptEnum>::DESCRIPTOR;
+    assert_eq!(desc.repr, Some(PrimitiveType::U32));
+    let bits: Vec<Option<i64>> = desc.variants.iter().map(|v| v.discriminant).collect();
+    // Real bit VALUES, not declaration indices.
+    assert!(bits.iter().all(|b| b.is_some()));
+    for (i, b) in bits.iter().enumerate() {
+        let v = b.unwrap();
+        assert!(v != 0 && (v & (v - 1)) == 0, "variant {i} is a single bit");
+    }
+}

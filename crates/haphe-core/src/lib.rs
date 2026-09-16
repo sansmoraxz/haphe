@@ -24,6 +24,9 @@ mod bitflags_support;
 /// [`script_bitflags!`] expansions.
 #[cfg(feature = "bitflags")]
 pub use bitflags;
+#[cfg(feature = "bitflags")]
+#[doc(hidden)]
+pub use bitflags_support::bitflags_repr;
 pub mod bridge;
 pub mod foreign;
 pub mod function;

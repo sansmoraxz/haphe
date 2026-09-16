@@ -45,11 +45,13 @@ static HAND_WRITTEN: EnumDescriptor<'static> = EnumDescriptor {
             name: "Red",
             doc: Some("Pure red."),
             kind: VariantKind::Unit,
+            discriminant: None,
         },
         EnumVariant {
             name: "RGB",
             doc: None,
             kind: VariantKind::Tuple(&[U8, U8, U8]),
+            discriminant: None,
         },
         EnumVariant {
             name: "Named",
@@ -68,12 +70,14 @@ static HAND_WRITTEN: EnumDescriptor<'static> = EnumDescriptor {
                     readonly: true,
                 },
             ]),
+            discriminant: None,
         },
     ],
     methods: <Color as ScriptImpl>::METHODS,
     trait_impls: &[TraitImpl::Clone],
     thread_safety: ThreadSafety::SEND_SYNC,
     generic_params: &[],
+    repr: None,
     is_flags: false,
 };
 

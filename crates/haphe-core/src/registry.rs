@@ -75,6 +75,10 @@ pub enum RegistryError<'a> {
     /// A module-level function instantiation names a function that does not
     /// exist in the module.
     DanglingFunctionInstantiation { module: &'a str, function: &'a str },
+    /// Two variants of an enum share an exposed case name.
+    DuplicateEnumCase { owner: TypeId<'a>, case: &'a str },
+    /// Two variants of an enum share a numeric discriminant.
+    DuplicateEnumDiscriminant { owner: TypeId<'a>, value: i64 },
 }
 
 impl std::fmt::Display for RegistryError<'_> {
@@ -147,6 +151,13 @@ impl std::fmt::Display for RegistryError<'_> {
             Self::DanglingFunctionInstantiation { module, function } => write!(
                 f,
                 "module `{module}` declares an instantiation of `{function}`, which is not a function of the module"
+            ),
+            Self::DuplicateEnumCase { owner, case } => {
+                write!(f, "enum {owner} declares the case `{case}` more than once")
+            }
+            Self::DuplicateEnumDiscriminant { owner, value } => write!(
+                f,
+                "enum {owner} declares the discriminant `{value}` more than once"
             ),
         }
     }
@@ -374,6 +385,21 @@ impl<'a> TypeRegistry<'a> {
         for e in self.enums {
             let generic_names: HashSet<&str> = e.generic_params.iter().map(|g| g.name).collect();
 
+            let mut seen_cases = HashSet::new();
+            let mut seen_discriminants = HashSet::new();
+            for variant in e.variants {
+                if !seen_cases.insert(variant.name) {
+                    errors.push(RegistryError::DuplicateEnumCase {
+                        owner: e.id,
+                        case: variant.name,
+                    });
+                }
+                if let Some(value) = variant.discriminant
+                    && !seen_discriminants.insert(value)
+                {
+                    errors.push(RegistryError::DuplicateEnumDiscriminant { owner: e.id, value });
+                }
+            }
             for variant in e.variants {
                 if e.is_flags && !matches!(variant.kind, VariantKind::Unit) {
                     errors.push(RegistryError::NonUnitFlagsVariant {
