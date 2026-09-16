@@ -315,3 +315,245 @@ fn duplicate_exposed_type_names_are_rejected() {
         "got: {err:?}"
     );
 }
+
+#[test]
+fn iterable_and_indexed_types_document_their_protocols() {
+    /// Sequence of readings.
+    #[derive(Script, Clone)]
+    #[script(traits(IntoIterator(item = i64)))]
+    struct Readings {
+        #[script(skip)]
+        values: Vec<i64>,
+    }
+    impl IntoIterator for Readings {
+        type Item = i64;
+        type IntoIter = std::vec::IntoIter<i64>;
+        fn into_iter(self) -> Self::IntoIter {
+            self.values.into_iter()
+        }
+    }
+
+    /// Keyed scores.
+    #[derive(Script, Clone)]
+    #[script(traits(IntoIterator(item = (String, i64))))]
+    struct Scores {
+        #[script(skip)]
+        entries: Vec<(String, i64)>,
+    }
+    impl IntoIterator for Scores {
+        type Item = (String, i64);
+        type IntoIter = std::vec::IntoIter<(String, i64)>;
+        fn into_iter(self) -> Self::IntoIter {
+            self.entries.into_iter()
+        }
+    }
+
+    /// Indexable buffer.
+    #[derive(Script, Clone)]
+    #[script(traits(Index(index = i64, output = i64), IndexMut(index = i64, output = i64)))]
+    struct Buf {
+        #[script(skip)]
+        data: Vec<i64>,
+    }
+    impl std::ops::Index<i64> for Buf {
+        type Output = i64;
+        fn index(&self, i: i64) -> &i64 {
+            &self.data[i as usize]
+        }
+    }
+    impl std::ops::IndexMut<i64> for Buf {
+        fn index_mut(&mut self, i: i64) -> &mut i64 {
+            &mut self.data[i as usize]
+        }
+    }
+
+    haphe::registry! {
+        static ITER_REGISTRY = {
+            structs: [Readings, Scores, Buf],
+        };
+    }
+
+    let output = haphe::generate(&LuaDeclGenerator::new(), &ITER_REGISTRY).unwrap();
+    let s = std::str::from_utf8(&output.files[0].content).unwrap();
+
+    assert!(
+        s.contains("---Iterable: `pairs(x)` on 5.2+, `x:iter()` everywhere."),
+        "got:\n{s}"
+    );
+    assert!(
+        s.contains("---@return fun(): integer, integer"),
+        "got:\n{s}"
+    );
+    assert!(s.contains("function Readings:iter() end"), "got:\n{s}");
+    assert!(s.contains("---@return fun(): string, integer"), "got:\n{s}");
+    assert!(s.contains("function Scores:iter() end"), "got:\n{s}");
+    assert!(s.contains("---@field [integer] integer"), "got:\n{s}");
+}
+
+#[test]
+fn pow_and_bitwise_operators_annotated() {
+    /// A bit mask.
+    #[derive(Script, Clone, Copy)]
+    #[script(traits(BitAnd, BitOr, BitXor, Shl, Shr, Not, Pow(rhs = f64, output = Self)))]
+    struct Bits {
+        raw: u32,
+    }
+    macro_rules! bits_binops {
+        ($($t:ident :: $m:ident => $op:tt),*) => {$(
+            impl haphe::ops::$t for Bits {
+                type Output = Bits;
+                fn $m(self, rhs: Bits) -> Bits { Bits { raw: self.raw $op rhs.raw } }
+            }
+        )*};
+    }
+    bits_binops!(BitAnd::bitand => &, BitOr::bitor => |, BitXor::bitxor => ^, Shl::shl => <<, Shr::shr => >>);
+    impl haphe::ops::Not for Bits {
+        type Output = Bits;
+        fn not(self) -> Bits {
+            Bits { raw: !self.raw }
+        }
+    }
+    impl haphe::ops::Pow<f64> for Bits {
+        type Output = Bits;
+        fn pow(self, rhs: f64) -> Bits {
+            Bits {
+                raw: (self.raw as f64).powf(rhs) as u32,
+            }
+        }
+    }
+
+    haphe::registry! {
+        static BITS_REGISTRY = {
+            structs: [Bits],
+        };
+    }
+
+    let output = haphe::generate(&LuaDeclGenerator::new(), &BITS_REGISTRY).unwrap();
+    let s = std::str::from_utf8(&output.files[0].content).unwrap();
+    assert!(s.contains("---@operator band(Bits): Bits"), "got:\n{s}");
+    assert!(s.contains("---@operator bor(Bits): Bits"), "got:\n{s}");
+    assert!(s.contains("---@operator bxor(Bits): Bits"), "got:\n{s}");
+    assert!(s.contains("---@operator shl(Bits): Bits"), "got:\n{s}");
+    assert!(s.contains("---@operator shr(Bits): Bits"), "got:\n{s}");
+    assert!(s.contains("---@operator bnot: Bits"), "got:\n{s}");
+    assert!(s.contains("---@operator pow(number): Bits"), "got:\n{s}");
+}
+
+#[test]
+fn idiv_and_fallback_annotations() {
+    /// Explicit floor division.
+    #[derive(Script, Clone, Copy)]
+    #[script(traits(IDiv))]
+    struct Floored {
+        n: i64,
+    }
+    impl haphe::ops::IDiv for Floored {
+        type Output = Floored;
+        fn idiv(self, rhs: Floored) -> Floored {
+            Floored {
+                n: self.n.div_euclid(rhs.n),
+            }
+        }
+    }
+
+    /// Integer Div only: the runtime answers `//` via the fallback, so the
+    /// stub advertises idiv too.
+    #[derive(Script, Clone, Copy)]
+    #[script(traits(Div(rhs = i64, output = Self)))]
+    struct Halver {
+        n: i64,
+    }
+    impl std::ops::Div<i64> for Halver {
+        type Output = Halver;
+        fn div(self, rhs: i64) -> Halver {
+            Halver { n: self.n / rhs }
+        }
+    }
+
+    /// Float Div: no fallback, no idiv annotation.
+    #[derive(Script, Clone, Copy)]
+    #[script(traits(Div(rhs = f64, output = Self)))]
+    struct Scaler2 {
+        v: f64,
+    }
+    impl std::ops::Div<f64> for Scaler2 {
+        type Output = Scaler2;
+        fn div(self, rhs: f64) -> Scaler2 {
+            Scaler2 { v: self.v / rhs }
+        }
+    }
+
+    haphe::registry! {
+        static IDIV_REGISTRY = {
+            structs: [Floored, Halver, Scaler2],
+        };
+    }
+
+    let output = haphe::generate(&LuaDeclGenerator::new(), &IDIV_REGISTRY).unwrap();
+    let s = std::str::from_utf8(&output.files[0].content).unwrap();
+    assert!(
+        s.contains("---@operator idiv(Floored): Floored"),
+        "got:\n{s}"
+    );
+    assert!(s.contains("---@operator div(integer): Halver"), "got:\n{s}");
+    assert!(
+        s.contains("---@operator idiv(integer): Halver"),
+        "got:\n{s}"
+    );
+    assert!(!s.contains("idiv(number)"), "got:\n{s}");
+}
+
+#[test]
+fn mod_annotation_dedupes_with_rem() {
+    /// Declares both: Mod wins, one `mod` annotation.
+    #[derive(Script, Clone, Copy)]
+    #[script(traits(Mod, Rem))]
+    struct Cyclic {
+        n: i64,
+    }
+    impl haphe::ops::Mod for Cyclic {
+        type Output = Cyclic;
+        fn modulo(self, rhs: Cyclic) -> Cyclic {
+            Cyclic {
+                n: self.n.rem_euclid(rhs.n),
+            }
+        }
+    }
+    impl std::ops::Rem for Cyclic {
+        type Output = Cyclic;
+        fn rem(self, rhs: Cyclic) -> Cyclic {
+            Cyclic { n: self.n % rhs.n }
+        }
+    }
+
+    haphe::registry! {
+        static MOD_REGISTRY = {
+            structs: [Cyclic],
+        };
+    }
+
+    let output = haphe::generate(&LuaDeclGenerator::new(), &MOD_REGISTRY).unwrap();
+    let s = std::str::from_utf8(&output.files[0].content).unwrap();
+    assert_eq!(
+        s.matches("---@operator mod(Cyclic): Cyclic").count(),
+        1,
+        "got:\n{s}"
+    );
+}
+
+#[test]
+fn opaque_primitive_newtype_keeps_named_alias() {
+    /// An opaque bool newtype: a distinct declaration-level type.
+    #[derive(Script, Clone, Copy)]
+    struct Enabled(bool);
+
+    haphe::registry! {
+        static NEWTYPE_REGISTRY = {
+            type_aliases: [Enabled],
+        };
+    }
+
+    let output = haphe::generate(&LuaDeclGenerator::new(), &NEWTYPE_REGISTRY).unwrap();
+    let s = std::str::from_utf8(&output.files[0].content).unwrap();
+    assert!(s.contains("---@alias Enabled boolean"), "got:\n{s}");
+}

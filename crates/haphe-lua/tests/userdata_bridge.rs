@@ -623,3 +623,118 @@ fn no_display_means_no_concat() {
         .unwrap_err();
     assert!(err.to_string().contains("concatenate"), "got: {err}");
 }
+
+// ---------------------------------------------------------------------------
+// Transparent primitive newtypes cross as native Lua values
+// ---------------------------------------------------------------------------
+
+/// TRANSPARENT bool newtype: its values cross as native booleans — Lua
+/// truthiness cannot be hooked on userdata (only nil/false are falsy), so
+/// bool-like types should be transparent newtypes. An OPAQUE newtype stays a
+/// distinct declaration-level type with no generated value conversions;
+/// transparency is the opt-in for native representation.
+#[derive(Script, Clone, Copy)]
+#[script(transparent)]
+struct Toggle(bool);
+
+#[derive(Script, Clone, Copy)]
+#[script(transparent)]
+struct Meters(f64);
+
+#[script]
+fn is_ready() -> Toggle {
+    Toggle(false)
+}
+
+#[script]
+fn flip(t: Toggle) -> Toggle {
+    Toggle(!t.0)
+}
+
+#[script]
+fn cruise_altitude() -> Meters {
+    Meters(1234.5)
+}
+
+#[derive(Script, Clone)]
+#[script(methods)]
+struct Sensor {
+    armed: Toggle,
+}
+
+#[script]
+impl Sensor {
+    #[script(constructor)]
+    fn new() -> Self {
+        Sensor {
+            armed: Toggle(false),
+        }
+    }
+
+    fn toggled(&self, next: Toggle) -> Toggle {
+        Toggle(!next.0)
+    }
+
+    fn reading(&self) -> Meters {
+        Meters(42.0)
+    }
+}
+
+#[test]
+fn transparent_newtypes_cross_as_native_values_in_free_fns() {
+    let lua = Lua::new();
+    let tbl = lua.create_table().unwrap();
+    bind_fn::<is_ready>(&lua, &tbl).unwrap();
+    bind_fn::<flip>(&lua, &tbl).unwrap();
+    bind_fn::<cruise_altitude>(&lua, &tbl).unwrap();
+    lua.globals().set("m", &tbl).unwrap();
+
+    // Native boolean, participates in truthiness.
+    let ty: String = lua.load("return type(m.is_ready())").eval().unwrap();
+    assert_eq!(ty, "boolean");
+    let negated: bool = lua.load("return not m.is_ready()").eval().unwrap();
+    assert!(negated);
+    let branch: String = lua
+        .load("if m.is_ready() then return 'on' else return 'off' end")
+        .eval()
+        .unwrap();
+    assert_eq!(branch, "off");
+
+    // A fn taking the newtype accepts a plain Lua boolean.
+    let flipped: bool = lua.load("return m.flip(false)").eval().unwrap();
+    assert!(flipped);
+
+    // Numeric newtype: native number.
+    let ty: String = lua.load("return type(m.cruise_altitude())").eval().unwrap();
+    assert_eq!(ty, "number");
+    let v: f64 = lua.load("return m.cruise_altitude()").eval().unwrap();
+    assert_eq!(v, 1234.5);
+}
+
+#[test]
+fn transparent_newtype_field_and_method_bind_in_lua() {
+    let lua = Lua::new();
+    let tbl = lua.create_table().unwrap();
+    bind_type::<Sensor>(&lua, &tbl).unwrap();
+    lua.globals().set("Sensor", &tbl).unwrap();
+    lua.load("s = Sensor.new()").exec().unwrap();
+
+    // Field crosses as a native boolean (and truthiness works).
+    let ty: String = lua.load("return type(s.armed)").eval().unwrap();
+    assert_eq!(ty, "boolean");
+    let negated: bool = lua.load("return not s.armed").eval().unwrap();
+    assert!(negated);
+
+    // Field write accepts a plain boolean.
+    lua.load("s.armed = true").exec().unwrap();
+    let armed: bool = lua.load("return s.armed").eval().unwrap();
+    assert!(armed);
+
+    // Method param + return through the newtype.
+    let toggled: bool = lua.load("return s:toggled(false)").eval().unwrap();
+    assert!(toggled);
+    let ty: String = lua.load("return type(s:reading())").eval().unwrap();
+    assert_eq!(ty, "number");
+    let v: f64 = lua.load("return s:reading()").eval().unwrap();
+    assert_eq!(v, 42.0);
+}

@@ -214,8 +214,49 @@ fn emit_struct(
         };
         let _ = writeln!(out, "---@field {} {ty}{note}", prop.name);
     }
+    // Indexed access: LuaLS models `obj[key]` as a bracketed field. Emitted
+    // once even when both Index and IndexMut are declared (LuaLS fields are
+    // readable and writable).
+    if let Some((index, output)) = s.trait_impls.iter().find_map(|ti| match ti {
+        haphe::TraitImpl::Index { index, output }
+        | haphe::TraitImpl::IndexMut { index, output } => Some((index, output)),
+        _ => None,
+    }) {
+        let context = format!("{} index operator", s.name);
+        let k = render_type(registry, index, &context)?;
+        let v = render_type(registry, output, &context)?;
+        let _ = writeln!(out, "---@field [{k}] {v}");
+    }
     emit_operators(out, registry, s)?;
     let _ = writeln!(out, "local {} = {{}}\n", s.name);
+
+    // Iterable types: the runtime registers `__pairs`/`__iter` where the
+    // version supports it and a portable `iter()` method everywhere.
+    for ti in s.trait_impls {
+        let item = match ti {
+            haphe::TraitImpl::IntoIterator { item } | haphe::TraitImpl::Iterator { item } => item,
+            _ => continue,
+        };
+        let context = format!("{} iterator item", s.name);
+        let stepper = match item {
+            TypeDescriptor::Tuple(elems) if elems.len() == 2 => {
+                let k = render_type(registry, &elems[0], &context)?;
+                let v = render_type(registry, &elems[1], &context)?;
+                format!("fun(): {k}, {v}")
+            }
+            other => format!(
+                "fun(): integer, {}",
+                render_type(registry, other, &context)?
+            ),
+        };
+        let _ = writeln!(
+            out,
+            "---Iterable: `pairs(x)` on 5.2+, `x:iter()` everywhere."
+        );
+        let _ = writeln!(out, "---@return {stepper}");
+        let _ = writeln!(out, "function {}:iter() end\n", s.name);
+        break;
+    }
 
     // Methods, colon syntax. `self`-consuming methods are exposed the same
     // way at runtime; static methods (no receiver) live on the type table
@@ -240,14 +281,34 @@ fn emit_operators(
     s: &StructDescriptor<'_>,
 ) -> Result<(), LuaDeclError> {
     use haphe::TraitImpl;
+    // `%` dedupe: an explicit `Mod` wins over `Rem` (both annotate as
+    // `mod`), mirroring the runtime precedence.
+    let has_mod_decl = s
+        .trait_impls
+        .iter()
+        .any(|ti| matches!(ti, TraitImpl::Mod { .. }));
     for ti in s.trait_impls {
         let (op, rhs, output) = match ti {
             TraitImpl::Add { rhs, output } => ("add", Some(*rhs), *output),
             TraitImpl::Sub { rhs, output } => ("sub", Some(*rhs), *output),
             TraitImpl::Mul { rhs, output } => ("mul", Some(*rhs), *output),
             TraitImpl::Div { rhs, output } => ("div", Some(*rhs), *output),
-            TraitImpl::Rem { rhs, output } => ("mod", Some(*rhs), *output),
+            TraitImpl::Rem { rhs, output } if !has_mod_decl => ("mod", Some(*rhs), *output),
+            TraitImpl::Rem { .. } => continue,
+            TraitImpl::Mod { rhs, output } => ("mod", Some(*rhs), *output),
+            TraitImpl::Pow { rhs, output } => ("pow", Some(*rhs), *output),
+            TraitImpl::IDiv { rhs, output } => ("idiv", Some(*rhs), *output),
+            // Bitwise annotations are emitted from the descriptor regardless
+            // of the configured Lua version, like every other stub here: the
+            // stub describes the type; a pre-5.3 runtime rejects the binding
+            // itself at registration. LuaLS supports all six operator names.
+            TraitImpl::BitAnd { rhs, output } => ("band", Some(*rhs), *output),
+            TraitImpl::BitOr { rhs, output } => ("bor", Some(*rhs), *output),
+            TraitImpl::BitXor { rhs, output } => ("bxor", Some(*rhs), *output),
+            TraitImpl::Shl { rhs, output } => ("shl", Some(*rhs), *output),
+            TraitImpl::Shr { rhs, output } => ("shr", Some(*rhs), *output),
             TraitImpl::Neg { output } => ("unm", None, *output),
+            TraitImpl::Not { output } => ("bnot", None, *output),
             // LuaLS supports `---@operator concat`; `ToString` types accept
             // string-like counterparts and produce a string.
             TraitImpl::ToString => {
@@ -260,14 +321,41 @@ fn emit_operators(
         // exact rhs-type matches first, then declaration order.
         let context = format!("{} operator {op}", s.name);
         let output = render_type(registry, output, &context)?;
-        match rhs {
-            Some(rhs) => {
-                let rhs = render_type(registry, rhs, &context)?;
+        let rhs_rendered = match rhs {
+            Some(rhs) => Some(render_type(registry, rhs, &context)?),
+            None => None,
+        };
+        match rhs_rendered {
+            Some(ref rhs) => {
                 let _ = writeln!(out, "---@operator {op}({rhs}): {output}");
             }
             None => {
                 let _ = writeln!(out, "---@operator {op}: {output}");
             }
+        }
+        // The runtime also answers `//` for integer-typed `Div` declarations
+        // (the truncating fallback), so the stub advertises it — describing
+        // what the type actually responds to, mirroring how iteration stubs
+        // document runtime behavior rather than gating on versions.
+        let rhs_is_int = matches!(
+            rhs,
+            Some(haphe::TypeDescriptor::Primitive(
+                haphe::PrimitiveType::I8
+                    | haphe::PrimitiveType::I16
+                    | haphe::PrimitiveType::I32
+                    | haphe::PrimitiveType::I64
+                    | haphe::PrimitiveType::U8
+                    | haphe::PrimitiveType::U16
+                    | haphe::PrimitiveType::U32
+                    | haphe::PrimitiveType::U64
+            ))
+        );
+        if op == "div"
+            && rhs_is_int
+            && crate::declared_idiv_fallback(s.trait_impls)
+            && let Some(ref r) = rhs_rendered
+        {
+            let _ = writeln!(out, "---@operator idiv({r}): {output}");
         }
     }
     Ok(())
@@ -395,6 +483,9 @@ fn emit_module(
     }
 
     for function in module.functions {
+        // Registry-level instantiations don't lift this rejection: the Lua
+        // runtime cannot dispatch monomorphs by name, so stubs describing
+        // them would advertise callables that trap.
         if !function.generic_params.is_empty() {
             return Err(LuaDeclError::GenericFunction {
                 name: function.name.to_string(),

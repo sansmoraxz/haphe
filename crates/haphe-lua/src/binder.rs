@@ -7,10 +7,93 @@
 use std::sync::Arc;
 
 use haphe::bridge::{FromScript, IntoScript, ScriptValue};
-use haphe::{FnBinder, TypeBinder};
+use haphe::{FnBinder, ScriptIter, TypeBinder};
 use mlua::{Lua, MetaMethod, UserDataFields, UserDataMethods};
 
 use crate::LuaBindError;
+
+/// How the stepper presents core's plain value stream to Lua's generic-for.
+///
+/// Core's `ScriptIter` yields single values; pairing is this backend's
+/// decision, made statically from the type's declared iterator item type
+/// (never guessed from runtime shapes).
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) enum IterPairing {
+    /// 1-based `(i, item)` control pairs.
+    #[default]
+    Enumerate,
+    /// The declared item is a 2-tuple: each yielded 2-element list is
+    /// unpacked to `(k, v)`.
+    KeyValue,
+}
+
+/// Builds the per-iteration stepper closure Lua's generic-for drives: it
+/// owns the iterator, pulls one item per call, and returns nil-terminated
+/// control pairs.
+fn make_stepper(lua: &Lua, iter: ScriptIter, pairing: IterPairing) -> mlua::Result<mlua::Function> {
+    // Without `send`, the closure holds the lazy iterator and advances it
+    // per step — lazy end to end.
+    #[cfg(not(feature = "send"))]
+    let state = std::cell::RefCell::new(iter.enumerate());
+    // Under `send`, mlua closures must be `Send` while `ScriptIter` is
+    // deliberately not: this backend's send-mode policy is to buffer the
+    // iteration up front.
+    #[cfg(feature = "send")]
+    let state = std::sync::Mutex::new(iter.collect::<Vec<_>>().into_iter().enumerate());
+
+    lua.create_function(move |lua, _: mlua::MultiValue| {
+        #[cfg(not(feature = "send"))]
+        let mut it = state.borrow_mut();
+        #[cfg(feature = "send")]
+        let mut it = state.lock().expect("iteration stepper poisoned");
+        match it.next() {
+            None => Ok((mlua::Value::Nil, mlua::Value::Nil)),
+            Some((i, item)) => match pairing {
+                IterPairing::Enumerate => Ok((
+                    mlua::Value::Integer((i as i64 + 1) as mlua::Integer),
+                    script_to_lua(lua, item)?,
+                )),
+                IterPairing::KeyValue => match item {
+                    ScriptValue::List(mut kv) if kv.len() == 2 => {
+                        let v = kv.pop().expect("len checked");
+                        let k = kv.pop().expect("len checked");
+                        Ok((script_to_lua(lua, k)?, script_to_lua(lua, v)?))
+                    }
+                    other => Err(mlua::Error::runtime(format!(
+                        "declared (key, value) iterator item did not cross as a \
+                         2-element list (got {other:?})"
+                    ))),
+                },
+            },
+        }
+    })
+}
+
+/// Rejects operators the configured Lua version cannot represent, per the
+/// bridge contract (never silently drop a registration).
+///
+/// The bitwise metamethods (`__band`, `__bor`, `__bxor`, `__bnot`, `__shl`,
+/// `__shr`) exist only on Lua 5.3+ — not on 5.1/5.2/LuaJIT, and not on Luau,
+/// which has no bitwise operators. `__pow` exists everywhere.
+fn check_op_supported(op: &'static str) -> Result<(), LuaBindError> {
+    #[cfg(not(any(feature = "lua55", feature = "lua54", feature = "lua53")))]
+    if matches!(op, "bitand" | "bitor" | "bitxor" | "bnot" | "shl" | "shr") {
+        return Err(LuaBindError::UnsupportedOperator { op });
+    }
+    // `__idiv` (`//`) exists on Lua 5.3+ and Luau (mlua gates the
+    // MetaMethod accordingly).
+    #[cfg(not(any(
+        feature = "lua55",
+        feature = "lua54",
+        feature = "lua53",
+        feature = "luau"
+    )))]
+    if op == "idiv" {
+        return Err(LuaBindError::UnsupportedOperator { op });
+    }
+    let _ = op;
+    Ok(())
+}
 
 /// Converts a [`ScriptValue`] to an [`mlua::Value`].
 pub(crate) fn script_to_lua(lua: &Lua, v: ScriptValue) -> mlua::Result<mlua::Value> {
@@ -114,6 +197,7 @@ type ScriptMethodMut<T> =
 type ScriptCtorFn<T> = fn(&[ScriptValue]) -> Result<T, haphe::ScriptConvertError>;
 type ScriptArithSelf<T> = fn(T, T) -> T;
 type ScriptArithScalar<T> = fn(T, &[ScriptValue]) -> Result<T, haphe::ScriptConvertError>;
+type ScriptNewIndex<T> = fn(&mut T, &[ScriptValue]) -> Result<(), haphe::ScriptConvertError>;
 /// One scalar overload: the declared rhs type plus its monomorphized wrapper.
 type ScalarOverload<T> = (
     &'static haphe::TypeDescriptor<'static>,
@@ -176,7 +260,14 @@ pub(crate) struct LuaTypeBinder<T: 'static> {
     lt: Option<fn(&T, &T) -> bool>,
     le: Option<fn(&T, &T) -> bool>,
     unm: Option<fn(&T) -> T>,
+    bnot: Option<fn(&T) -> T>,
     ariths: Vec<ArithEntry<T>>,
+    iter: Option<fn(T) -> ScriptIter>,
+    len: Option<fn(T) -> usize>,
+    index: Option<ScriptMethodRef<T>>,
+    newindex: Option<ScriptNewIndex<T>>,
+    pairing: IterPairing,
+    idiv_fallback: bool,
 }
 
 impl<T: 'static + Clone + mlua::MaybeSend + mlua::MaybeSync> LuaTypeBinder<T> {
@@ -192,12 +283,46 @@ impl<T: 'static + Clone + mlua::MaybeSend + mlua::MaybeSync> LuaTypeBinder<T> {
             lt: None,
             le: None,
             unm: None,
+            bnot: None,
             ariths: Vec::new(),
+            iter: None,
+            len: None,
+            index: None,
+            newindex: None,
+            pairing: IterPairing::default(),
+            idiv_fallback: false,
         }
+    }
+
+    /// Sets the iteration pairing, decided from the type's declared iterator
+    /// item type.
+    pub fn set_pairing(&mut self, pairing: IterPairing) {
+        self.pairing = pairing;
+    }
+
+    /// Enables the integer-`Div` fallback: the type's `__div` registration
+    /// is also installed as `__idiv`, decided statically from the descriptor
+    /// (integer-typed `Div`, no explicit `IDiv`). The fallback carries
+    /// Rust's TRUNCATING division semantics, not Lua's floor semantics —
+    /// declare `traits(IDiv)` for floor behavior on negative operands.
+    pub fn set_idiv_fallback(&mut self, fallback: bool) {
+        self.idiv_fallback = fallback;
     }
 
     /// Apply all collected registrations to the Lua state.
     pub fn register(self, lua: &Lua, type_table: &mlua::Table) -> Result<(), LuaBindError> {
+        // Iterable types get an implicit portable `iter` method; a
+        // user-declared method with that name would silently shadow it.
+        if self.iter.is_some()
+            && self
+                .methods
+                .iter()
+                .map(|m| m.name)
+                .chain(self.mut_methods.iter().map(|m| m.name))
+                .any(|name| name == "iter")
+        {
+            return Err(LuaBindError::ReservedMethod { name: "iter" });
+        }
         // Constructors → Lua functions on the type table.
         for ctor in &self.constructors {
             let f = ctor.f;
@@ -327,6 +452,96 @@ impl<T: 'static + Clone + mlua::MaybeSend + mlua::MaybeSync> LuaTypeBinder<T> {
                     lua.create_any_userdata(f(&*ud.borrow::<T>()?))
                 });
             }
+            // `__bnot` exists only on Lua 5.3+; other versions reject the
+            // registration up front in `meta_bnot`.
+            #[cfg(any(feature = "lua55", feature = "lua54", feature = "lua53"))]
+            if let Some(f) = self.bnot {
+                reg.add_meta_function(MetaMethod::BNot, move |lua, args: mlua::MultiValue| {
+                    let mut v = args.into_vec();
+                    let ud: mlua::AnyUserData = mlua::FromLua::from_lua(v.remove(0), lua)?;
+                    lua.create_any_userdata(f(&*ud.borrow::<T>()?))
+                });
+            }
+
+            // Iteration. Value acquisition is this backend's policy: CLONE,
+            // exactly as `meta_arith_self` operands are cloned. Each
+            // iteration start builds one stepper owning one fresh iterator,
+            // so concurrent iterations are independent snapshots.
+            if let Some(f) = self.iter {
+                let pairing = self.pairing;
+                // `__pairs`: the built-in `pairs` consults it on 5.2+ and
+                // LuaJIT with 5.2 compatibility.
+                #[cfg(any(
+                    feature = "lua55",
+                    feature = "lua54",
+                    feature = "lua53",
+                    feature = "lua52",
+                    feature = "luajit52"
+                ))]
+                reg.add_meta_method(MetaMethod::Pairs, move |lua, this: &T, ()| {
+                    let stepper = make_stepper(lua, f(this.clone()), pairing)?;
+                    Ok((stepper, mlua::Value::Nil, mlua::Value::Nil))
+                });
+                // `__ipairs`: the 5.2-era array protocol (the metamethod
+                // exists only on Lua 5.2 and LuaJIT with 5.2 compatibility;
+                // 5.3 deprecated it and 5.4+ removed it — no emulation
+                // elsewhere). Always 1-based sequential `(i, item)`,
+                // regardless of the kv pairing `pairs` uses: `ipairs` is by
+                // definition the array protocol.
+                #[cfg(any(feature = "lua52", feature = "luajit52"))]
+                reg.add_meta_method(MetaMethod::IPairs, move |lua, this: &T, ()| {
+                    let stepper = make_stepper(lua, f(this.clone()), IterPairing::Enumerate)?;
+                    Ok((stepper, mlua::Value::Nil, mlua::Value::Nil))
+                });
+                // Luau's `__iter`: `for k, v in obj do` calls it for the
+                // same (function, state, control) triple.
+                #[cfg(feature = "luau")]
+                reg.add_meta_method(MetaMethod::Iter, move |lua, this: &T, ()| {
+                    let stepper = make_stepper(lua, f(this.clone()), pairing)?;
+                    Ok((stepper, mlua::Value::Nil, mlua::Value::Nil))
+                });
+                // Portable `obj:iter()` on every version — the only story on
+                // 5.1/LuaJIT, which have no `__pairs`.
+                reg.add_function("iter", move |lua, args: mlua::MultiValue| {
+                    let mut v = args.into_vec();
+                    if v.is_empty() {
+                        return Err(mlua::Error::runtime("iter takes a receiver (use `:`)"));
+                    }
+                    let ud: mlua::AnyUserData = mlua::FromLua::from_lua(v.remove(0), lua)?;
+                    let this = ud.borrow::<T>()?;
+                    make_stepper(lua, f(this.clone()), pairing)
+                });
+            }
+            if let Some(f) = self.len {
+                reg.add_meta_method(MetaMethod::Len, move |_, this: &T, ()| {
+                    Ok(f(this.clone()) as mlua::Integer)
+                });
+            }
+
+            // Indexing. mlua consults registered fields and methods first
+            // and falls back to these custom metamethods only for misses
+            // (its generated `__index`/`__newindex` chain), so `obj.field`,
+            // `obj:method()`, and `obj[key]` coexist. Keys convert verbatim
+            // to the declared Rust index type — no 1-based adjustment — and
+            // a Rust out-of-bounds panic surfaces as a Lua error.
+            if let Some(f) = self.index {
+                reg.add_meta_method(MetaMethod::Index, move |lua, this: &T, key: mlua::Value| {
+                    let sv = lua_to_script(&key)?;
+                    let out = f(this, std::slice::from_ref(&sv))
+                        .map_err(|e| mlua::Error::runtime(e.to_string()))?;
+                    script_to_lua(lua, out)
+                });
+            }
+            if let Some(f) = self.newindex {
+                reg.add_meta_method_mut(
+                    MetaMethod::NewIndex,
+                    move |_, this: &mut T, (key, value): (mlua::Value, mlua::Value)| {
+                        let k = lua_to_script(&key)?;
+                        let v = lua_to_script(&value)?;
+                        f(this, &[k, v]).map_err(|e| mlua::Error::runtime(e.to_string()))
+                    },
+                );
+            }
 
             // Arithmetic: group by op, merge handlers. Repeated operator
             // declarations become overloads of ONE metamethod, resolved as:
@@ -353,42 +568,85 @@ impl<T: 'static + Clone + mlua::MaybeSend + mlua::MaybeSync> LuaTypeBinder<T> {
             all_ops.extend(self_ops.keys());
             all_ops.extend(scalar_ops.keys());
 
+            // `%` precedence: an explicit `Mod` declaration (Lua floor
+            // semantics) wins over `Rem` (Rust truncated semantics) when
+            // both are declared — both target `__mod`.
+            let has_mod = all_ops.contains("mod");
             for op in all_ops {
+                if op == "rem" && has_mod {
+                    continue;
+                }
                 let meta = match op {
                     "add" => MetaMethod::Add,
                     "sub" => MetaMethod::Sub,
                     "mul" => MetaMethod::Mul,
                     "div" => MetaMethod::Div,
                     "mod" | "rem" => MetaMethod::Mod,
+                    "pow" => MetaMethod::Pow,
+                    // `//`: an explicit IDiv declaration; pre-5.3 (non-Luau)
+                    // versions rejected the registration up front.
+                    #[cfg(any(
+                        feature = "lua55",
+                        feature = "lua54",
+                        feature = "lua53",
+                        feature = "luau"
+                    ))]
+                    "idiv" => MetaMethod::IDiv,
+                    // Bitwise ops reach this map only on 5.3+; other
+                    // versions rejected the registration up front.
+                    #[cfg(any(feature = "lua55", feature = "lua54", feature = "lua53"))]
+                    "bitand" => MetaMethod::BAnd,
+                    #[cfg(any(feature = "lua55", feature = "lua54", feature = "lua53"))]
+                    "bitor" => MetaMethod::BOr,
+                    #[cfg(any(feature = "lua55", feature = "lua54", feature = "lua53"))]
+                    "bitxor" => MetaMethod::BXor,
+                    #[cfg(any(feature = "lua55", feature = "lua54", feature = "lua53"))]
+                    "shl" => MetaMethod::Shl,
+                    #[cfg(any(feature = "lua55", feature = "lua54", feature = "lua53"))]
+                    "shr" => MetaMethod::Shr,
                     _ => continue,
                 };
-                let self_f = self_ops.get(op).copied();
-                let scalar_fs: Vec<ScalarOverload<T>> =
-                    scalar_ops.get(op).cloned().unwrap_or_default();
+                // The integer-Div fallback registers the same dispatch
+                // under `__idiv` too (never overriding an explicit IDiv:
+                // the fallback is only enabled when none is declared).
+                let mut metas = vec![meta];
+                #[cfg(any(
+                    feature = "lua55",
+                    feature = "lua54",
+                    feature = "lua53",
+                    feature = "luau"
+                ))]
+                if op == "div" && self.idiv_fallback {
+                    metas.push(MetaMethod::IDiv);
+                }
+                for meta in metas {
+                    let self_f = self_ops.get(op).copied();
+                    let scalar_fs: Vec<ScalarOverload<T>> =
+                        scalar_ops.get(op).cloned().unwrap_or_default();
 
-                reg.add_meta_function(meta, move |lua, args: mlua::MultiValue| {
-                    let mut v = args.into_vec();
-                    if v.len() != 2 {
-                        return Err(mlua::Error::runtime("expected 2 args"));
-                    }
-                    let second = v.pop().unwrap();
-                    let first = v.pop().unwrap();
+                    reg.add_meta_function(meta, move |lua, args: mlua::MultiValue| {
+                        let mut v = args.into_vec();
+                        if v.len() != 2 {
+                            return Err(mlua::Error::runtime("expected 2 args"));
+                        }
+                        let second = v.pop().unwrap();
+                        let first = v.pop().unwrap();
 
-                    // Try Self op Self.
-                    if let Some(f) = self_f
-                        && let Ok(a_ud) =
-                            <mlua::AnyUserData as mlua::FromLua>::from_lua(first.clone(), lua)
-                        && let Ok(b_ud) =
-                            <mlua::AnyUserData as mlua::FromLua>::from_lua(second.clone(), lua)
-                        && let Ok(a) = a_ud.borrow::<T>()
-                        && let Ok(b) = b_ud.borrow::<T>()
-                    {
-                        return lua.create_any_userdata(f(a.clone(), b.clone()));
-                    }
+                        // Try Self op Self.
+                        if let Some(f) = self_f
+                            && let Ok(a_ud) =
+                                <mlua::AnyUserData as mlua::FromLua>::from_lua(first.clone(), lua)
+                            && let Ok(b_ud) =
+                                <mlua::AnyUserData as mlua::FromLua>::from_lua(second.clone(), lua)
+                            && let Ok(a) = a_ud.borrow::<T>()
+                            && let Ok(b) = b_ud.borrow::<T>()
+                        {
+                            return lua.create_any_userdata(f(a.clone(), b.clone()));
+                        }
 
-                    // Scalar overloads, two passes: exact rhs-type matches
-                    // first, then the rest in declaration order.
-                    let try_scalar =
+                        // Scalar overloads, two passes: exact rhs-type matches
+                        // first, then the rest in declaration order.
+                        let try_scalar =
                         |receiver: &mlua::Value,
                          scalar: &mlua::Value|
                          -> Option<mlua::Result<mlua::AnyUserData>> {
@@ -412,16 +670,17 @@ impl<T: 'static + Clone + mlua::MaybeSend + mlua::MaybeSync> LuaTypeBinder<T> {
                             None
                         };
 
-                    // Self op scalar, then scalar op Self (commutative).
-                    if let Some(result) = try_scalar(&first, &second) {
-                        return result;
-                    }
-                    if let Some(result) = try_scalar(&second, &first) {
-                        return result;
-                    }
+                        // Self op scalar, then scalar op Self (commutative).
+                        if let Some(result) = try_scalar(&first, &second) {
+                            return result;
+                        }
+                        if let Some(result) = try_scalar(&second, &first) {
+                            return result;
+                        }
 
-                    Err(mlua::Error::runtime("no matching operand types"))
-                });
+                        Err(mlua::Error::runtime("no matching operand types"))
+                    });
+                }
             }
         })?;
 
@@ -520,7 +779,13 @@ impl<T: 'static + Clone + mlua::MaybeSend + mlua::MaybeSync> TypeBinder<T> for L
         self.unm = Some(f);
         Ok(())
     }
+    fn meta_bnot(&mut self, f: fn(&T) -> T) -> Result<(), Self::Error> {
+        check_op_supported("bnot")?;
+        self.bnot = Some(f);
+        Ok(())
+    }
     fn meta_arith_self(&mut self, op: &'static str, f: fn(T, T) -> T) -> Result<(), Self::Error> {
+        check_op_supported(op)?;
         self.ariths.push(ArithEntry::SelfOp(op, f));
         Ok(())
     }
@@ -530,7 +795,30 @@ impl<T: 'static + Clone + mlua::MaybeSend + mlua::MaybeSync> TypeBinder<T> for L
         rhs: &'static haphe::TypeDescriptor<'static>,
         f: fn(T, &[ScriptValue]) -> Result<T, haphe::ScriptConvertError>,
     ) -> Result<(), Self::Error> {
+        check_op_supported(op)?;
         self.ariths.push(ArithEntry::Scalar(op, (rhs, f)));
+        Ok(())
+    }
+    fn meta_iter(&mut self, f: fn(T) -> ScriptIter) -> Result<(), Self::Error> {
+        self.iter = Some(f);
+        Ok(())
+    }
+    fn meta_len(&mut self, f: fn(T) -> usize) -> Result<(), Self::Error> {
+        self.len = Some(f);
+        Ok(())
+    }
+    fn meta_index(
+        &mut self,
+        f: fn(&T, &[ScriptValue]) -> Result<ScriptValue, haphe::ScriptConvertError>,
+    ) -> Result<(), Self::Error> {
+        self.index = Some(f);
+        Ok(())
+    }
+    fn meta_newindex(
+        &mut self,
+        f: fn(&mut T, &[ScriptValue]) -> Result<(), haphe::ScriptConvertError>,
+    ) -> Result<(), Self::Error> {
+        self.newindex = Some(f);
         Ok(())
     }
 }

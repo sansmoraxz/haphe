@@ -100,6 +100,7 @@ static INNER_MODULE: ModuleDescriptor<'static> = ModuleDescriptor {
     type_ids: &[],
     submodules: &[],
     constants: &[],
+    function_instantiations: &[],
 };
 
 static MATH_MODULE: ModuleDescriptor<'static> = ModuleDescriptor {
@@ -109,6 +110,7 @@ static MATH_MODULE: ModuleDescriptor<'static> = ModuleDescriptor {
     type_ids: &[TypeId::new("test::Point")],
     submodules: &[INNER_MODULE],
     constants: &[PI_CONST, MAX_CONST, ENABLED_CONST, NAME_CONST],
+    function_instantiations: &[],
 };
 
 static REGISTRY: TypeRegistry<'static> =

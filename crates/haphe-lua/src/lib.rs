@@ -85,7 +85,8 @@ pub use decl::{LuaDeclError, LuaDeclGenerator};
 pub use foreign::{foreign_caller, foreign_handle};
 
 use haphe::{
-    BackendCapabilities, RuntimeBinder, ScriptBind, ScriptBindFn, ThreadSafety, ValidatedRegistry,
+    BackendCapabilities, RuntimeBinder, ScriptBind, ScriptBindFn, ScriptStruct, ThreadSafety,
+    ValidatedRegistry,
 };
 
 pub use error::LuaBindError;
@@ -172,13 +173,99 @@ impl RuntimeBinder for LuaBinder {
 ///
 /// `type_table` is the Lua table where the type's constructors will be
 /// placed (typically the type's entry in a module table).
-pub fn bind_type<T: ScriptBind + Clone + mlua::MaybeSend + mlua::MaybeSync + 'static>(
+///
+/// # Iteration
+///
+/// A type declaring `traits(IntoIterator(item = ...))` (or `Iterator`)
+/// iterates with the built-in `pairs(obj)` on Lua 5.2+ and LuaJIT with 5.2
+/// compatibility, with Luau's native `for ... in obj do`, and with a
+/// portable implicit `obj:iter()` method on every version (the only option
+/// on 5.1 and plain LuaJIT, which have no `__pairs`). A declared 2-tuple
+/// item iterates as `(k, v)`; any other item as 1-based `(i, item)` — this
+/// pairing is decided here, statically, from the declared item type. `#obj`
+/// reports the iterator's size hint. Note that built-in containers
+/// (`Vec`, arrays, maps) already cross as native Lua tables and iterate
+/// with plain `pairs`/`ipairs`; this covers opaque userdata types.
+///
+/// `ipairs(obj)` works only on Lua 5.2 and LuaJIT with 5.2 compatibility,
+/// where the `__ipairs` metamethod exists: always 1-based sequential
+/// `(i, item)` (the array protocol), regardless of a kv item's pairing. Lua
+/// 5.3 deprecated and 5.4+ removed `__ipairs` — there `ipairs(obj)` performs
+/// raw `obj[1], obj[2], ...` lookups through `__index`, which only terminates
+/// on nil while this backend's `traits(Index)` bridge surfaces out-of-range
+/// access as an error; the supported spellings on 5.3+ are `pairs(obj)` and
+/// `obj:iter()`.
+pub fn bind_type<
+    T: ScriptBind + ScriptStruct + Clone + mlua::MaybeSend + mlua::MaybeSync + 'static,
+>(
     lua: &mlua::Lua,
     type_table: &mlua::Table,
 ) -> Result<(), LuaBindError> {
     let mut binder = binder::LuaTypeBinder::<T>::new();
+    binder.set_pairing(declared_iter_pairing(
+        <T as ScriptStruct>::DESCRIPTOR.trait_impls,
+    ));
+    binder.set_idiv_fallback(declared_idiv_fallback(
+        <T as ScriptStruct>::DESCRIPTOR.trait_impls,
+    ));
     T::bind(&mut binder)?;
     binder.register(lua, type_table)
+}
+
+/// Whether `//` should fall back to the type's `Div` registration: only for
+/// integer-typed `Div` declarations (integer-primitive rhs, and an output
+/// that is not some other primitive shape), and never when an explicit
+/// `IDiv` is declared. The fallback carries Rust's truncating semantics
+/// (`-7 // 2` gives `-3`, not Lua's floor `-4`) — declare `traits(IDiv)`
+/// for floor behavior on negative operands.
+pub(crate) fn declared_idiv_fallback(trait_impls: &[haphe::TraitImpl<'_>]) -> bool {
+    use haphe::{PrimitiveType, TraitImpl, TypeDescriptor};
+    let is_int = |td: &TypeDescriptor<'_>| {
+        matches!(
+            td,
+            TypeDescriptor::Primitive(
+                PrimitiveType::I8
+                    | PrimitiveType::I16
+                    | PrimitiveType::I32
+                    | PrimitiveType::I64
+                    | PrimitiveType::U8
+                    | PrimitiveType::U16
+                    | PrimitiveType::U32
+                    | PrimitiveType::U64
+            )
+        )
+    };
+    if trait_impls
+        .iter()
+        .any(|ti| matches!(ti, TraitImpl::IDiv { .. }))
+    {
+        return false;
+    }
+    trait_impls.iter().any(|ti| {
+        matches!(
+            ti,
+            TraitImpl::Div { rhs, output }
+                if is_int(rhs) && (is_int(output) || !matches!(output, TypeDescriptor::Primitive(_)))
+        )
+    })
+}
+
+/// The pairing for a type's iteration, from its declared iterator item type:
+/// a 2-tuple item iterates as `(k, v)`, anything else as 1-based `(i, item)`.
+fn declared_iter_pairing(trait_impls: &[haphe::TraitImpl<'_>]) -> binder::IterPairing {
+    use haphe::{TraitImpl, TypeDescriptor};
+    for ti in trait_impls {
+        let item = match ti {
+            TraitImpl::IntoIterator { item } | TraitImpl::Iterator { item } => item,
+            _ => continue,
+        };
+        return if matches!(item, TypeDescriptor::Tuple(elems) if elems.len() == 2) {
+            binder::IterPairing::KeyValue
+        } else {
+            binder::IterPairing::Enumerate
+        };
+    }
+    binder::IterPairing::Enumerate
 }
 
 /// Registers a free function into a Lua table.

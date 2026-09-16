@@ -31,6 +31,19 @@ pub enum LuaBindError {
         /// The interface's exposed name.
         name: &'static str,
     },
+    /// A user-declared method collides with a method this backend registers
+    /// implicitly (the `iter` method on iterable types).
+    ReservedMethod {
+        /// The colliding method name.
+        name: &'static str,
+    },
+    /// An operator was declared that the configured Lua version has no
+    /// metamethod for (the bitwise family requires Lua 5.3+; Lua 5.1/5.2,
+    /// LuaJIT, and Luau cannot represent it).
+    UnsupportedOperator {
+        /// The operator's Rust trait method name (`bitand`, `shl`, ...).
+        op: &'static str,
+    },
 }
 
 impl std::fmt::Display for LuaBindError {
@@ -72,6 +85,22 @@ impl std::fmt::Display for LuaBindError {
                      feature to dispatch instantiations through one Lua function"
                 )
             }
+            Self::ReservedMethod { name } => {
+                write!(
+                    f,
+                    "method `{name}` collides with the implicit `{name}` method this \
+                     backend registers on iterable types; rename the method"
+                )
+            }
+            Self::UnsupportedOperator { op } => {
+                write!(
+                    f,
+                    "operator `{op}` has no metamethod in the configured Lua version: \
+                     the bitwise family requires Lua 5.3+ (not available on Lua \
+                     5.1/5.2, LuaJIT, or Luau); floor division (`//`) requires \
+                     Lua 5.3+ or Luau"
+                )
+            }
         }
     }
 }
@@ -84,6 +113,8 @@ impl std::error::Error for LuaBindError {
             Self::GenericFunction { .. } => None,
             Self::MissingForeignFunction { .. } => None,
             Self::GenericForeignInterface { .. } => None,
+            Self::ReservedMethod { .. } => None,
+            Self::UnsupportedOperator { .. } => None,
         }
     }
 }
