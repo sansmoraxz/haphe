@@ -1,0 +1,5 @@
+error: `Call`'s `args` must be a tuple type like `(i64, String)` (use `()` for no parameters)
+ --> tests/ui/call_args_not_tuple.rs:4:17
+  |
+4 | #[script(traits(Call(args = i64, output = i64)))]
+  |                 ^^^^

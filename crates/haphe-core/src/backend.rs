@@ -157,6 +157,7 @@ impl BackendCapabilities {
         for s in registry.structs() {
             check_fns_async(s.id, s.methods, self.async_fns, &mut errors);
             check_fns_async(s.id, s.constructors, self.async_fns, &mut errors);
+            check_trait_impls_async(s.id, s.trait_impls, self.async_fns, &mut errors);
             check_fns_generics(s.id, s.methods, self.generics, &mut errors);
             check_fns_generics(s.id, s.constructors, self.generics, &mut errors);
             if !self.callbacks {
@@ -242,6 +243,7 @@ impl BackendCapabilities {
 
         for e in registry.enums() {
             check_fns_async(e.id, e.methods, self.async_fns, &mut errors);
+            check_trait_impls_async(e.id, e.trait_impls, self.async_fns, &mut errors);
             check_fns_generics(e.id, e.methods, self.generics, &mut errors);
             if !self.callbacks {
                 check_fns_callbacks(e.id, e.methods, &mut errors);
@@ -443,6 +445,25 @@ fn check_fns_async<'a>(
             errors.push(CompatibilityError::UnsupportedAsync {
                 type_id,
                 fn_name: f.name,
+            });
+        }
+    }
+}
+
+fn check_trait_impls_async<'a>(
+    type_id: TypeId<'a>,
+    trait_impls: &[crate::types::TraitImpl<'a>],
+    supports_async: bool,
+    errors: &mut Vec<CompatibilityError<'a>>,
+) {
+    if supports_async {
+        return;
+    }
+    for ti in trait_impls {
+        if matches!(ti, crate::types::TraitImpl::AsyncCall { .. }) {
+            errors.push(CompatibilityError::UnsupportedAsync {
+                type_id,
+                fn_name: "call",
             });
         }
     }

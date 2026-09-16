@@ -53,7 +53,11 @@ mod verify;
 ///   `ToString` (string concatenation), `Debug`, `Hash`, `PartialEq`, `Eq`,
 ///   `PartialOrd`, `Ord`, `Clone`, `Default`, `Add`, `Sub`, `Mul`, `Div`,
 ///   `Rem`, `IDiv`, `Mod`, `Neg`, `BitAnd`, `BitOr`, `BitXor`, `Shl`, `Shr`,
-///   `Not`, `Pow`, `Index`, `IndexMut`, `Iterator`, `IntoIterator`. Operator traits accept
+///   `Not`, `Pow`, `Call`, `AsyncCall`, `Index`, `IndexMut`, `Iterator`,
+///   `IntoIterator`. `Call(args = (A, B), output = O)` exposes invocation
+///   via the haphe-provided `ops::Call` trait (`args` is always a tuple);
+///   `AsyncCall` is its awaiting sibling, requires an explicit
+///   `thread_safety`, and is gated by the backend's async capability. Operator traits accept
 ///   named type arguments (e.g. `Add(rhs = f64, output = Self)`), defaulting
 ///   to `Self`; `Index`/`IndexMut` require `index` and `output`;
 ///   `Iterator`/`IntoIterator` require `item`.

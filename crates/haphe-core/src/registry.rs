@@ -641,6 +641,12 @@ fn collect_dangling_refs_in_trait_impls<'a>(
             TraitImpl::Iterator { item } | TraitImpl::IntoIterator { item } => {
                 collect_dangling_refs(owner, item, known, errors);
             }
+            TraitImpl::Call { args, output } | TraitImpl::AsyncCall { args, output } => {
+                for arg in *args {
+                    collect_dangling_refs(owner, arg, known, errors);
+                }
+                collect_dangling_refs(owner, output, known, errors);
+            }
             TraitImpl::Display
             | TraitImpl::ToString
             | TraitImpl::Debug

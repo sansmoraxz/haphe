@@ -408,3 +408,33 @@ fn capability_passes_with_registry_only_instantiations() {
         "{errors:?}"
     );
 }
+
+#[test]
+fn async_call_gated_by_async_capability() {
+    static ARGS: [TypeDescriptor<'static>; 1] = [I32];
+    static TRAITS: [haphe_core::TraitImpl<'static>; 1] = [haphe_core::TraitImpl::AsyncCall {
+        args: &ARGS,
+        output: &I32,
+    }];
+    static STRUCTS: [StructDescriptor<'static>; 1] = [StructDescriptor {
+        trait_impls: &TRAITS,
+        ..plain_struct("Invoker")
+    }];
+    static REGISTRY: TypeRegistry<'static> = TypeRegistry::new(&STRUCTS, &[], &[], &[], &[], &[]);
+    let validated = REGISTRY.validate().unwrap();
+    BackendCapabilities::ALL.check(&validated).unwrap();
+    let errors = BackendCapabilities::ALL
+        .with_async_fns(false)
+        .check(&validated)
+        .unwrap_err();
+    assert!(
+        errors.iter().any(|e| matches!(
+            e,
+            haphe_core::CompatibilityError::UnsupportedAsync {
+                fn_name: "call",
+                ..
+            }
+        )),
+        "{errors:?}"
+    );
+}

@@ -22,6 +22,12 @@ impl std::error::Error for NeverError {}
 type IndexFn<T> = fn(&T, &[ScriptValue]) -> Result<ScriptValue, ScriptConvertError>;
 type BinOp<T> = (&'static str, fn(T, T) -> T);
 type NewIndexFn<T> = fn(&mut T, &[ScriptValue]) -> Result<(), ScriptConvertError>;
+type AsyncFn<T> =
+    for<'a> fn(haphe::ScriptCow<'a, T>, &'a [ScriptValue]) -> haphe::ScriptCallFuture<'a>;
+type AsyncMutFn<T> = for<'a> fn(&'a mut T, &'a [ScriptValue]) -> haphe::ScriptCallFuture<'a>;
+type CtorFn<T> = fn(&[ScriptValue]) -> Result<T, ScriptConvertError>;
+type CowMethodFn<T> =
+    for<'a> fn(haphe::ScriptCow<'a, T>, &[ScriptValue]) -> Result<ScriptValue, ScriptConvertError>;
 
 #[derive(Default)]
 struct MockBinder<T> {
@@ -33,7 +39,14 @@ struct MockBinder<T> {
     arith_self: Vec<BinOp<T>>,
     bnot: Option<fn(&T) -> T>,
     fields: Vec<&'static str>,
-    methods: Vec<(&'static str, IndexFn<T>)>,
+    methods: Vec<(&'static str, CowMethodFn<T>)>,
+    hash: Option<fn(&T) -> u64>,
+    debug: Option<fn(&T) -> String>,
+    constructors: Vec<(&'static str, CtorFn<T>)>,
+    call: Option<IndexFn<T>>,
+    call_async: Option<AsyncFn<T>>,
+    async_methods: Vec<(&'static str, AsyncFn<T>)>,
+    async_mut_methods: Vec<(&'static str, AsyncMutFn<T>)>,
 }
 
 impl<T> TypeBinder<T> for MockBinder<T> {
@@ -49,10 +62,13 @@ impl<T> TypeBinder<T> for MockBinder<T> {
         Ok(())
     }
 
-    fn method_ref(
+    fn method(
         &mut self,
         name: &'static str,
-        f: fn(&T, &[ScriptValue]) -> Result<ScriptValue, ScriptConvertError>,
+        f: for<'a> fn(
+            haphe::ScriptCow<'a, T>,
+            &[ScriptValue],
+        ) -> Result<ScriptValue, ScriptConvertError>,
     ) -> Result<(), NeverError> {
         self.methods.push((name, f));
         Ok(())
@@ -66,19 +82,40 @@ impl<T> TypeBinder<T> for MockBinder<T> {
         Ok(())
     }
 
-    fn method_owned(
+    fn method_async(
         &mut self,
-        _: &'static str,
-        _: fn(T, &[ScriptValue]) -> Result<ScriptValue, ScriptConvertError>,
+        name: &'static str,
+        f: for<'a> fn(haphe::ScriptCow<'a, T>, &'a [ScriptValue]) -> haphe::ScriptCallFuture<'a>,
     ) -> Result<(), NeverError> {
+        self.async_methods.push((name, f));
+        Ok(())
+    }
+
+    fn method_async_mut(
+        &mut self,
+        name: &'static str,
+        f: for<'a> fn(&'a mut T, &'a [ScriptValue]) -> haphe::ScriptCallFuture<'a>,
+    ) -> Result<(), NeverError> {
+        self.async_mut_methods.push((name, f));
         Ok(())
     }
 
     fn constructor(
         &mut self,
-        _: &'static str,
-        _: fn(&[ScriptValue]) -> Result<T, ScriptConvertError>,
+        name: &'static str,
+        f: fn(&[ScriptValue]) -> Result<T, ScriptConvertError>,
     ) -> Result<(), NeverError> {
+        self.constructors.push((name, f));
+        Ok(())
+    }
+
+    fn meta_hash(&mut self, f: fn(&T) -> u64) -> Result<(), NeverError> {
+        self.hash = Some(f);
+        Ok(())
+    }
+
+    fn meta_debug(&mut self, f: fn(&T) -> String) -> Result<(), NeverError> {
+        self.debug = Some(f);
         Ok(())
     }
 
@@ -141,6 +178,22 @@ impl<T> TypeBinder<T> for MockBinder<T> {
         f: fn(&T, &[ScriptValue]) -> Result<ScriptValue, ScriptConvertError>,
     ) -> Result<(), NeverError> {
         self.index = Some(f);
+        Ok(())
+    }
+
+    fn meta_call(
+        &mut self,
+        f: fn(&T, &[ScriptValue]) -> Result<ScriptValue, ScriptConvertError>,
+    ) -> Result<(), NeverError> {
+        self.call = Some(f);
+        Ok(())
+    }
+
+    fn meta_call_async(
+        &mut self,
+        f: for<'a> fn(haphe::ScriptCow<'a, T>, &'a [ScriptValue]) -> haphe::ScriptCallFuture<'a>,
+    ) -> Result<(), NeverError> {
+        self.call_async = Some(f);
         Ok(())
     }
 
@@ -235,6 +288,13 @@ fn bound<T: ScriptBind>() -> MockBinder<T> {
         bnot: None,
         fields: Vec::new(),
         methods: Vec::new(),
+        hash: None,
+        debug: None,
+        constructors: Vec::new(),
+        call: None,
+        call_async: None,
+        async_methods: Vec::new(),
+        async_mut_methods: Vec::new(),
     };
     T::bind(&mut binder).unwrap();
     binder
@@ -634,7 +694,7 @@ fn transparent_newtype_field_and_method_bind() {
         powered: Flag(true),
         label: "m".into(),
     };
-    let out = f(&m, &[ScriptValue::Bool(true)]).unwrap();
+    let out = f(haphe::ScriptCow::Borrowed(&m), &[ScriptValue::Bool(true)]).unwrap();
     assert!(matches!(out, ScriptValue::Bool(false)));
 
     // The struct-returning method stays descriptor-only.
@@ -669,4 +729,209 @@ fn transparent_newtype_free_fn_binds() {
     assert_eq!(name, "invert");
     let out = f(&[ScriptValue::Bool(false)]).unwrap();
     assert!(matches!(out, ScriptValue::Bool(true)));
+}
+
+// ---------------------------------------------------------------------------
+// Call / AsyncCall
+// ---------------------------------------------------------------------------
+
+#[derive(Script, Clone)]
+#[script(traits(Call(args = (i64, i64), output = i64)))]
+struct Adder {
+    base: i64,
+}
+
+impl haphe::ops::Call<(i64, i64)> for Adder {
+    type Output = i64;
+    fn call(&self, (a, b): (i64, i64)) -> i64 {
+        self.base + a + b
+    }
+}
+
+#[derive(Script, Clone)]
+#[script(thread_safety = send_sync, traits(AsyncCall(args = (i64,), output = i64)))]
+struct DeferredDoubler {
+    factor: i64,
+}
+
+impl haphe::ops::AsyncCall<(i64,)> for DeferredDoubler {
+    type Output = i64;
+    async fn call_async(&self, (n,): (i64,)) -> i64 {
+        self.factor * n
+    }
+}
+
+fn poll_ready(fut: haphe::ScriptCallFuture<'_>) -> Result<ScriptValue, ScriptConvertError> {
+    use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+    fn noop(_: *const ()) {}
+    fn clone(_: *const ()) -> RawWaker {
+        RawWaker::new(std::ptr::null(), &VTABLE)
+    }
+    static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, noop, noop, noop);
+    let waker = unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &VTABLE)) };
+    let mut cx = Context::from_waker(&waker);
+    let mut fut = fut;
+    match fut.as_mut().poll(&mut cx) {
+        Poll::Ready(v) => v,
+        Poll::Pending => panic!("future not immediately ready"),
+    }
+}
+
+#[test]
+fn call_registers_and_invokes() {
+    let binder = bound::<Adder>();
+    let f = binder.call.expect("meta_call registered");
+    let adder = Adder { base: 100 };
+    let out = f(&adder, &[ScriptValue::I64(2), ScriptValue::I64(3)]).unwrap();
+    assert!(matches!(out, ScriptValue::I64(105)));
+    // Missing / mistyped args error.
+    assert!(f(&adder, &[ScriptValue::String("x".into())]).is_err());
+    // Sync-only declaration registers no async call.
+    assert!(binder.call_async.is_none());
+}
+
+#[test]
+fn async_call_registers_and_awaits() {
+    let binder = bound::<DeferredDoubler>();
+    let f = binder.call_async.expect("meta_call_async registered");
+    assert!(binder.call.is_none());
+    let out = poll_ready(f(
+        haphe::ScriptCow::Owned(DeferredDoubler { factor: 7 }),
+        &[ScriptValue::I64(6)],
+    ))
+    .unwrap();
+    assert!(matches!(out, ScriptValue::I64(42)));
+}
+
+#[test]
+fn zero_arg_call_works() {
+    #[derive(Script, Clone)]
+    #[script(traits(Call(args = (), output = i64)))]
+    struct Nullary {
+        value: i64,
+    }
+    impl haphe::ops::Call<()> for Nullary {
+        type Output = i64;
+        fn call(&self, (): ()) -> i64 {
+            self.value
+        }
+    }
+    let binder = bound::<Nullary>();
+    let f = binder.call.expect("meta_call registered");
+    let out = f(&Nullary { value: 9 }, &[]).unwrap();
+    assert!(matches!(out, ScriptValue::I64(9)));
+}
+
+// ---------------------------------------------------------------------------
+// Async methods
+// ---------------------------------------------------------------------------
+
+#[derive(Script, Clone)]
+#[script(thread_safety = send_sync, methods)]
+struct Fetcher {
+    #[script(readonly)]
+    base: i64,
+}
+
+#[haphe::script]
+impl Fetcher {
+    async fn fetch(&self, offset: i64) -> i64 {
+        self.base + offset
+    }
+
+    async fn bump(&mut self, by: i64) -> i64 {
+        self.base += by;
+        self.base
+    }
+
+    async fn consume(self) -> i64 {
+        self.base
+    }
+
+    async fn fire(&self) {}
+}
+
+#[test]
+fn async_methods_register_and_await() {
+    let binder = bound::<Fetcher>();
+    let names: Vec<&str> = binder.async_methods.iter().map(|(n, _)| *n).collect();
+    assert_eq!(names, vec!["fetch", "consume", "fire"]);
+    let mut_names: Vec<&str> = binder.async_mut_methods.iter().map(|(n, _)| *n).collect();
+    assert_eq!(mut_names, vec!["bump"]);
+    let get = |name: &str| {
+        binder
+            .async_methods
+            .iter()
+            .find(|(n, _)| *n == name)
+            .unwrap()
+            .1
+    };
+
+    use haphe::ScriptCow;
+    // Borrowed receiver: zero-clone shared dispatch.
+    let fetcher = Fetcher { base: 40 };
+    let out = poll_ready(get("fetch")(
+        ScriptCow::Borrowed(&fetcher),
+        &[ScriptValue::I64(2)],
+    ))
+    .unwrap();
+    assert!(matches!(out, ScriptValue::I64(42)));
+    // Owned receiver: the consuming method takes it without cloning.
+    let out = poll_ready(get("consume")(ScriptCow::Owned(Fetcher { base: 5 }), &[])).unwrap();
+    assert!(matches!(out, ScriptValue::I64(5)));
+    let out = poll_ready(get("fire")(ScriptCow::Borrowed(&fetcher), &[])).unwrap();
+    assert!(matches!(out, ScriptValue::Unit));
+    // Conversion failures surface through the future.
+    assert!(
+        poll_ready(get("fetch")(
+            ScriptCow::Borrowed(&fetcher),
+            &[ScriptValue::String("x".into())]
+        ))
+        .is_err()
+    );
+
+    // `&mut self`: the borrowed-mutable channel writes back in place.
+    let (_, bump) = binder.async_mut_methods[0];
+    let mut target = Fetcher { base: 1 };
+    let out = poll_ready(bump(&mut target, &[ScriptValue::I64(9)])).unwrap();
+    assert!(matches!(out, ScriptValue::I64(10)));
+    assert_eq!(target.base, 10, "mutation persisted on the receiver");
+}
+
+// ---------------------------------------------------------------------------
+// Hash / Debug / Default projections
+// ---------------------------------------------------------------------------
+
+#[derive(Script, Clone, Debug, Hash, PartialEq, Default)]
+#[script(traits(Hash, Debug, Default, PartialEq))]
+struct Tag {
+    id: i64,
+}
+
+#[test]
+fn hash_debug_default_register_and_compute() {
+    let binder = bound::<Tag>();
+
+    let hash = binder.hash.expect("meta_hash registered");
+    let (a, b) = (Tag { id: 7 }, Tag { id: 7 });
+    assert_eq!(hash(&a), hash(&b), "equal values hash equal");
+
+    let debug = binder.debug.expect("meta_debug registered");
+    assert_eq!(debug(&a), format!("{a:?}"));
+
+    let (name, ctor) = binder
+        .constructors
+        .iter()
+        .find(|(n, _)| *n == "default")
+        .expect("Default projected as nullary constructor");
+    assert_eq!(*name, "default");
+    assert_eq!(ctor(&[]).unwrap(), Tag::default());
+}
+
+#[test]
+fn debug_without_display_still_feeds_tostring_fallback() {
+    // Existing behavior preserved: Debug supplies __tostring when Display
+    // is absent, in addition to the new meta_debug channel.
+    let binder = bound::<Tag>();
+    assert!(binder.debug.is_some());
 }

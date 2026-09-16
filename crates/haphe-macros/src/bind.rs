@@ -180,12 +180,16 @@ pub fn gen_impl_bind_methods(
     ident: &Ident,
     self_ty: &Type,
     methods: &[BindMethod],
+    async_methods: &[BindMethod],
     dispatch_methods: &[BindMethod],
     constructors: &[BindMethod],
     generics: &Generics,
 ) -> TokenStream {
     let mod_ident = hidden_mod_ident(ident);
     let method_regs = methods.iter().map(|m| gen_method_registration(self_ty, m));
+    let async_regs = async_methods
+        .iter()
+        .map(|m| gen_async_method_registration(self_ty, m));
     let dispatch_regs = dispatch_methods
         .iter()
         .map(|m| gen_dispatched_method_registration(self_ty, m));
@@ -211,6 +215,7 @@ pub fn gen_impl_bind_methods(
             ) -> ::core::result::Result<(), __B::Error> {
                 #(#ctor_regs)*
                 #(#method_regs)*
+                #(#async_regs)*
                 #(#dispatch_regs)*
                 ::core::result::Result::Ok(())
             }
@@ -460,10 +465,42 @@ fn gen_metamethod_registrations(self_ty: &Type, traits: &[TraitDecl]) -> TokenSt
                     )?;
                 });
             }
-            "Debug" if !has_display => {
+            "Debug" => {
+                if !has_display {
+                    tokens.extend(quote! {
+                        __b.meta_tostring(
+                            (|__t: &#self_ty| ::std::format!("{__t:?}")) as fn(&#self_ty) -> ::std::string::String,
+                        )?;
+                    });
+                }
                 tokens.extend(quote! {
-                    __b.meta_tostring(
+                    __b.meta_debug(
                         (|__t: &#self_ty| ::std::format!("{__t:?}")) as fn(&#self_ty) -> ::std::string::String,
+                    )?;
+                });
+            }
+            "Hash" => {
+                tokens.extend(quote! {
+                    __b.meta_hash(
+                        (|__t: &#self_ty| {
+                            use ::std::hash::{Hash, Hasher};
+                            let mut __h = ::std::hash::DefaultHasher::new();
+                            Hash::hash(__t, &mut __h);
+                            __h.finish()
+                        }) as fn(&#self_ty) -> u64,
+                    )?;
+                });
+            }
+            // `Default` projects as a nullary constructor named `default`
+            // through the ordinary constructor channel — reachable from
+            // every backend (user ruling: full runtime interusability).
+            "Default" => {
+                tokens.extend(quote! {
+                    __b.constructor(
+                        "default",
+                        (|_: &[::haphe::ScriptValue]| ::core::result::Result::Ok(
+                            <#self_ty as ::core::default::Default>::default()
+                        )) as fn(&[::haphe::ScriptValue]) -> ::core::result::Result<#self_ty, ::haphe::ScriptConvertError>,
                     )?;
                 });
             }
@@ -575,6 +612,79 @@ fn gen_metamethod_registrations(self_ty: &Type, traits: &[TraitDecl]) -> TokenSt
                         (|__t: #self_ty| ::core::iter::Iterator::size_hint(
                             &::core::iter::IntoIterator::into_iter(__t)
                         ).0) as fn(#self_ty) -> usize,
+                    )?;
+                });
+            }
+            "Call" => {
+                let Some(args_ty) = decl
+                    .args
+                    .iter()
+                    .find(|(n, _)| n == "args")
+                    .map(|(_, t)| substitute_self(t, &ctx))
+                else {
+                    continue; // missing `args` already errored in the descriptor pass
+                };
+                let Type::Tuple(args_tuple) = &args_ty else {
+                    continue; // non-tuple `args` already errored
+                };
+                let elem_tys: Vec<&Type> = args_tuple.elems.iter().collect();
+                let vars: Vec<Ident> = (0..elem_tys.len())
+                    .map(|i| format_ident!("__a{i}"))
+                    .collect();
+                let idx: Vec<usize> = (0..elem_tys.len()).collect();
+                tokens.extend(quote! {
+                    __b.meta_call(
+                        (|__t: &#self_ty, __args: &[::haphe::ScriptValue]| -> ::core::result::Result<::haphe::ScriptValue, ::haphe::ScriptConvertError> {
+                            #(
+                                let #vars = <#elem_tys as ::haphe::FromScript>::from_script(
+                                    __args.get(#idx).cloned().unwrap_or(::haphe::ScriptValue::Unit)
+                                )?;
+                            )*
+                            ::core::result::Result::Ok(::haphe::IntoScript::into_script(
+                                <#self_ty as ::haphe::ops::Call<#args_ty>>::call(
+                                    __t,
+                                    (#(#vars,)*),
+                                )
+                            ))
+                        }) as fn(&#self_ty, &[::haphe::ScriptValue]) -> ::core::result::Result<::haphe::ScriptValue, ::haphe::ScriptConvertError>,
+                    )?;
+                });
+            }
+            "AsyncCall" => {
+                let Some(args_ty) = decl
+                    .args
+                    .iter()
+                    .find(|(n, _)| n == "args")
+                    .map(|(_, t)| substitute_self(t, &ctx))
+                else {
+                    continue; // missing `args` already errored in the descriptor pass
+                };
+                let Type::Tuple(args_tuple) = &args_ty else {
+                    continue; // non-tuple `args` already errored
+                };
+                let elem_tys: Vec<&Type> = args_tuple.elems.iter().collect();
+                let vars: Vec<Ident> = (0..elem_tys.len())
+                    .map(|i| format_ident!("__a{i}"))
+                    .collect();
+                let idx: Vec<usize> = (0..elem_tys.len()).collect();
+                tokens.extend(quote! {
+                    __b.meta_call_async(
+                        (|__recv: ::haphe::ScriptCow<'_, #self_ty>, __args: &[::haphe::ScriptValue]| -> ::haphe::ScriptCallFuture<'_> {
+                            ::std::boxed::Box::pin(async move {
+                                #(
+                                    let #vars = <#elem_tys as ::haphe::FromScript>::from_script(
+                                        __args.get(#idx).cloned().unwrap_or(::haphe::ScriptValue::Unit)
+                                    )?;
+                                )*
+                                ::core::result::Result::Ok(::haphe::IntoScript::into_script(
+                                    <#self_ty as ::haphe::ops::AsyncCall<#args_ty>>::call_async(
+                                        &__recv,
+                                        (#(#vars,)*),
+                                    )
+                                    .await
+                                ))
+                            })
+                        }) as for<'a> fn(::haphe::ScriptCow<'a, #self_ty>, &'a [::haphe::ScriptValue]) -> ::haphe::ScriptCallFuture<'a>,
                     )?;
                 });
             }
@@ -697,30 +807,54 @@ pub fn gen_dispatched_method_registration(self_ty: &Type, method: &BindMethod) -
     };
     let idx: Vec<usize> = (0..stripped.len()).collect();
 
-    let (recv_decl, recv_call, wrapper_recv, wrapper_recv_ty, register) = match method.receiver {
-        ReceiverShape::RefMut => (
-            quote! { __t: &mut Self },
-            quote! { __t.#ident(#(#call_args),*) },
-            quote! { __t: &mut __T },
-            quote! { &mut __T },
-            format_ident!("method_mut"),
-        ),
-        ReceiverShape::Owned => (
-            quote! { __t: Self },
-            quote! { __t.#ident(#(#call_args),*) },
-            quote! { __t: __T },
-            quote! { __T },
-            format_ident!("method_owned"),
-        ),
+    struct DispatchShape {
+        recv_decl: TokenStream,
+        recv_call: TokenStream,
+        wrapper_sig: TokenStream,
+        wrapper_prep: TokenStream,
+        cast_ty: TokenStream,
+        extra_bound: TokenStream,
+        register: Ident,
+    }
+    let shape = match method.receiver {
+        ReceiverShape::RefMut => DispatchShape {
+            recv_decl: quote! { __t: &mut Self },
+            recv_call: quote! { __t.#ident(#(#call_args),*) },
+            wrapper_sig: quote! { __t: &mut __T },
+            wrapper_prep: TokenStream::new(),
+            cast_ty: quote! { fn(&mut __T, &[::haphe::ScriptValue]) },
+            extra_bound: TokenStream::new(),
+            register: format_ident!("method_mut"),
+        },
+        ReceiverShape::Owned => DispatchShape {
+            recv_decl: quote! { __t: Self },
+            recv_call: quote! { __t.#ident(#(#call_args),*) },
+            wrapper_sig: quote! { __recv: ::haphe::ScriptCow<'_, __T> },
+            wrapper_prep: quote! { let __t: __T = __recv.into_owned(); },
+            cast_ty: quote! { for<'a> fn(::haphe::ScriptCow<'a, __T>, &[::haphe::ScriptValue]) },
+            extra_bound: quote! { __T: ::core::clone::Clone, },
+            register: format_ident!("method"),
+        },
         // `None` mirrors gen_method_registration's associated-fn handling.
-        ReceiverShape::Ref | ReceiverShape::None => (
-            quote! { __t: &Self },
-            quote! { __t.#ident(#(#call_args),*) },
-            quote! { __t: &__T },
-            quote! { &__T },
-            format_ident!("method_ref"),
-        ),
+        ReceiverShape::Ref | ReceiverShape::None => DispatchShape {
+            recv_decl: quote! { __t: &Self },
+            recv_call: quote! { __t.#ident(#(#call_args),*) },
+            wrapper_sig: quote! { __recv: ::haphe::ScriptCow<'_, __T> },
+            wrapper_prep: quote! { let __t: &__T = &__recv; },
+            cast_ty: quote! { for<'a> fn(::haphe::ScriptCow<'a, __T>, &[::haphe::ScriptValue]) },
+            extra_bound: TokenStream::new(),
+            register: format_ident!("method"),
+        },
     };
+    let DispatchShape {
+        recv_decl,
+        recv_call,
+        wrapper_sig,
+        wrapper_prep,
+        cast_ty,
+        extra_bound,
+        register,
+    } = shape;
     let recv_decl2 = recv_decl.clone();
 
     quote! {
@@ -749,6 +883,7 @@ pub fn gen_dispatched_method_registration(self_ty: &Type, method: &BindMethod) -
             impl<__T> __Go<__T> for &::haphe::BridgeProbe<__T>
             where
                 __T: __Call,
+                #extra_bound
                 #( __T::#p_assoc: ::haphe::FromScript, )*
                 ::haphe::ScriptValue: ::core::convert::From<__T::__R>,
             {
@@ -758,8 +893,9 @@ pub fn gen_dispatched_method_registration(self_ty: &Type, method: &BindMethod) -
                 ) -> ::core::result::Result<(), __B::Error> {
                     __b.#register(
                         #name,
-                        (|#wrapper_recv, __args: &[::haphe::ScriptValue]|
+                        (|#wrapper_sig, __args: &[::haphe::ScriptValue]|
                             -> ::core::result::Result<::haphe::ScriptValue, ::haphe::ScriptConvertError> {
+                            #wrapper_prep
                             #(
                                 let #p_vars = <__T::#p_assoc as ::haphe::FromScript>::from_script(
                                     __args.get(#idx).cloned().unwrap_or(::haphe::ScriptValue::Unit)
@@ -768,7 +904,7 @@ pub fn gen_dispatched_method_registration(self_ty: &Type, method: &BindMethod) -
                             ::core::result::Result::Ok(::haphe::ScriptValue::from(
                                 __T::__invoke(__t, #( #p_vars ),*)
                             ))
-                        }) as fn(#wrapper_recv_ty, &[::haphe::ScriptValue])
+                        }) as #cast_ty
                             -> ::core::result::Result<::haphe::ScriptValue, ::haphe::ScriptConvertError>,
                     )
                 }
@@ -778,6 +914,56 @@ pub fn gen_dispatched_method_registration(self_ty: &Type, method: &BindMethod) -
             (&&::haphe::BridgeProbe::<#self_ty>(::core::marker::PhantomData))
                 .__haphe_bind(__b)?;
         }
+    }
+}
+
+/// Registration for an `async` method. The receiver arrives as a
+/// [`ScriptCow`] whose borrow the boxed future may hold across `await`s
+/// (`&self` derefs, consuming `self` takes `into_owned`); `&mut self` goes
+/// through the dedicated mutable channel, so mutation writes back in place.
+fn gen_async_method_registration(self_ty: &Type, method: &BindMethod) -> TokenStream {
+    let name = &method.name;
+    let ident = &method.ident;
+
+    let extractions = gen_param_extractions(&method.params);
+    let call_args = gen_call_args(&method.params);
+
+    let result_expr = if method.has_return {
+        quote! { ::haphe::IntoScript::into_script(__t.#ident(#(#call_args),*).await) }
+    } else {
+        quote! { { __t.#ident(#(#call_args),*).await; ::haphe::ScriptValue::Unit } }
+    };
+
+    if matches!(method.receiver, ReceiverShape::RefMut) {
+        return quote! {
+            __b.method_async_mut(
+                #name,
+                (|__t: &mut #self_ty, __args: &[::haphe::ScriptValue]| -> ::haphe::ScriptCallFuture<'_> {
+                    ::std::boxed::Box::pin(async move {
+                        #(#extractions)*
+                        ::core::result::Result::Ok(#result_expr)
+                    })
+                }) as for<'a> fn(&'a mut #self_ty, &'a [::haphe::ScriptValue]) -> ::haphe::ScriptCallFuture<'a>,
+            )?;
+        };
+    }
+
+    let recv_prep = match method.receiver {
+        ReceiverShape::Owned => quote! { let __t: #self_ty = __recv.into_owned(); },
+        _ => quote! { let __t: &#self_ty = &__recv; },
+    };
+
+    quote! {
+        __b.method_async(
+            #name,
+            (|__recv: ::haphe::ScriptCow<'_, #self_ty>, __args: &[::haphe::ScriptValue]| -> ::haphe::ScriptCallFuture<'_> {
+                ::std::boxed::Box::pin(async move {
+                    #recv_prep
+                    #(#extractions)*
+                    ::core::result::Result::Ok(#result_expr)
+                })
+            }) as for<'a> fn(::haphe::ScriptCow<'a, #self_ty>, &'a [::haphe::ScriptValue]) -> ::haphe::ScriptCallFuture<'a>,
+        )?;
     }
 }
 
@@ -797,9 +983,10 @@ fn gen_method_registration(self_ty: &Type, method: &BindMethod) -> TokenStream {
     match method.receiver {
         ReceiverShape::Ref => {
             quote! {
-                __b.method_ref(
+                __b.method(
                     #name,
-                    |__t: &#self_ty, __args: &[::haphe::ScriptValue]| -> ::core::result::Result<::haphe::ScriptValue, ::haphe::ScriptConvertError> {
+                    |__recv: ::haphe::ScriptCow<'_, #self_ty>, __args: &[::haphe::ScriptValue]| -> ::core::result::Result<::haphe::ScriptValue, ::haphe::ScriptConvertError> {
+                        let __t: &#self_ty = &__recv;
                         #(#extractions)*
                         ::core::result::Result::Ok(#result_expr)
                     },
@@ -824,9 +1011,12 @@ fn gen_method_registration(self_ty: &Type, method: &BindMethod) -> TokenStream {
                 quote! { { __t.#ident(#(#call_args),*); ::haphe::ScriptValue::Unit } }
             };
             quote! {
-                __b.method_owned(
+                __b.method(
                     #name,
-                    |__t: #self_ty, __args: &[::haphe::ScriptValue]| -> ::core::result::Result<::haphe::ScriptValue, ::haphe::ScriptConvertError> {
+                    |__recv: ::haphe::ScriptCow<'_, #self_ty>, __args: &[::haphe::ScriptValue]| -> ::core::result::Result<::haphe::ScriptValue, ::haphe::ScriptConvertError> {
+                        // Consuming receiver: clone-at-boundary only when the
+                        // backend handed a borrowed carrier.
+                        let __t: #self_ty = __recv.into_owned();
                         #(#extractions)*
                         ::core::result::Result::Ok(#result_expr)
                     },
@@ -835,9 +1025,9 @@ fn gen_method_registration(self_ty: &Type, method: &BindMethod) -> TokenStream {
         }
         ReceiverShape::None => {
             quote! {
-                __b.method_ref(
+                __b.method(
                     #name,
-                    |_: &#self_ty, __args: &[::haphe::ScriptValue]| -> ::core::result::Result<::haphe::ScriptValue, ::haphe::ScriptConvertError> {
+                    |_: ::haphe::ScriptCow<'_, #self_ty>, __args: &[::haphe::ScriptValue]| -> ::core::result::Result<::haphe::ScriptValue, ::haphe::ScriptConvertError> {
                         #(#extractions)*
                         ::core::result::Result::Ok(::haphe::IntoScript::into_script(<#self_ty>::#ident(#(#call_args),*)))
                     },

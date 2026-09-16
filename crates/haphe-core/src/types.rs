@@ -270,6 +270,20 @@ pub enum TraitImpl<'a> {
         output: &'a TypeDescriptor<'a>,
     },
 
+    /// Callable values via the haphe-provided [`ops::Call`](crate::ops::Call)
+    /// trait (std's `Fn*` traits are not implementable).
+    Call {
+        args: &'a [TypeDescriptor<'a>],
+        output: &'a TypeDescriptor<'a>,
+    },
+    /// Asynchronously callable values via
+    /// [`ops::AsyncCall`](crate::ops::AsyncCall); gated by the backend's
+    /// async capability.
+    AsyncCall {
+        args: &'a [TypeDescriptor<'a>],
+        output: &'a TypeDescriptor<'a>,
+    },
+
     // Indexing
     Index {
         index: &'a TypeDescriptor<'a>,

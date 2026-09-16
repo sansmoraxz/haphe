@@ -152,6 +152,37 @@ where
     }
 }
 
+/// Callable values (`value(...)` invocation).
+///
+/// The standard library's `Fn*` traits cannot back an exposable call
+/// operator (they are not implementable on stable Rust), so this trait
+/// fills the role: `Args` is the parameter list as a tuple (`()`, `(i64,)`,
+/// `(i64, String)`, ...), invoked through a shared reference so calling
+/// never consumes the value. No blanket extension and no std-type
+/// implementations — implement it directly.
+pub trait Call<Args> {
+    /// The result type of the invocation.
+    type Output;
+
+    /// Invokes the value with `args`.
+    fn call(&self, args: Args) -> Self::Output;
+}
+
+/// Asynchronously callable values (`value(...)` invocation awaiting a
+/// result).
+///
+/// The async sibling of [`Call`], for hosts whose call bodies suspend.
+/// Declared with `traits(AsyncCall(args = ..., output = ...))`; the type
+/// must declare `thread_safety` explicitly, and binding is gated by the
+/// backend's async capability.
+pub trait AsyncCall<Args> {
+    /// The result type of the invocation.
+    type Output;
+
+    /// Invokes the value with `args`.
+    fn call_async(&self, args: Args) -> impl ::core::future::Future<Output = Self::Output>;
+}
+
 /// Floor division (Lua's `//`-style integer division).
 ///
 /// The standard library defines no floor-division trait, so this one has no

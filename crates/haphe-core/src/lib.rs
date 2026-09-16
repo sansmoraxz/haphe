@@ -52,7 +52,8 @@ pub use backend::{
 pub use bridge::{
     BindTarget, BridgeProbe, FnBinder, ForeignCaller, ForeignError, ForeignErrorKind,
     ForeignHandle, FromScript, IntoScript, OpaqueUserData, ScriptBind, ScriptBindFn,
-    ScriptConvertError, ScriptIter, ScriptValue, SkipBind, SkipBindFn, TypeBinder,
+    ScriptCallFuture, ScriptConvertError, ScriptCow, ScriptIter, ScriptValue, SkipBind, SkipBindFn,
+    TypeBinder,
 };
 pub use foreign::ForeignInterfaceDescriptor;
 pub use function::{FunctionDescriptor, Ownership, ParamDescriptor, Receiver, any_async};

@@ -226,6 +226,7 @@ fn trait_impl_expr(
             | "BitXor" | "Shl" | "Shr" | "Pow" => &["rhs", "output"],
             "Neg" | "Not" => &["output"],
             "Index" | "IndexMut" => &["index", "output"],
+            "Call" | "AsyncCall" => &["args", "output"],
             "Iterator" | "IntoIterator" => &["item"],
             other => {
                 errors.spanned(
@@ -233,8 +234,8 @@ fn trait_impl_expr(
                     format!(
                         "unsupported trait `{other}` (expected one of: Display, Debug, Hash, \
                          PartialEq, Eq, PartialOrd, Ord, Clone, Default, Add, Sub, Mul, Div, Rem, \
-                         IDiv, Mod, Neg, BitAnd, BitOr, BitXor, Shl, Shr, Not, Pow, Index, \
-                         IndexMut, Iterator, IntoIterator)"
+                         IDiv, Mod, Neg, BitAnd, BitOr, BitXor, Shl, Shr, Not, Pow, Call, \
+                         AsyncCall, Index, IndexMut, Iterator, IntoIterator)"
                     ),
                 );
                 return None;
@@ -290,6 +291,31 @@ fn trait_impl_expr(
                 expr = quote! { ::haphe::TraitImpl::#variant { index: #index, output: #output } };
                 bound = quote! { ::haphe::ops::#variant<#idx_sub, Output = #out_sub> };
             }
+            "Call" | "AsyncCall" => {
+                let args_ty = lookup(decl, self_ty, span, errors, "args", false)?;
+                let out_ty = lookup(decl, self_ty, span, errors, "output", true)?;
+                let Type::Tuple(args_tuple) = &args_ty else {
+                    errors.spanned(
+                        span,
+                        format!(
+                            "`{name_str}`'s `args` must be a tuple type like `(i64, String)` \
+                             (use `()` for no parameters)"
+                        ),
+                    );
+                    return None;
+                };
+                let arg_descs: Vec<TokenStream> =
+                    args_tuple.elems.iter().map(|ty| desc(ty, errors)).collect();
+                let output = desc(&out_ty, errors);
+                let (args_sub, out_sub) = (
+                    substitute_self(&args_ty, ctx),
+                    substitute_self(&out_ty, ctx),
+                );
+                expr = quote! {
+                    ::haphe::TraitImpl::#variant { args: &[#(*#arg_descs),*], output: #output }
+                };
+                bound = quote! { ::haphe::ops::#variant<#args_sub, Output = #out_sub> };
+            }
             "Iterator" | "IntoIterator" => {
                 let item_ty = lookup(decl, self_ty, span, errors, "item", false)?;
                 let item = desc(&item_ty, errors);
@@ -314,6 +340,17 @@ fn trait_impl_expr(
 fn expand_inner(input: DeriveInput) -> syn::Result<TokenStream> {
     let mut errors = Errors::default();
     let container = parse_container_args(&input.attrs, &mut errors);
+
+    // Async callability implies suspension points; mirror the async-methods
+    // rule and demand an explicit thread-safety claim.
+    if container.thread_safety.is_none()
+        && let Some(decl) = container.traits.iter().find(|t| t.name == "AsyncCall")
+    {
+        errors.spanned(
+            decl.name.span(),
+            "types declaring `AsyncCall` must declare #[script(thread_safety = ...)] explicitly",
+        );
+    }
 
     // Newtypes are exposed as type aliases: single-field tuple structs
     // always, and single-field named structs when marked `transparent`.

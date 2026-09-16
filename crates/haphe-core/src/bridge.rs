@@ -431,13 +431,17 @@ pub trait TypeBinder<T>: Sized {
         setter: Option<fn(&mut T, V)>,
     ) -> Result<(), Self::Error>;
 
-    /// Register a `&self` method. The wrapper converts arguments from
-    /// `ScriptValue` and returns the result as `ScriptValue` — the macro
-    /// generates the conversion code with concrete types.
-    fn method_ref(
+    /// Register a non-mutating method (`&self` or consuming `self`). The
+    /// wrapper converts arguments from `ScriptValue` and returns the result
+    /// as `ScriptValue` — the macro generates the conversion code with
+    /// concrete types. The receiver arrives as a [`ScriptCow`]: pass
+    /// `Borrowed` while holding the runtime's guard for zero-clone dispatch,
+    /// or `Owned` with a value acquired by the backend's own policy (a
+    /// consuming method clones a borrowed carrier at the boundary).
+    fn method(
         &mut self,
         name: &'static str,
-        f: fn(&T, &[ScriptValue]) -> Result<ScriptValue, ScriptConvertError>,
+        f: for<'a> fn(ScriptCow<'a, T>, &[ScriptValue]) -> Result<ScriptValue, ScriptConvertError>,
     ) -> Result<(), Self::Error>;
 
     /// Register a `&mut self` method.
@@ -447,11 +451,32 @@ pub trait TypeBinder<T>: Sized {
         f: fn(&mut T, &[ScriptValue]) -> Result<ScriptValue, ScriptConvertError>,
     ) -> Result<(), Self::Error>;
 
-    /// Register a consuming `self` method.
-    fn method_owned(
+    /// Register a non-mutating `async` method (`&self` or consuming
+    /// `self`).
+    ///
+    /// The receiver arrives as a [`ScriptCow`] and the returned future may
+    /// borrow it: a backend that can hold its runtime's guard across
+    /// `await`s passes `Borrowed` (zero clones); one that cannot passes
+    /// `Owned`. Only reachable when the backend's capabilities declare
+    /// async support — others reject the registration with a descriptive
+    /// error.
+    fn method_async(
         &mut self,
         name: &'static str,
-        f: fn(T, &[ScriptValue]) -> Result<ScriptValue, ScriptConvertError>,
+        f: for<'a> fn(ScriptCow<'a, T>, &'a [ScriptValue]) -> ScriptCallFuture<'a>,
+    ) -> Result<(), Self::Error>;
+
+    /// Register a `&mut self` `async` method.
+    ///
+    /// The future borrows the receiver mutably for its whole run, so
+    /// mutation writes back in place. A backend that cannot hold a mutable
+    /// guard across `await`s rejects the registration with a descriptive
+    /// error — it must never substitute an acquired copy, whose mutations
+    /// would be silently lost.
+    fn method_async_mut(
+        &mut self,
+        name: &'static str,
+        f: for<'a> fn(&'a mut T, &'a [ScriptValue]) -> ScriptCallFuture<'a>,
     ) -> Result<(), Self::Error>;
 
     /// Register a constructor (no receiver, returns `T`).
@@ -470,6 +495,16 @@ pub trait TypeBinder<T>: Sized {
     /// operand(s) with `f` and accepts only string-like counterparts
     /// (strings and numbers), erroring on anything else.
     fn meta_concat(&mut self, f: fn(&T) -> String) -> Result<(), Self::Error>;
+
+    /// Register a hash accessor, from `std::hash::Hash` (a stable `u64`
+    /// digest via the standard hasher). Backends surface it in their native
+    /// shape — a named function where the runtime has no hashing protocol.
+    fn meta_hash(&mut self, f: fn(&T) -> u64) -> Result<(), Self::Error>;
+
+    /// Register a debug-formatting accessor, from `std::fmt::Debug`.
+    /// Distinct from [`meta_tostring`](Self::meta_tostring): both may be
+    /// registered; backends decide how each surfaces.
+    fn meta_debug(&mut self, f: fn(&T) -> String) -> Result<(), Self::Error>;
 
     /// Register a `PartialEq` / `__eq` metamethod.
     fn meta_eq(&mut self, f: fn(&T, &T) -> bool) -> Result<(), Self::Error>;
@@ -533,6 +568,28 @@ pub trait TypeBinder<T>: Sized {
     /// value-acquisition cost).
     fn meta_len(&mut self, f: fn(T) -> usize) -> Result<(), Self::Error>;
 
+    /// Register a call metamethod, from [`crate::ops::Call`].
+    ///
+    /// `f` converts the call arguments to the declared tuple, invokes
+    /// through a shared reference, and converts the result back. A backend
+    /// whose runtime has no call construct rejects the registration with a
+    /// descriptive error rather than dropping it.
+    fn meta_call(
+        &mut self,
+        f: fn(&T, &[ScriptValue]) -> Result<ScriptValue, ScriptConvertError>,
+    ) -> Result<(), Self::Error>;
+
+    /// Register an async call metamethod, from [`crate::ops::AsyncCall`].
+    ///
+    /// The receiver arrives as a [`ScriptCow`] like
+    /// [`method_async`](Self::method_async). Only reachable when the
+    /// backend's capabilities declare async support — others reject the
+    /// registration with a descriptive error.
+    fn meta_call_async(
+        &mut self,
+        f: for<'a> fn(ScriptCow<'a, T>, &'a [ScriptValue]) -> ScriptCallFuture<'a>,
+    ) -> Result<(), Self::Error>;
+
     /// Register an indexed-read metamethod, from `std::ops::Index`.
     ///
     /// `f` converts the single key argument to the declared index type,
@@ -555,6 +612,59 @@ pub trait TypeBinder<T>: Sized {
         f: fn(&mut T, &[ScriptValue]) -> Result<(), ScriptConvertError>,
     ) -> Result<(), Self::Error>;
 }
+
+/// Clone-on-write receiver carrier for bridged method and call dispatch.
+///
+/// The backend picks the variant per its own model: one that can hold its
+/// runtime's userdata guard across the invocation (or across `await`s)
+/// passes [`Borrowed`](ScriptCow::Borrowed) — zero clones, and for `&mut`
+/// channels true in-place mutation; one that cannot passes
+/// [`Owned`](ScriptCow::Owned) with a value it acquired by its own policy.
+/// Generated wrappers consume the carrier: shared-receiver methods go
+/// through [`Deref`](core::ops::Deref), consuming ones take the owned value
+/// (cloning a borrowed carrier at the boundary).
+///
+/// Bridge plumbing, not a bridged value type: it never appears in a
+/// descriptor or a script-visible signature, so it deliberately implements
+/// none of the `Script*` description traits.
+pub enum ScriptCow<'a, T> {
+    /// A receiver borrowed from the runtime for the duration of the call.
+    Borrowed(&'a T),
+    /// A receiver the backend acquired and handed over.
+    Owned(T),
+}
+
+impl<T> core::ops::Deref for ScriptCow<'_, T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        match self {
+            Self::Borrowed(t) => t,
+            Self::Owned(t) => t,
+        }
+    }
+}
+
+impl<T: Clone> ScriptCow<'_, T> {
+    /// Extracts an owned value, cloning a borrowed carrier.
+    pub fn into_owned(self) -> T {
+        match self {
+            Self::Borrowed(t) => t.clone(),
+            Self::Owned(t) => t,
+        }
+    }
+}
+
+/// Boxed future produced by async bridged dispatch
+/// ([`TypeBinder::method_async`] and friends). May borrow the receiver
+/// carrier and the argument slice for `'a` — the backend drives it while
+/// holding whatever guard backs a [`ScriptCow::Borrowed`] receiver.
+///
+/// Intentionally not `Send`; a backend whose threading model demands `Send`
+/// handles that at its own boundary.
+pub type ScriptCallFuture<'a> = ::core::pin::Pin<
+    Box<dyn ::core::future::Future<Output = Result<ScriptValue, ScriptConvertError>> + 'a>,
+>;
 
 /// Owned iterator over a value's contents.
 ///
