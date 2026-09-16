@@ -258,6 +258,28 @@ fn emit_struct(
         break;
     }
 
+    // Hash / Debug surface as portable methods (Lua has no hashing or
+    // debug-formatting protocol).
+    if s.trait_impls
+        .iter()
+        .any(|ti| matches!(ti, haphe::TraitImpl::Hash))
+    {
+        let _ = writeln!(
+            out,
+            "---Stable hash of the value (Rust `Hash` digest as an integer)."
+        );
+        let _ = writeln!(out, "---@return integer");
+        let _ = writeln!(out, "function {}:hash() end\n", s.name);
+    }
+    if s.trait_impls
+        .iter()
+        .any(|ti| matches!(ti, haphe::TraitImpl::Debug))
+    {
+        let _ = writeln!(out, "---Rust `Debug` formatting of the value.");
+        let _ = writeln!(out, "---@return string");
+        let _ = writeln!(out, "function {}:debug() end\n", s.name);
+    }
+
     // Methods, colon syntax. `self`-consuming methods are exposed the same
     // way at runtime; static methods (no receiver) live on the type table
     // with the constructors.
@@ -309,6 +331,24 @@ fn emit_operators(
             TraitImpl::Shr { rhs, output } => ("shr", Some(*rhs), *output),
             TraitImpl::Neg { output } => ("unm", None, *output),
             TraitImpl::Not { output } => ("bnot", None, *output),
+            // Callable objects: LuaLS documents them as an `---@overload`
+            // on the class. Sync and async spell identically — the Lua-side
+            // calling convention is the same when mlua drives the future.
+            TraitImpl::Call { args, output } | TraitImpl::AsyncCall { args, output } => {
+                let context = format!("{} call operator", s.name);
+                let mut params = Vec::new();
+                for (i, arg) in args.iter().enumerate() {
+                    let rendered = render_type(registry, arg, &context)?;
+                    params.push(format!("a{}: {rendered}", i + 1));
+                }
+                let out_rendered = render_type(registry, output, &context)?;
+                let _ = writeln!(
+                    out,
+                    "---@overload fun({}): {out_rendered}",
+                    params.join(", ")
+                );
+                continue;
+            }
             // LuaLS supports `---@operator concat`; `ToString` types accept
             // string-like counterparts and produce a string.
             TraitImpl::ToString => {
@@ -461,6 +501,16 @@ fn emit_module(
                         &format!("{path}.{}.", s.name),
                         &format!("{}::{}", s.name, ctor.name),
                     )?;
+                }
+                // `traits(Default)` registers an implicit nullary
+                // constructor named `default`.
+                if s.trait_impls
+                    .iter()
+                    .any(|ti| matches!(ti, haphe::TraitImpl::Default))
+                {
+                    let _ = writeln!(out, "---Constructs the default value (Rust `Default`).");
+                    let _ = writeln!(out, "---@return {}", s.name);
+                    let _ = writeln!(out, "function {path}.{}.default() end\n", s.name);
                 }
                 for m in s.methods {
                     if m.receiver.is_none() {

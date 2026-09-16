@@ -90,7 +90,9 @@ impl haphe::ops::IndexMut<i64> for Buffer {
     }
 }
 
-fn lua_with<T: haphe::ScriptBind + haphe::ScriptStruct + Clone + 'static>() -> (Lua, mlua::Table) {
+fn lua_with<
+    T: haphe::ScriptBind + haphe::ScriptStruct + Clone + mlua::MaybeSend + mlua::MaybeSync + 'static,
+>() -> (Lua, mlua::Table) {
     let lua = Lua::new();
     let table = lua.create_table().unwrap();
     bind_type::<T>(&lua, &table).unwrap();

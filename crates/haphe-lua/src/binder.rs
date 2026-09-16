@@ -7,7 +7,7 @@
 use std::sync::Arc;
 
 use haphe::bridge::{FromScript, IntoScript, ScriptValue};
-use haphe::{FnBinder, ScriptIter, TypeBinder};
+use haphe::{FnBinder, ScriptCallFuture, ScriptCow, ScriptIter, TypeBinder};
 use mlua::{Lua, MetaMethod, UserDataFields, UserDataMethods};
 
 use crate::LuaBindError;
@@ -192,6 +192,10 @@ type FieldSetFn<T> =
 
 // Method/constructor fn pointers using ScriptValue — no generics needed.
 type ScriptMethodRef<T> = fn(&T, &[ScriptValue]) -> Result<ScriptValue, haphe::ScriptConvertError>;
+type CowMethodFn<T> =
+    for<'a> fn(ScriptCow<'a, T>, &[ScriptValue]) -> Result<ScriptValue, haphe::ScriptConvertError>;
+type AsyncCowFn<T> = for<'a> fn(ScriptCow<'a, T>, &'a [ScriptValue]) -> ScriptCallFuture<'a>;
+type AsyncMutFn<T> = for<'a> fn(&'a mut T, &'a [ScriptValue]) -> ScriptCallFuture<'a>;
 type ScriptMethodMut<T> =
     fn(&mut T, &[ScriptValue]) -> Result<ScriptValue, haphe::ScriptConvertError>;
 type ScriptCtorFn<T> = fn(&[ScriptValue]) -> Result<T, haphe::ScriptConvertError>;
@@ -212,7 +216,7 @@ struct FieldReg<T: 'static> {
 
 struct MethodReg<T: 'static> {
     name: &'static str,
-    f: ScriptMethodRef<T>,
+    f: CowMethodFn<T>,
 }
 
 struct MutMethodReg<T: 'static> {
@@ -261,11 +265,19 @@ pub(crate) struct LuaTypeBinder<T: 'static> {
     le: Option<fn(&T, &T) -> bool>,
     unm: Option<fn(&T) -> T>,
     bnot: Option<fn(&T) -> T>,
+    hash: Option<fn(&T) -> u64>,
+    debug: Option<fn(&T) -> String>,
     ariths: Vec<ArithEntry<T>>,
     iter: Option<fn(T) -> ScriptIter>,
     len: Option<fn(T) -> usize>,
     index: Option<ScriptMethodRef<T>>,
     newindex: Option<ScriptNewIndex<T>>,
+    call: Option<ScriptMethodRef<T>>,
+    call_async: Option<AsyncCowFn<T>>,
+    #[cfg(all(feature = "async", not(feature = "send")))]
+    async_methods: Vec<(&'static str, AsyncCowFn<T>)>,
+    #[cfg(all(feature = "async", not(feature = "send")))]
+    async_mut_methods: Vec<(&'static str, AsyncMutFn<T>)>,
     pairing: IterPairing,
     idiv_fallback: bool,
 }
@@ -284,11 +296,19 @@ impl<T: 'static + Clone + mlua::MaybeSend + mlua::MaybeSync> LuaTypeBinder<T> {
             le: None,
             unm: None,
             bnot: None,
+            hash: None,
+            debug: None,
             ariths: Vec::new(),
             iter: None,
             len: None,
             index: None,
             newindex: None,
+            call: None,
+            call_async: None,
+            #[cfg(all(feature = "async", not(feature = "send")))]
+            async_methods: Vec::new(),
+            #[cfg(all(feature = "async", not(feature = "send")))]
+            async_mut_methods: Vec::new(),
             pairing: IterPairing::default(),
             idiv_fallback: false,
         }
@@ -311,17 +331,38 @@ impl<T: 'static + Clone + mlua::MaybeSend + mlua::MaybeSync> LuaTypeBinder<T> {
 
     /// Apply all collected registrations to the Lua state.
     pub fn register(self, lua: &Lua, type_table: &mlua::Table) -> Result<(), LuaBindError> {
-        // Iterable types get an implicit portable `iter` method; a
-        // user-declared method with that name would silently shadow it.
-        if self.iter.is_some()
-            && self
-                .methods
-                .iter()
-                .map(|m| m.name)
-                .chain(self.mut_methods.iter().map(|m| m.name))
-                .any(|name| name == "iter")
-        {
-            return Err(LuaBindError::ReservedMethod { name: "iter" });
+        // Some traits register implicit portable methods (`iter` on
+        // iterable types, `hash` for `Hash`, `debug` for `Debug`); a
+        // user-declared method with one of those names would silently
+        // shadow it.
+        for (reserved, taken) in [
+            ("iter", self.iter.is_some()),
+            ("hash", self.hash.is_some()),
+            ("debug", self.debug.is_some()),
+        ] {
+            if taken
+                && self
+                    .methods
+                    .iter()
+                    .map(|m| m.name)
+                    .chain(self.mut_methods.iter().map(|m| m.name))
+                    .any(|name| name == reserved)
+            {
+                return Err(LuaBindError::ReservedMethod { name: reserved });
+            }
+        }
+        // Constructors land on the type table by name; a duplicate (e.g. a
+        // user constructor named `default` next to the implicit one from
+        // `traits(Default)`) would silently overwrite.
+        for (i, ctor) in self.constructors.iter().enumerate() {
+            if self.constructors[..i].iter().any(|c| c.name == ctor.name) {
+                return Err(LuaBindError::DuplicateConstructor { name: ctor.name });
+            }
+        }
+        // Lua has exactly one `__call` metamethod: a type declaring both
+        // Call and AsyncCall is ambiguous — refuse rather than pick.
+        if self.call.is_some() && self.call_async.is_some() {
+            return Err(LuaBindError::AmbiguousCall);
         }
         // Constructors → Lua functions on the type table.
         for ctor in &self.constructors {
@@ -363,10 +404,63 @@ impl<T: 'static + Clone + mlua::MaybeSend + mlua::MaybeSync> LuaTypeBinder<T> {
                     let this = ud.borrow::<T>()?;
                     let sv_args: Vec<ScriptValue> =
                         v.iter().map(lua_to_script).collect::<mlua::Result<_>>()?;
-                    let result =
-                        f(&*this, &sv_args).map_err(|e| mlua::Error::runtime(e.to_string()))?;
+                    // Borrowed carrier while the guard is held: zero clones
+                    // for `&self`; a consuming method clones inside the
+                    // wrapper via `into_owned`.
+                    let result = f(ScriptCow::Borrowed(&this), &sv_args)
+                        .map_err(|e| mlua::Error::runtime(e.to_string()))?;
                     script_to_lua(lua, result)
                 });
+            }
+
+            // Async methods: value acquisition is CLONE (like the async
+            // call metamethod), so the future owns its value and borrows
+            // nothing. NOTE the consequence for `&mut self` receivers: the
+            // CLONE mutates, not the bound userdata. mlua's plain async
+            // methods exist on every Lua version (unlike async metamethods)
+            // but still require its `async` feature and, under `send`,
+            // `Send` futures — those combos are rejected in `method_async`.
+            #[cfg(all(feature = "async", not(feature = "send")))]
+            for (name, f) in &self.async_methods {
+                let f = *f;
+                reg.add_async_method(
+                    *name,
+                    move |lua, this: mlua::UserDataRef<T>, args: mlua::MultiValue| {
+                        let sv_args: mlua::Result<Vec<ScriptValue>> =
+                            args.into_vec().iter().map(lua_to_script).collect();
+                        async move {
+                            // The async block owns the guard; the wrapper's
+                            // future borrows it — zero-clone dispatch.
+                            let sv_args = sv_args?;
+                            let out = f(ScriptCow::Borrowed(&this), &sv_args)
+                                .await
+                                .map_err(|e| mlua::Error::runtime(e.to_string()))?;
+                            script_to_lua(&lua, out)
+                        }
+                    },
+                );
+            }
+            // `&mut self` async methods: the mutable guard is held across
+            // awaits, so the wrapper's future mutates the bound userdata in
+            // place — script-visible mutation persists.
+            #[cfg(all(feature = "async", not(feature = "send")))]
+            for (name, f) in &self.async_mut_methods {
+                let f = *f;
+                reg.add_async_method_mut(
+                    *name,
+                    move |lua, this: mlua::UserDataRefMut<T>, args: mlua::MultiValue| {
+                        let sv_args: mlua::Result<Vec<ScriptValue>> =
+                            args.into_vec().iter().map(lua_to_script).collect();
+                        async move {
+                            let mut this = this;
+                            let sv_args = sv_args?;
+                            let out = f(&mut this, &sv_args)
+                                .await
+                                .map_err(|e| mlua::Error::runtime(e.to_string()))?;
+                            script_to_lua(&lua, out)
+                        }
+                    },
+                );
             }
 
             // Methods (&mut self).
@@ -518,6 +612,25 @@ impl<T: 'static + Clone + mlua::MaybeSend + mlua::MaybeSync> LuaTypeBinder<T> {
                 });
             }
 
+            // Lua has no hashing protocol; a portable method is the
+            // native-ish surface, mirroring `iter()`. The u64 digest is
+            // reinterpreted as Lua's signed 64-bit integer.
+            if let Some(f) = self.hash {
+                reg.add_method("hash", move |_, this: &T, ()| Ok(f(this) as i64));
+            }
+            // Debug formatting lands in mlua's own `__todebugstring` slot
+            // (an ungated mlua extension consulted before `__tostring` when
+            // Rust pretty-formats the userdata), plus a portable
+            // `obj:debug()` method — scripts cannot reach the metamethod
+            // through mlua's protected metatables. Same native-slot +
+            // portable-companion pattern as `__pairs`/`iter()`.
+            if let Some(f) = self.debug {
+                reg.add_meta_method(MetaMethod::ToDebugString, move |_, this: &T, ()| {
+                    Ok(f(this))
+                });
+                reg.add_method("debug", move |_, this: &T, ()| Ok(f(this)));
+            }
+
             // Indexing. mlua consults registered fields and methods first
             // and falls back to these custom metamethods only for misses
             // (its generated `__index`/`__newindex` chain), so `obj.field`,
@@ -539,6 +652,52 @@ impl<T: 'static + Clone + mlua::MaybeSend + mlua::MaybeSync> LuaTypeBinder<T> {
                         let k = lua_to_script(&key)?;
                         let v = lua_to_script(&value)?;
                         f(this, &[k, v]).map_err(|e| mlua::Error::runtime(e.to_string()))
+                    },
+                );
+            }
+
+            // Calling. `__call` exists on every Lua version.
+            if let Some(f) = self.call {
+                reg.add_meta_method(
+                    MetaMethod::Call,
+                    move |lua, this: &T, args: mlua::MultiValue| {
+                        let sv_args: Vec<ScriptValue> = args
+                            .into_vec()
+                            .iter()
+                            .map(lua_to_script)
+                            .collect::<mlua::Result<_>>()?;
+                        let out =
+                            f(this, &sv_args).map_err(|e| mlua::Error::runtime(e.to_string()))?;
+                        script_to_lua(lua, out)
+                    },
+                );
+            }
+            // Async call: value acquisition is CLONE (like iteration), so
+            // the future owns its value and borrows nothing. mlua only
+            // offers async metamethods with its `async` feature and not on
+            // Lua 5.1/Luau; under `send`, mlua demands `Send` futures while
+            // `ScriptCallFuture` is deliberately not — all those combos are
+            // rejected descriptively in `meta_call_async` instead.
+            #[cfg(all(
+                feature = "async",
+                not(feature = "send"),
+                not(any(feature = "lua51", feature = "luau"))
+            ))]
+            if let Some(f) = self.call_async {
+                reg.add_async_meta_method(
+                    MetaMethod::Call,
+                    move |lua, this: mlua::UserDataRef<T>, args: mlua::MultiValue| {
+                        let sv_args: mlua::Result<Vec<ScriptValue>> =
+                            args.into_vec().iter().map(lua_to_script).collect();
+                        async move {
+                            // Borrowed through the guard the async block
+                            // owns — zero-clone dispatch.
+                            let sv_args = sv_args?;
+                            let out = f(ScriptCow::Borrowed(&this), &sv_args)
+                                .await
+                                .map_err(|e| mlua::Error::runtime(e.to_string()))?;
+                            script_to_lua(&lua, out)
+                        }
                     },
                 );
             }
@@ -719,11 +878,7 @@ impl<T: 'static + Clone + mlua::MaybeSend + mlua::MaybeSync> TypeBinder<T> for L
         Ok(())
     }
 
-    fn method_ref(
-        &mut self,
-        name: &'static str,
-        f: fn(&T, &[ScriptValue]) -> Result<ScriptValue, haphe::ScriptConvertError>,
-    ) -> Result<(), Self::Error> {
+    fn method(&mut self, name: &'static str, f: CowMethodFn<T>) -> Result<(), Self::Error> {
         self.methods.push(MethodReg { name, f });
         Ok(())
     }
@@ -734,15 +889,6 @@ impl<T: 'static + Clone + mlua::MaybeSend + mlua::MaybeSync> TypeBinder<T> for L
         f: fn(&mut T, &[ScriptValue]) -> Result<ScriptValue, haphe::ScriptConvertError>,
     ) -> Result<(), Self::Error> {
         self.mut_methods.push(MutMethodReg { name, f });
-        Ok(())
-    }
-
-    fn method_owned(
-        &mut self,
-        _name: &'static str,
-        _f: fn(T, &[ScriptValue]) -> Result<ScriptValue, haphe::ScriptConvertError>,
-    ) -> Result<(), Self::Error> {
-        // TODO: owned methods need special handling in mlua
         Ok(())
     }
 
@@ -761,6 +907,14 @@ impl<T: 'static + Clone + mlua::MaybeSend + mlua::MaybeSync> TypeBinder<T> for L
     }
     fn meta_concat(&mut self, f: fn(&T) -> String) -> Result<(), Self::Error> {
         self.concat = Some(f);
+        Ok(())
+    }
+    fn meta_hash(&mut self, f: fn(&T) -> u64) -> Result<(), Self::Error> {
+        self.hash = Some(f);
+        Ok(())
+    }
+    fn meta_debug(&mut self, f: fn(&T) -> String) -> Result<(), Self::Error> {
+        self.debug = Some(f);
         Ok(())
     }
     fn meta_eq(&mut self, f: fn(&T, &T) -> bool) -> Result<(), Self::Error> {
@@ -820,6 +974,102 @@ impl<T: 'static + Clone + mlua::MaybeSend + mlua::MaybeSync> TypeBinder<T> for L
     ) -> Result<(), Self::Error> {
         self.newindex = Some(f);
         Ok(())
+    }
+    fn meta_call(
+        &mut self,
+        f: fn(&T, &[ScriptValue]) -> Result<ScriptValue, haphe::ScriptConvertError>,
+    ) -> Result<(), Self::Error> {
+        self.call = Some(f);
+        Ok(())
+    }
+    fn meta_call_async(&mut self, f: AsyncCowFn<T>) -> Result<(), Self::Error> {
+        #[cfg(not(feature = "async"))]
+        {
+            let _ = f;
+            Err(LuaBindError::UnsupportedAsyncCall {
+                reason: "enable this backend's `async` feature",
+            })
+        }
+        #[cfg(all(feature = "async", feature = "send"))]
+        {
+            let _ = f;
+            Err(LuaBindError::UnsupportedAsyncCall {
+                reason: "the `send` feature demands `Send` futures, and async call \
+                         futures are deliberately not Send",
+            })
+        }
+        #[cfg(all(
+            feature = "async",
+            not(feature = "send"),
+            any(feature = "lua51", feature = "luau")
+        ))]
+        {
+            let _ = f;
+            Err(LuaBindError::UnsupportedAsyncCall {
+                reason: "mlua has no async metamethods on Lua 5.1 or Luau",
+            })
+        }
+        #[cfg(all(
+            feature = "async",
+            not(feature = "send"),
+            not(any(feature = "lua51", feature = "luau"))
+        ))]
+        {
+            self.call_async = Some(f);
+            Ok(())
+        }
+    }
+    fn method_async(&mut self, name: &'static str, f: AsyncCowFn<T>) -> Result<(), Self::Error> {
+        #[cfg(not(feature = "async"))]
+        {
+            let _ = f;
+            Err(LuaBindError::UnsupportedAsyncMethod {
+                name,
+                reason: "enable this backend's `async` feature",
+            })
+        }
+        #[cfg(all(feature = "async", feature = "send"))]
+        {
+            let _ = f;
+            Err(LuaBindError::UnsupportedAsyncMethod {
+                name,
+                reason: "the `send` feature demands `Send` futures, and async method \
+                         futures are deliberately not Send",
+            })
+        }
+        #[cfg(all(feature = "async", not(feature = "send")))]
+        {
+            self.async_methods.push((name, f));
+            Ok(())
+        }
+    }
+    fn method_async_mut(
+        &mut self,
+        name: &'static str,
+        f: AsyncMutFn<T>,
+    ) -> Result<(), Self::Error> {
+        #[cfg(not(feature = "async"))]
+        {
+            let _ = f;
+            Err(LuaBindError::UnsupportedAsyncMethod {
+                name,
+                reason: "enable this backend's `async` feature",
+            })
+        }
+        #[cfg(all(feature = "async", feature = "send"))]
+        {
+            let _ = f;
+            Err(LuaBindError::UnsupportedAsyncMethod {
+                name,
+                reason: "the `send` feature demands `Send` futures, and async method \
+                         futures are deliberately not Send",
+            })
+        }
+        #[cfg(all(feature = "async", not(feature = "send")))]
+        {
+            self.async_mut_methods.push((name, f));
+            Ok(())
+        }
     }
 }
 

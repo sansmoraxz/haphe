@@ -32,9 +32,18 @@ pub enum LuaBindError {
         name: &'static str,
     },
     /// A user-declared method collides with a method this backend registers
-    /// implicitly (the `iter` method on iterable types).
+    /// implicitly (the `iter` method on iterable types, `hash` for `Hash`,
+    /// `debug` for `Debug`).
     ReservedMethod {
         /// The colliding method name.
+        name: &'static str,
+    },
+    /// Two constructors share a name on one type's table (e.g. a declared
+    /// constructor named `default` next to the implicit one from
+    /// `traits(Default)`); the later registration would silently overwrite
+    /// the earlier.
+    DuplicateConstructor {
+        /// The colliding constructor name.
         name: &'static str,
     },
     /// An operator was declared that the configured Lua version has no
@@ -43,6 +52,22 @@ pub enum LuaBindError {
     UnsupportedOperator {
         /// The operator's Rust trait method name (`bitand`, `shl`, ...).
         op: &'static str,
+    },
+    /// An `AsyncCall` declaration cannot be represented in this
+    /// configuration.
+    UnsupportedAsyncCall {
+        /// What is missing or conflicting.
+        reason: &'static str,
+    },
+    /// A type declares both `Call` and `AsyncCall`, but Lua has exactly one
+    /// `__call` metamethod — the binding is ambiguous.
+    AmbiguousCall,
+    /// An `async` method cannot be represented in this configuration.
+    UnsupportedAsyncMethod {
+        /// The method's exposed name.
+        name: &'static str,
+        /// What is missing or conflicting.
+        reason: &'static str,
     },
 }
 
@@ -89,7 +114,34 @@ impl std::fmt::Display for LuaBindError {
                 write!(
                     f,
                     "method `{name}` collides with the implicit `{name}` method this \
-                     backend registers on iterable types; rename the method"
+                     backend registers for the declared trait; rename the method"
+                )
+            }
+            Self::DuplicateConstructor { name } => {
+                write!(
+                    f,
+                    "two constructors named `{name}` target one type table; the later \
+                     registration would silently overwrite the earlier (note that \
+                     `traits(Default)` registers an implicit `default` constructor)"
+                )
+            }
+            Self::UnsupportedAsyncCall { reason } => {
+                write!(
+                    f,
+                    "async call (`AsyncCall`) cannot be bound in this configuration: {reason}"
+                )
+            }
+            Self::UnsupportedAsyncMethod { name, reason } => {
+                write!(
+                    f,
+                    "async method `{name}` cannot be bound in this configuration: {reason}"
+                )
+            }
+            Self::AmbiguousCall => {
+                write!(
+                    f,
+                    "type declares both `Call` and `AsyncCall`, but Lua has exactly one \
+                     `__call` metamethod; declare one of them"
                 )
             }
             Self::UnsupportedOperator { op } => {
@@ -114,7 +166,11 @@ impl std::error::Error for LuaBindError {
             Self::MissingForeignFunction { .. } => None,
             Self::GenericForeignInterface { .. } => None,
             Self::ReservedMethod { .. } => None,
+            Self::DuplicateConstructor { .. } => None,
             Self::UnsupportedOperator { .. } => None,
+            Self::UnsupportedAsyncCall { .. } => None,
+            Self::AmbiguousCall => None,
+            Self::UnsupportedAsyncMethod { .. } => None,
         }
     }
 }

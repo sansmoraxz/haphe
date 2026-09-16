@@ -557,3 +557,69 @@ fn opaque_primitive_newtype_keeps_named_alias() {
     let s = std::str::from_utf8(&output.files[0].content).unwrap();
     assert!(s.contains("---@alias Enabled boolean"), "got:\n{s}");
 }
+
+#[test]
+fn callable_types_annotated_as_overloads() {
+    /// A callable accumulator.
+    #[derive(Script, Clone)]
+    struct Acc {
+        base: i64,
+    }
+    // Call is declared without `methods`, so only the trait matters here.
+    #[derive(Script, Clone)]
+    #[script(traits(Call(args = (i64, i64), output = i64)))]
+    struct Summer {
+        base: i64,
+    }
+    impl haphe::ops::Call<(i64, i64)> for Summer {
+        type Output = i64;
+        fn call(&self, (a, b): (i64, i64)) -> i64 {
+            self.base + a + b
+        }
+    }
+    let _ = Acc { base: 0 };
+
+    haphe::registry! {
+        static CALL_REGISTRY = {
+            structs: [Summer],
+        };
+    }
+
+    let output = haphe::generate(&LuaDeclGenerator::new(), &CALL_REGISTRY).unwrap();
+    let s = std::str::from_utf8(&output.files[0].content).unwrap();
+    assert!(
+        s.contains("---@overload fun(a1: integer, a2: integer): integer"),
+        "got:\n{s}"
+    );
+}
+
+// The decl generator's capabilities key `async_fns` off the `async`
+// feature, so a registry with async methods only validates there.
+#[cfg(feature = "async")]
+#[test]
+fn async_methods_appear_in_stubs() {
+    /// Talks to a remote service.
+    #[derive(Script, Clone)]
+    #[script(thread_safety = none, methods)]
+    struct Client {
+        host: String,
+    }
+    #[script]
+    impl Client {
+        async fn get(&self, path: String) -> String {
+            format!("{}/{path}", self.host)
+        }
+    }
+
+    haphe::registry! {
+        static ASYNC_REGISTRY = {
+            structs: [Client],
+        };
+    }
+
+    let output = haphe::generate(&LuaDeclGenerator::new(), &ASYNC_REGISTRY).unwrap();
+    let s = std::str::from_utf8(&output.files[0].content).unwrap();
+    // Async methods stub like sync ones — the Lua-side calling convention
+    // is identical when mlua drives the future.
+    assert!(s.contains("function Client:get("), "got:\n{s}");
+}
