@@ -11,6 +11,13 @@ readme = "README.md"
 # default features (cranelift, async, cache, gc, wat, ...).
 runtime = ["dep:wasmtime"]
 
+# haphe naming extension for generic functions and generic foreign
+# interfaces: emits one deterministically-named monomorph per declared
+# instantiation (names derived purely from descriptors, reproducible across
+# builds). Without this feature such registries are rejected with a
+# descriptive error, since plain WIT dispatches by name only.
+generics = []
+
 # Individually selectable wasmtime extras (each implies `runtime`),
 
 # Additional compilation strategies

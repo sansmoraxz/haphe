@@ -568,3 +568,481 @@ fn generic_instance_resource_links() {
     let result = run_guest(&engine, &linker, (), GENERIC_GUEST).expect("guest instantiates");
     assert!(matches!(result, Val::Float64(_)));
 }
+
+// ---------------------------------------------------------------------------
+// Foreign interfaces: Rust calls into guest exports
+// ---------------------------------------------------------------------------
+
+/// Host-side math the Rust program calls out to.
+#[script(foreign, thread_safety = none)]
+trait HostMath {
+    fn add(&self, a: i32, b: i32) -> i32;
+}
+
+/// Guest exporting the `host-math` foreign interface.
+const MATH_GUEST: &str = r#"
+(component
+  (core module $m
+    (func (export "add") (param i32 i32) (result i32)
+      (i32.add (local.get 0) (local.get 1))))
+  (core instance $mi (instantiate $m))
+  (func $add (param "a" s32) (param "b" s32) (result s32)
+    (canon lift (core func $mi "add")))
+  (instance $i (export "add" (func $add)))
+  (export "haphe:demo/host-math" (instance $i))
+)
+"#;
+
+/// Same surface, but the implementation traps.
+const TRAPPING_MATH_GUEST: &str = r#"
+(component
+  (core module $m
+    (func (export "add") (param i32 i32) (result i32)
+      (unreachable)))
+  (core instance $mi (instantiate $m))
+  (func $add (param "a" s32) (param "b" s32) (result s32)
+    (canon lift (core func $mi "add")))
+  (instance $i (export "add" (func $add)))
+  (export "haphe:demo/host-math" (instance $i))
+)
+"#;
+
+fn foreign_handle_from_wat<H: haphe::ScriptForeign + haphe::ForeignHandle>(
+    guest_wat: &str,
+) -> Result<H, WasmBindError> {
+    let engine = Engine::default();
+    let component = Component::new(&engine, wat::parse_str(guest_wat).unwrap()).unwrap();
+    let linker: Linker<()> = Linker::new(&engine);
+    let mut store = wasmtime::Store::new(&engine, ());
+    let instance = linker.instantiate(&mut store, &component).unwrap();
+    let store = std::sync::Arc::new(std::sync::Mutex::new(store));
+    haphe_wit::foreign_handle("haphe:demo", store, &instance)
+}
+
+#[test]
+fn foreign_handle_dispatches_into_guest_export() {
+    let math: HostMathHandle = foreign_handle_from_wat(MATH_GUEST).unwrap();
+    assert_eq!(math.add(2, 3), 5);
+    assert_eq!(math.add(-10, 4), -6);
+}
+
+#[test]
+fn missing_foreign_instance_is_reported() {
+    let Err(err) = foreign_handle_from_wat::<HostMathHandle>("(component)") else {
+        panic!("expected an error");
+    };
+    assert!(
+        matches!(err, WasmBindError::MissingForeignInstance { ref interface }
+            if interface == "haphe:demo/host-math"),
+        "got: {err:?}"
+    );
+}
+
+#[test]
+fn missing_foreign_function_is_reported() {
+    const EMPTY_INSTANCE_GUEST: &str = r#"
+(component
+  (core module $m
+    (func (export "other") (result i32) (i32.const 0)))
+  (core instance $mi (instantiate $m))
+  (func $other (result s32) (canon lift (core func $mi "other")))
+  (instance $i (export "other" (func $other)))
+  (export "haphe:demo/host-math" (instance $i))
+)
+"#;
+    let Err(err) = foreign_handle_from_wat::<HostMathHandle>(EMPTY_INSTANCE_GUEST) else {
+        panic!("expected an error");
+    };
+    assert!(
+        matches!(err, WasmBindError::MissingForeignExport { ref function, .. }
+            if function == "add"),
+        "got: {err:?}"
+    );
+}
+
+#[test]
+#[should_panic(expected = "foreign function `add` failed")]
+fn trapping_guest_export_panics_through_non_result_method() {
+    let math: HostMathHandle = foreign_handle_from_wat(TRAPPING_MATH_GUEST).unwrap();
+    math.add(1, 1);
+}
+
+// ---------------------------------------------------------------------------
+// Generic foreign interfaces (`generics` naming extension)
+// ---------------------------------------------------------------------------
+
+/// Host-side scaling, generic over the result type.
+#[cfg(feature = "generics")]
+#[script(foreign, thread_safety = none)]
+trait Scaler<T> {
+    fn scale(&self, by: i64) -> T;
+}
+
+#[cfg(feature = "generics")]
+const SCALER_GUEST: &str = r#"
+(component
+  (core module $m
+    (func (export "scale") (param i64) (result i64)
+      (i64.mul (local.get 0) (i64.const 2))))
+  (core instance $mi (instantiate $m))
+  (func $scale (param "by" s64) (result s64)
+    (canon lift (core func $mi "scale")))
+  (instance $i (export "scale" (func $scale)))
+  (export "haphe:demo/scaler-s64" (instance $i))
+)
+"#;
+
+/// The handle's type arguments resolve the monomorphized instance export
+/// deterministically (same mangling the generator emits).
+#[cfg(feature = "generics")]
+#[test]
+fn generic_foreign_handle_resolves_monomorphized_export() {
+    let scaler: ScalerHandle<i64> = foreign_handle_from_wat(SCALER_GUEST).unwrap();
+    assert_eq!(scaler.scale(21), 42);
+}
+
+// ---------------------------------------------------------------------------
+// Composite values through the foreign caller
+// ---------------------------------------------------------------------------
+
+/// A plain data pair (WIT record).
+#[derive(Script, Clone, Debug, PartialEq)]
+struct Pair {
+    a: f64,
+    b: f64,
+}
+
+impl From<Pair> for haphe::ScriptValue {
+    fn from(p: Pair) -> Self {
+        haphe::ScriptValue::Map(vec![
+            ("a".to_string(), haphe::ScriptValue::F64(p.a)),
+            ("b".to_string(), haphe::ScriptValue::F64(p.b)),
+        ])
+    }
+}
+
+impl haphe::FromScript for Pair {
+    fn from_script(v: haphe::ScriptValue) -> Result<Self, haphe::ScriptConvertError> {
+        let err = haphe::ScriptConvertError {
+            expected: "Pair",
+            got: v.variant_name(),
+        };
+        let haphe::ScriptValue::Map(pairs) = v else {
+            return Err(err);
+        };
+        let field = |name: &str| {
+            pairs
+                .iter()
+                .find(|(k, _)| k == name)
+                .and_then(|(_, v)| match v {
+                    haphe::ScriptValue::F64(n) => Some(*n),
+                    haphe::ScriptValue::I64(n) => Some(*n as f64),
+                    _ => None,
+                })
+                .ok_or(haphe::ScriptConvertError {
+                    expected: "Pair field",
+                    got: "missing or non-numeric field",
+                })
+        };
+        Ok(Pair {
+            a: field("a")?,
+            b: field("b")?,
+        })
+    }
+}
+
+/// A unit enum (WIT enum); conversions are derive-generated.
+#[derive(Script, Debug, PartialEq)]
+enum Fruit {
+    Apple,
+    DragonFruit,
+}
+
+/// Host-side composite operations.
+#[script(foreign, thread_safety = none)]
+trait Composite {
+    fn sum_pair(&self, p: Pair) -> f64;
+    fn pick(&self, n: i64) -> Fruit;
+    fn rate(&self, f: Fruit) -> i64;
+}
+
+const COMPOSITE_GUEST: &str = r#"
+(component
+  (core module $m
+    (func (export "sum-pair") (param f64 f64) (result f64)
+      (f64.add (local.get 0) (local.get 1)))
+    (func (export "pick") (param i64) (result i32)
+      (i32.wrap_i64 (local.get 0)))
+    (func (export "rate") (param i32) (result i64)
+      (i64.extend_i32_u (local.get 0))))
+  (core instance $mi (instantiate $m))
+  (type $pair (record (field "a" f64) (field "b" f64)))
+  (type $fruit (enum "apple" "dragon-fruit"))
+  (func $sum-pair (param "p" $pair) (result f64)
+    (canon lift (core func $mi "sum-pair")))
+  (func $pick (param "n" s64) (result $fruit)
+    (canon lift (core func $mi "pick")))
+  (func $rate (param "f" $fruit) (result s64)
+    (canon lift (core func $mi "rate")))
+  (instance $i
+    (export "pair" (type $pair))
+    (export "fruit" (type $fruit))
+    (export "sum-pair" (func $sum-pair))
+    (export "pick" (func $pick))
+    (export "rate" (func $rate)))
+  (export "haphe:demo/composite" (instance $i))
+)
+"#;
+
+haphe::registry! {
+    pub static COMPOSITE_REGISTRY = {
+        structs: [Pair],
+        enums: [Fruit],
+        foreign: [CompositeHandle],
+    };
+}
+
+#[test]
+fn composite_values_cross_the_foreign_boundary() {
+    // Enum returns need the registry-aware caller: the guest's kebab case
+    // names are translated back to the declared variant names it carries.
+    let engine = Engine::default();
+    let component = Component::new(&engine, wat::parse_str(COMPOSITE_GUEST).unwrap()).unwrap();
+    let linker: Linker<()> = Linker::new(&engine);
+    let mut store = wasmtime::Store::new(&engine, ());
+    let instance = linker.instantiate(&mut store, &component).unwrap();
+    let store = std::sync::Arc::new(std::sync::Mutex::new(store));
+    let validated = COMPOSITE_REGISTRY.validate().unwrap();
+    let comp: CompositeHandle =
+        haphe_wit::foreign_handle_in("haphe:demo", store, &instance, &validated).unwrap();
+    // Record param (ScriptValue::Map -> Val::Record).
+    assert_eq!(comp.sum_pair(Pair { a: 2.0, b: 3.0 }), 5.0);
+    // Enum return: the guest's "dragon-fruit" is translated to the declared
+    // `DragonFruit`, which the derive-generated FromScript matches exactly.
+    assert_eq!(comp.pick(1), Fruit::DragonFruit);
+    assert_eq!(comp.pick(0), Fruit::Apple);
+    // Enum param: the declared case lowers to the guest's spelling via the
+    // crate's kebab conversion.
+    assert_eq!(comp.rate(Fruit::Apple), 0);
+    assert_eq!(comp.rate(Fruit::DragonFruit), 1);
+}
+
+// ---------------------------------------------------------------------------
+// True async dispatch
+// ---------------------------------------------------------------------------
+
+/// Async host math (dispatching into the same `host-math` guest surface).
+#[script(foreign, thread_safety = none, rename = "HostMath")]
+trait AsyncMath {
+    async fn add(&self, a: i32, b: i32) -> i32;
+}
+
+fn block_on<F: Future>(mut fut: F) -> F::Output {
+    let mut fut = unsafe { std::pin::Pin::new_unchecked(&mut fut) };
+    let waker = std::task::Waker::noop();
+    let mut cx = std::task::Context::from_waker(waker);
+    loop {
+        if let std::task::Poll::Ready(out) = fut.as_mut().poll(&mut cx) {
+            return out;
+        }
+    }
+}
+
+#[test]
+fn async_caller_dispatches_via_call_async() {
+    let engine = Engine::default();
+    let component = Component::new(&engine, wat::parse_str(MATH_GUEST).unwrap()).unwrap();
+    let linker: Linker<()> = Linker::new(&engine);
+    let mut store = wasmtime::Store::new(&engine, ());
+    let instance = block_on(linker.instantiate_async(&mut store, &component)).unwrap();
+    let store = std::sync::Arc::new(std::sync::Mutex::new(store));
+    let math: AsyncMathHandle =
+        haphe_wit::foreign_handle_async("haphe:demo", store, &instance).unwrap();
+    assert_eq!(block_on(math.add(20, 22)), 42);
+}
+
+/// A sync method through an async caller refuses with a clear error.
+#[test]
+#[should_panic(expected = "asynchronously")]
+fn sync_dispatch_through_async_caller_is_refused() {
+    let engine = Engine::default();
+    let component = Component::new(&engine, wat::parse_str(MATH_GUEST).unwrap()).unwrap();
+    let linker: Linker<()> = Linker::new(&engine);
+    let mut store = wasmtime::Store::new(&engine, ());
+    let instance = block_on(linker.instantiate_async(&mut store, &component)).unwrap();
+    let store = std::sync::Arc::new(std::sync::Mutex::new(store));
+    let math: HostMathHandle =
+        haphe_wit::foreign_handle_async("haphe:demo", store, &instance).unwrap();
+    math.add(1, 1);
+}
+
+// ---------------------------------------------------------------------------
+// Registry-aware generic resolution (`generics` feature)
+// ---------------------------------------------------------------------------
+
+/// Tags a value with a score.
+#[cfg(feature = "generics")]
+#[script(foreign, thread_safety = none)]
+trait Tagger<T> {
+    fn tag(&self, value: T) -> f64;
+}
+
+#[cfg(feature = "generics")]
+haphe::registry! {
+    pub static GENERIC_FOREIGN_REGISTRY = {
+        structs: [Pair],
+        foreign: [TaggerHandle<Pair>],
+    };
+}
+
+#[cfg(feature = "generics")]
+const TAGGER_GUEST: &str = r#"
+(component
+  (core module $m
+    (func (export "tag") (param f64 f64) (result f64)
+      (f64.add (local.get 0) (local.get 1))))
+  (core instance $mi (instantiate $m))
+  (type $pair (record (field "a" f64) (field "b" f64)))
+  (func $tag (param "value" $pair) (result f64)
+    (canon lift (core func $mi "tag")))
+  (instance $i
+    (export "pair" (type $pair))
+    (export "tag" (func $tag)))
+  (export "haphe:demo/tagger-pair" (instance $i))
+)
+"#;
+
+#[cfg(feature = "generics")]
+#[test]
+fn registered_type_args_resolve_via_registry_aware_mangling() {
+    let engine = Engine::default();
+    let component = Component::new(&engine, wat::parse_str(TAGGER_GUEST).unwrap()).unwrap();
+    let linker: Linker<()> = Linker::new(&engine);
+    let mut store = wasmtime::Store::new(&engine, ());
+    let instance = linker.instantiate(&mut store, &component).unwrap();
+    let store = std::sync::Arc::new(std::sync::Mutex::new(store));
+
+    // The plain mangler cannot name registered types.
+    let err =
+        haphe_wit::foreign_handle::<TaggerHandle<Pair>, _>("haphe:demo", store.clone(), &instance)
+            .err()
+            .expect("plain mangling refuses registered type args");
+    assert!(
+        err.to_string().contains("not supported at runtime"),
+        "got: {err}"
+    );
+
+    // Registry-aware mangling resolves `tagger-pair` and dispatches.
+    let validated = GENERIC_FOREIGN_REGISTRY.validate().unwrap();
+    let tagger: TaggerHandle<Pair> =
+        haphe_wit::foreign_handle_in("haphe:demo", store, &instance, &validated).unwrap();
+    assert_eq!(tagger.tag(Pair { a: 1.5, b: 2.5 }), 4.0);
+}
+
+/// Two descriptor functions must never resolve to one guest export: a
+/// hand-written `echo_s64` next to a monomorphized `echo<i64>` collides at
+/// caller construction, before any guest lookup.
+#[cfg(feature = "generics")]
+#[test]
+fn colliding_export_names_are_rejected_at_caller_construction() {
+    use haphe::{
+        ForeignInterfaceDescriptor, FunctionDescriptor, GenericParam, Ownership, Receiver,
+        ThreadSafety, TypeDescriptor, TypeId,
+    };
+
+    const S64: TypeDescriptor<'static> = TypeDescriptor::Primitive(haphe::PrimitiveType::I64);
+    const T: TypeDescriptor<'static> = TypeDescriptor::GenericParam("T");
+    static T_PARAM: [GenericParam<'static>; 1] = [GenericParam {
+        name: "T",
+        bounds: &[],
+        default: None,
+    }];
+    static INSTS: [&[TypeDescriptor<'static>]; 1] = [&[S64]];
+    const fn desc_fn(
+        name: &'static str,
+        generic_params: &'static [GenericParam<'static>],
+        instantiations: &'static [&'static [TypeDescriptor<'static>]],
+        return_type: &'static TypeDescriptor<'static>,
+    ) -> FunctionDescriptor<'static> {
+        FunctionDescriptor {
+            name,
+            doc: None,
+            receiver: Some(Receiver::Ref),
+            generic_params,
+            instantiations,
+            params: &[],
+            return_type,
+            return_ownership: Ownership::Owned,
+            is_async: false,
+            error_kind: None,
+        }
+    }
+    static FNS: [FunctionDescriptor<'static>; 2] = [
+        desc_fn("echo_s64", &[], &[], &S64),
+        desc_fn("echo", &T_PARAM, &INSTS, &T),
+    ];
+    static DESC: ForeignInterfaceDescriptor<'static> = ForeignInterfaceDescriptor {
+        id: TypeId::new("Echoes"),
+        name: "Echoes",
+        doc: None,
+        generic_params: &[],
+        functions: &FNS,
+        thread_safety: ThreadSafety::NONE,
+    };
+
+    let engine = Engine::default();
+    let component = Component::new(&engine, wat::parse_str("(component)").unwrap()).unwrap();
+    let linker: Linker<()> = Linker::new(&engine);
+    let mut store = wasmtime::Store::new(&engine, ());
+    let instance = linker.instantiate(&mut store, &component).unwrap();
+    let store = std::sync::Arc::new(std::sync::Mutex::new(store));
+    let Err(err) = haphe_wit::foreign_caller("haphe:demo", store, &instance, &DESC, &[]) else {
+        panic!("expected a name collision error");
+    };
+    assert!(
+        matches!(
+            &err,
+            WasmBindError::Gen(haphe_wit::WitGenError::NameCollision { kebab, .. })
+                if kebab == "echo-s64"
+        ),
+        "got: {err:?}"
+    );
+}
+
+/// The package address may embed a version (`ns:pkg@v`), which becomes part
+/// of the instance export name; malformed addresses are rejected up front.
+#[test]
+fn package_address_forms() {
+    let engine = Engine::default();
+    let component = Component::new(&engine, wat::parse_str("(component)").unwrap()).unwrap();
+    let linker: Linker<()> = Linker::new(&engine);
+    let mut store = wasmtime::Store::new(&engine, ());
+    let instance = linker.instantiate(&mut store, &component).unwrap();
+    let store = std::sync::Arc::new(std::sync::Mutex::new(store));
+
+    let Err(err) = haphe_wit::foreign_handle::<HostMathHandle, _>(
+        "haphe:demo@1.2.3",
+        store.clone(),
+        &instance,
+    ) else {
+        panic!("expected a missing-instance error");
+    };
+    assert!(
+        matches!(&err, WasmBindError::MissingForeignInstance { interface }
+            if interface == "haphe:demo/host-math@1.2.3"),
+        "got: {err:?}"
+    );
+
+    let Err(err) =
+        haphe_wit::foreign_handle::<HostMathHandle, _>("Not A Package", store, &instance)
+    else {
+        panic!("expected an invalid-address error");
+    };
+    assert!(
+        matches!(
+            &err,
+            WasmBindError::Gen(haphe_wit::WitGenError::InvalidPackageName(_))
+        ),
+        "got: {err:?}"
+    );
+}

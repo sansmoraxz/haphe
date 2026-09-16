@@ -4,11 +4,19 @@
 //! [`WitGenerator`] implements [`BindingGenerator`], turning a haphe type
 //! registry into a `.wit` document: modules become interfaces, structs become
 //! records or resources, enums become `enum`s or `variant`s, and a world
-//! imports every interface (the host provides the API, guest components
-//! consume it).
+//! lists every interface. Provided (Rust-implemented) interfaces and foreign
+//! (counterpart-implemented) interfaces map to `import`/`export` lines
+//! according to the configured [`WorldPerspective`].
 //!
 //! Identifiers are implicitly converted to kebab-case because the WIT grammar
 //! admits no other casing; see the crate README for details.
+//!
+//! With the `runtime` feature, the two directions split cleanly:
+//! `WasmBinder` binds provided (Rust-implemented) interfaces into a wasmtime
+//! `Linker`, while the free `foreign_handle`/`foreign_caller` functions (and
+//! their `_in`/`_async` variants) connect to a live instantiated component's
+//! foreign exports — no binder or registration machinery, just a store, an
+//! instance, and a package address.
 
 mod emit;
 mod model;
@@ -18,7 +26,10 @@ mod runtime;
 mod types;
 
 #[cfg(feature = "runtime")]
-pub use runtime::{WasmBindError, WasmBinder};
+pub use runtime::{
+    WasmBindError, WasmBinder, foreign_caller, foreign_caller_async, foreign_caller_in,
+    foreign_handle, foreign_handle_async, foreign_handle_in,
+};
 
 use std::fmt;
 
@@ -29,9 +40,27 @@ use haphe::{
 };
 
 use emit::Printer;
-use model::{Env, Plan};
+use model::{Direction, Env, Plan};
 use names::{NameMap, to_kebab};
 use types::{Pos, render_return, render_type};
+
+/// Which side of the component boundary the generated world is targeted by.
+///
+/// A world's `import`/`export` lines are written from the perspective of the
+/// component that targets it. The haphe program can sit on either side, so
+/// the mapping of provided (Rust-implemented) and foreign (counterpart-
+/// implemented) interfaces flips with the perspective.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WorldPerspective {
+    /// The world is targeted by the haphe program's counterpart (default):
+    /// provided interfaces are `import`s, foreign interfaces are `export`s.
+    #[default]
+    Peer,
+    /// The world is targeted by the haphe program itself (compiled as a
+    /// component): provided interfaces are `export`s, foreign interfaces are
+    /// `import`s.
+    Own,
+}
 
 /// How module constants are represented (WIT has no constants).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -44,7 +73,8 @@ pub enum ConstantMode {
     Skip,
 }
 
-/// Generates a WIT document with a world that imports every interface.
+/// Generates a WIT document with a world listing every interface, provided
+/// and foreign directions mapped per the configured [`WorldPerspective`].
 #[derive(Debug, Clone)]
 pub struct WitGenerator {
     package: String,
@@ -52,6 +82,7 @@ pub struct WitGenerator {
     world: String,
     default_interface: String,
     constants: ConstantMode,
+    perspective: WorldPerspective,
 }
 
 impl WitGenerator {
@@ -63,6 +94,7 @@ impl WitGenerator {
             world: "host".to_string(),
             default_interface: "types".to_string(),
             constants: ConstantMode::default(),
+            perspective: WorldPerspective::default(),
         }
     }
 
@@ -88,6 +120,13 @@ impl WitGenerator {
     /// Sets how module constants are represented.
     pub fn with_constant_mode(mut self, mode: ConstantMode) -> Self {
         self.constants = mode;
+        self
+    }
+
+    /// Sets which side of the component boundary targets the generated world
+    /// (default [`WorldPerspective::Peer`]).
+    pub fn with_world_perspective(mut self, perspective: WorldPerspective) -> Self {
+        self.perspective = perspective;
         self
     }
 }
@@ -134,6 +173,22 @@ pub enum WitGenError {
         /// The instantiation's mangled WIT name.
         name: String,
     },
+    /// A generic foreign interface; WIT dispatches by name and has no
+    /// generics, so monomorphized interfaces need a naming extension that is
+    /// not yet available.
+    GenericForeignInterface {
+        /// The interface's name.
+        name: String,
+    },
+    /// A generic function; WIT dispatches by name and has no generics, so
+    /// monomorphized functions need a naming extension that is not yet
+    /// available.
+    GenericFunction {
+        /// The containing interface's WIT name.
+        interface: String,
+        /// The function's name.
+        function: String,
+    },
 }
 
 impl fmt::Display for WitGenError {
@@ -167,6 +222,19 @@ impl fmt::Display for WitGenError {
             Self::UnregisteredInstantiation { name } => write!(
                 f,
                 "generic instantiation `{name}` is referenced but not listed in the registry"
+            ),
+            Self::GenericForeignInterface { name } => write!(
+                f,
+                "foreign interface `{name}` is generic; WIT dispatches by name only and \
+                 cannot distinguish instantiations"
+            ),
+            Self::GenericFunction {
+                interface,
+                function,
+            } => write!(
+                f,
+                "function `{function}` in interface `{interface}` is generic; WIT dispatches \
+                 by name only and cannot distinguish instantiations"
             ),
         }
     }
@@ -208,15 +276,21 @@ impl BindingGenerator for WitGenerator {
             if empty {
                 continue;
             }
-            emitted_ifaces.push(iface.name.clone());
+            emitted_ifaces.push((iface.name.clone(), iface.direction));
             p.line("");
             self.emit_interface(&mut p, registry, &plan, index)?;
         }
 
         p.line("");
         p.open(&format!("world {}", to_kebab(&self.world)));
-        for name in &emitted_ifaces {
-            p.line(&format!("import {name};"));
+        for (name, direction) in &emitted_ifaces {
+            let keyword = match (self.perspective, direction) {
+                (WorldPerspective::Peer, Direction::Provided)
+                | (WorldPerspective::Own, Direction::Foreign) => "import",
+                (WorldPerspective::Peer, Direction::Foreign)
+                | (WorldPerspective::Own, Direction::Provided) => "export",
+            };
+            p.line(&format!("{keyword} {name};"));
         }
         p.close();
 
@@ -253,7 +327,14 @@ impl WitGenerator {
         index: usize,
     ) -> Result<(), WitGenError> {
         let iface = &plan.interfaces[index];
+        let base_env = iface
+            .foreign_instance
+            .map(|i| plan.env_for(registry, &plan.instances[i]));
         p.doc(iface.doc);
+        if let Some(i) = iface.foreign_instance {
+            let marker = plan.instance_marker(&plan.instances[i])?;
+            p.doc(Some(&format!("haphe:generic-instance = {marker}")));
+        }
         p.open(&format!("interface {}", iface.name));
 
         for (owner, names) in plan.uses_for(registry, index)? {
@@ -329,8 +410,29 @@ impl WitGenerator {
         }
 
         for func in iface.functions {
-            let name = member_names.insert(func.name)?;
-            emit_function(p, func, None, &name, plan, None)?;
+            if func.generic_params.is_empty() {
+                let name = member_names.insert(func.name)?;
+                emit_function(p, func, None, &name, plan, base_env.as_ref())?;
+                continue;
+            }
+            // One deterministically-named monomorph per declared
+            // instantiation (`generics` feature; rejected in `Plan::build`
+            // otherwise).
+            for args in func.instantiations {
+                let mangled = plan.mangle_fn_instance(func.name, args, base_env.as_ref())?;
+                let name = member_names.insert(&mangled)?;
+                let env = plan.fn_env(func, args, base_env.as_ref());
+                let arg_names: Vec<String> = args
+                    .iter()
+                    .map(|a| plan.mangle_type(a, base_env.as_ref()))
+                    .collect::<Result<_, _>>()?;
+                p.doc(Some(&format!(
+                    "haphe:generic-instance = {}<{}>",
+                    func.name,
+                    arg_names.join(", ")
+                )));
+                emit_function(p, func, None, &name, plan, Some(&env))?;
+            }
         }
 
         if self.constants == ConstantMode::Getter {

@@ -123,6 +123,33 @@ fn parse_point(text: String) -> Result<Point, String> {
     })
 }
 
+/// Host-side notifications.
+#[script(foreign, thread_safety = none)]
+trait Notifier {
+    /// Sends a message to the embedder.
+    fn notify(&self, message: String);
+
+    #[script(error_kind = "IoError")]
+    fn moved(&self, to: Point) -> Result<u32, NotifyError>;
+
+    async fn flush(&self);
+}
+
+struct NotifyError;
+
+impl From<haphe::ForeignError> for NotifyError {
+    fn from(_: haphe::ForeignError) -> Self {
+        NotifyError
+    }
+}
+
+// Dispatch shuttles user-defined values as opaque userdata.
+impl From<Point> for haphe::ScriptValue {
+    fn from(p: Point) -> Self {
+        haphe::ScriptValue::UserData(haphe::OpaqueUserData::new(p))
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Registry
 // ---------------------------------------------------------------------------
@@ -131,6 +158,7 @@ haphe::registry! {
     pub static REGISTRY = {
         structs: [Point, Size],
         enums: [Color, Direction],
+        foreign: [NotifierHandle],
         modules: [
             mod geometry {
                 doc: "Geometry types and utilities",
@@ -519,4 +547,47 @@ fn stream_and_future_types_emit() {
         "got:\n{wit}"
     );
     assert!(wit.contains("value: stream<s32>,"), "got:\n{wit}");
+}
+
+// ---------------------------------------------------------------------------
+// Foreign interfaces
+// ---------------------------------------------------------------------------
+
+#[test]
+fn foreign_interface_is_emitted() {
+    let wit = generate();
+    assert!(
+        wit.contains("/// Host-side notifications.\ninterface notifier {"),
+        "got:\n{wit}"
+    );
+    // The `&self` receiver is dropped; params render normally.
+    assert!(
+        wit.contains("notify: func(message: string);"),
+        "got:\n{wit}"
+    );
+    // Owned `Point` param pulls a `use` from its defining interface, and
+    // `error_kind` wraps the return in `result<...>` with a doc line.
+    assert!(wit.contains("use geometry.{point};"), "got:\n{wit}");
+    assert!(wit.contains("/// Errors: IoError"), "got:\n{wit}");
+    assert!(
+        wit.contains("moved: func(to: point) -> result<u32>;"),
+        "got:\n{wit}"
+    );
+    assert!(wit.contains("flush: async func();"), "got:\n{wit}");
+}
+
+#[test]
+fn world_lists_foreign_interfaces_per_perspective() {
+    let wit = generate();
+    assert!(wit.contains("import geometry;"), "got:\n{wit}");
+    assert!(wit.contains("export notifier;"), "got:\n{wit}");
+    assert!(!wit.contains("import notifier;"), "got:\n{wit}");
+
+    // With the world targeted by the haphe program itself, the polarity flips.
+    let generator =
+        WitGenerator::new("haphe:demo").with_world_perspective(haphe_wit::WorldPerspective::Own);
+    let output = haphe::generate(&generator, &REGISTRY).unwrap();
+    let wit = String::from_utf8(output.files[0].content.clone()).unwrap();
+    assert!(wit.contains("export geometry;"), "got:\n{wit}");
+    assert!(wit.contains("import notifier;"), "got:\n{wit}");
 }

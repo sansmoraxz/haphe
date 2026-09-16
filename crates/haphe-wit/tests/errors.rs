@@ -466,3 +466,128 @@ fn instantiation_arity_mismatch_rejected_at_validation() {
         other => panic!("expected Invalid, got: {other:?}"),
     }
 }
+
+// ---------------------------------------------------------------------------
+// Foreign interfaces
+// ---------------------------------------------------------------------------
+
+const fn foreign_fn(
+    name: &'static str,
+    generic_params: &'static [haphe::GenericParam<'static>],
+    instantiations: &'static [&'static [TypeDescriptor<'static>]],
+    return_type: &'static TypeDescriptor<'static>,
+) -> FunctionDescriptor<'static> {
+    FunctionDescriptor {
+        name,
+        doc: None,
+        receiver: Some(Receiver::Ref),
+        generic_params,
+        instantiations,
+        params: &[],
+        return_type,
+        return_ownership: Ownership::Owned,
+        is_async: false,
+        error_kind: None,
+    }
+}
+
+const fn foreign_iface(
+    id: &'static str,
+    name: &'static str,
+    generic_params: &'static [haphe::GenericParam<'static>],
+    functions: &'static [FunctionDescriptor<'static>],
+) -> haphe::ForeignInterfaceDescriptor<'static> {
+    haphe::ForeignInterfaceDescriptor {
+        id: TypeId::new(id),
+        name,
+        doc: None,
+        generic_params,
+        functions,
+        thread_safety: ThreadSafety::NONE,
+    }
+}
+
+#[test]
+fn i128_in_foreign_signature_is_unrepresentable() {
+    static I128: TypeDescriptor = TypeDescriptor::Primitive(PrimitiveType::I128);
+    static FNS: [FunctionDescriptor; 1] = [foreign_fn("big", &[], &[], &I128)];
+    static FOREIGN: [haphe::ForeignInterfaceDescriptor; 1] =
+        [foreign_iface("test::Hooks", "Hooks", &[], &FNS)];
+    static REGISTRY: TypeRegistry = TypeRegistry::new(&[], &[], &[], &[], &[], &FOREIGN);
+
+    let err = generate_err(&REGISTRY);
+    assert!(
+        matches!(err, WitGenError::UnrepresentableType { .. }),
+        "got: {err:?}"
+    );
+}
+
+#[test]
+fn foreign_interface_name_collision_with_module() {
+    static FNS: [FunctionDescriptor; 1] = [foreign_fn("ping", &[], &[], &UNIT)];
+    static FOREIGN: [haphe::ForeignInterfaceDescriptor; 1] =
+        [foreign_iface("test::Geometry", "Geometry", &[], &FNS)];
+    static MODULES: [haphe::ModuleDescriptor; 1] = [haphe::ModuleDescriptor {
+        name: "geometry",
+        doc: None,
+        functions: &[],
+        type_ids: &[],
+        submodules: &[],
+        constants: &[],
+    }];
+    static REGISTRY: TypeRegistry = TypeRegistry::new(&[], &[], &[], &MODULES, &[], &FOREIGN);
+
+    let err = generate_err(&REGISTRY);
+    assert!(
+        matches!(err, WitGenError::NameCollision { .. }),
+        "got: {err:?}"
+    );
+}
+
+#[cfg_attr(feature = "generics", allow(dead_code))]
+static FGN_T_PARAM: [haphe::GenericParam<'static>; 1] = [haphe::GenericParam {
+    name: "T",
+    bounds: &[],
+    default: None,
+}];
+#[cfg_attr(feature = "generics", allow(dead_code))]
+static FGN_T_TYPE: TypeDescriptor = TypeDescriptor::GenericParam("T");
+#[cfg_attr(feature = "generics", allow(dead_code))]
+static S64_ARGS: [TypeDescriptor; 1] = [TypeDescriptor::Primitive(PrimitiveType::I64)];
+
+/// Without the `generics` feature, generic foreign interfaces and generic
+/// functions are rejected descriptively rather than emitted.
+#[cfg(not(feature = "generics"))]
+#[test]
+fn generic_foreign_interface_rejected_without_feature() {
+    static FNS: [FunctionDescriptor; 1] = [foreign_fn("get", &[], &[], &FGN_T_TYPE)];
+    static FOREIGN: [haphe::ForeignInterfaceDescriptor; 1] =
+        [foreign_iface("test::Store", "Store", &FGN_T_PARAM, &FNS)];
+    static INSTS: [haphe::InstantiationDescriptor; 1] = [haphe::InstantiationDescriptor {
+        id: TypeId::new("test::Store"),
+        args: &S64_ARGS,
+    }];
+    static REGISTRY: TypeRegistry = TypeRegistry::new(&[], &[], &[], &[], &INSTS, &FOREIGN);
+
+    let err = generate_err(&REGISTRY);
+    assert!(
+        matches!(err, WitGenError::GenericForeignInterface { .. }),
+        "got: {err:?}"
+    );
+}
+
+#[cfg(not(feature = "generics"))]
+#[test]
+fn generic_foreign_function_rejected_without_feature() {
+    static INSTS: [&[TypeDescriptor]; 1] = [&S64_ARGS];
+    static FNS: [FunctionDescriptor; 1] = [foreign_fn("get", &FGN_T_PARAM, &INSTS, &FGN_T_TYPE)];
+    static FOREIGN: [haphe::ForeignInterfaceDescriptor; 1] =
+        [foreign_iface("test::Hooks", "Hooks", &[], &FNS)];
+    static REGISTRY: TypeRegistry = TypeRegistry::new(&[], &[], &[], &[], &[], &FOREIGN);
+
+    let err = generate_err(&REGISTRY);
+    assert!(
+        matches!(err, WitGenError::GenericFunction { .. }),
+        "got: {err:?}"
+    );
+}

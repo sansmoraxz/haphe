@@ -8,8 +8,23 @@ use haphe::{
 use crate::WitGenError;
 use crate::names::{NameMap, to_kebab};
 
-/// One WIT interface: a flattened module (or the default interface holding
-/// types unclaimed by any module).
+/// Who owns an interface's function bodies.
+///
+/// How this maps to world `import`/`export` lines depends on the
+/// [`WorldPerspective`](crate::WorldPerspective) the generator is configured
+/// with — the haphe program may sit on either side of the component boundary.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Direction {
+    /// The haphe program provides the implementation (registered modules and
+    /// types).
+    Provided,
+    /// The embedding counterpart supplies the implementation (foreign
+    /// interfaces).
+    Foreign,
+}
+
+/// One WIT interface: a flattened module, the default interface holding
+/// types unclaimed by any module, or a foreign interface.
 pub(crate) struct Iface<'a> {
     pub name: String,
     pub doc: Option<&'a str>,
@@ -20,6 +35,11 @@ pub(crate) struct Iface<'a> {
     /// Indices into [`Plan::instances`] of generic instantiations defined in
     /// this interface.
     pub instance_indices: Vec<usize>,
+    /// How the world lists this interface.
+    pub direction: Direction,
+    /// For a monomorphized generic foreign interface (`generics` feature):
+    /// index into [`Plan::instances`] of the instantiation it represents.
+    pub foreign_instance: Option<usize>,
 }
 
 /// A planned monomorphization of a generic type: the erased descriptor plus
@@ -120,6 +140,8 @@ impl<'a> Plan<'a> {
             constants: &[],
             type_ids: Vec::new(),
             instance_indices: Vec::new(),
+            direction: Direction::Provided,
+            foreign_instance: None,
         }];
         let mut owner_of = HashMap::new();
         let mut iface_names = NameMap::new();
@@ -133,6 +155,47 @@ impl<'a> Plan<'a> {
                 &mut iface_names,
                 &generics,
             )?;
+        }
+
+        // Foreign interfaces: the counterpart supplies the implementation.
+        // Generic foreign interfaces and generic functions need the haphe
+        // naming extension (`generics` feature); without it they are
+        // rejected. With it, every emitted name derives purely from
+        // descriptors, so output stays deterministic across builds.
+        let mut foreign_generics: HashSet<&'a str> = HashSet::new();
+        for fi in registry.foreign_interfaces() {
+            if !fi.generic_params.is_empty() {
+                if cfg!(feature = "generics") {
+                    foreign_generics.insert(fi.id.as_str());
+                    erased_names.insert(fi.id.as_str(), to_kebab(fi.name));
+                    continue;
+                }
+                return Err(WitGenError::GenericForeignInterface {
+                    name: fi.name.to_string(),
+                });
+            }
+            interfaces.push(Iface {
+                name: iface_names.insert(fi.name)?,
+                doc: fi.doc,
+                functions: fi.functions,
+                constants: &[],
+                type_ids: Vec::new(),
+                instance_indices: Vec::new(),
+                direction: Direction::Foreign,
+                foreign_instance: None,
+            });
+        }
+        if !cfg!(feature = "generics") {
+            for iface in &interfaces {
+                for f in iface.functions {
+                    if !f.generic_params.is_empty() {
+                        return Err(WitGenError::GenericFunction {
+                            interface: iface.name.clone(),
+                            function: f.name.to_string(),
+                        });
+                    }
+                }
+            }
         }
 
         // Concrete types unclaimed by any module land in the default
@@ -165,10 +228,36 @@ impl<'a> Plan<'a> {
         };
 
         // Plan one emission per distinct instantiation (identical duplicates
-        // dedupe silently); mangled names share the type namespace.
+        // dedupe silently); mangled names share the type namespace. An
+        // instantiation of a generic foreign interface (`generics` feature)
+        // becomes its own interface under the mangled name.
         for inst in registry.instantiations() {
             let wit_name = plan.mangle_instance(inst.id.as_str(), inst.args, None)?;
             if plan.instance_names.contains(&wit_name) {
+                continue;
+            }
+            if foreign_generics.contains(inst.id.as_str()) {
+                let fi = registry
+                    .get_foreign_interface(&haphe::TypeId::new(inst.id.as_str()))
+                    .expect("id came from foreign_interfaces");
+                iface_names.insert(&wit_name)?;
+                plan.instance_names.insert(wit_name.clone());
+                let instance_index = plan.instances.len();
+                plan.instances.push(PlannedInstance {
+                    erased_id: inst.id.as_str(),
+                    args: inst.args,
+                    wit_name: wit_name.clone(),
+                });
+                plan.interfaces.push(Iface {
+                    name: wit_name,
+                    doc: fi.doc,
+                    functions: fi.functions,
+                    constants: &[],
+                    type_ids: Vec::new(),
+                    instance_indices: Vec::new(),
+                    direction: Direction::Foreign,
+                    foreign_instance: Some(instance_index),
+                });
                 continue;
             }
             names.insert(&wit_name)?;
@@ -205,13 +294,15 @@ impl<'a> Plan<'a> {
         registry: &'a ValidatedRegistry<'a>,
         inst: &'p PlannedInstance<'a>,
     ) -> Env<'p, 'a> {
-        let params = match registry
-            .get_type(&haphe::TypeId::new(inst.erased_id))
-            .unwrap()
-        {
-            TypeKind::Struct(s) => s.generic_params,
-            TypeKind::Enum(e) => e.generic_params,
-            TypeKind::TypeAlias(_) => &[],
+        let id = haphe::TypeId::new(inst.erased_id);
+        let params = if let Some(fi) = registry.get_foreign_interface(&id) {
+            fi.generic_params
+        } else {
+            match registry.get_type(&id).unwrap() {
+                TypeKind::Struct(s) => s.generic_params,
+                TypeKind::Enum(e) => e.generic_params,
+                TypeKind::TypeAlias(_) => &[],
+            }
         };
         Env {
             bindings: params
@@ -222,6 +313,41 @@ impl<'a> Plan<'a> {
             self_id: inst.erased_id,
             self_name: &inst.wit_name,
         }
+    }
+
+    /// Extends `base` with a generic function's own parameter bindings for
+    /// one instantiation.
+    pub fn fn_env<'p>(
+        &'p self,
+        f: &'a FunctionDescriptor<'a>,
+        args: &'a [TypeDescriptor<'a>],
+        base: Option<&Env<'p, 'a>>,
+    ) -> Env<'p, 'a> {
+        let mut bindings: Vec<(&'a str, &'p TypeDescriptor<'a>)> =
+            base.map(|e| e.bindings.clone()).unwrap_or_default();
+        bindings.extend(f.generic_params.iter().map(|p| p.name).zip(args.iter()));
+        Env {
+            bindings,
+            self_id: base.map(|e| e.self_id).unwrap_or(""),
+            self_name: base.map(|e| e.self_name).unwrap_or(""),
+        }
+    }
+
+    /// Deterministic mangled WIT name for one instantiation of a generic
+    /// function: `{kebab(fn)}-{mangled args}` (same argument mangling as
+    /// generic type instances).
+    pub fn mangle_fn_instance(
+        &self,
+        fn_name: &str,
+        args: &[TypeDescriptor<'a>],
+        env: Option<&Env<'_, 'a>>,
+    ) -> Result<String, WitGenError> {
+        let mut name = to_kebab(fn_name);
+        for arg in args {
+            name.push('-');
+            name.push_str(&self.mangle_type(arg, env)?);
+        }
+        Ok(name)
     }
 
     /// Deterministic mangled WIT name for an instantiation of the generic
@@ -247,7 +373,7 @@ impl<'a> Plan<'a> {
     }
 
     /// Mangled name fragment for one type argument.
-    fn mangle_type(
+    pub(crate) fn mangle_type(
         &self,
         ty: &TypeDescriptor<'a>,
         env: Option<&Env<'_, 'a>>,
@@ -362,8 +488,18 @@ impl<'a> Plan<'a> {
         // (owner interface index, resolved WIT name)
         let mut refs: BTreeSet<(usize, String)> = BTreeSet::new();
 
+        let base_env = iface
+            .foreign_instance
+            .map(|i| self.env_for(registry, &self.instances[i]));
         for f in iface.functions {
-            self.collect_fn_uses(f, None, &mut refs)?;
+            if f.generic_params.is_empty() {
+                self.collect_fn_uses(f, base_env.as_ref(), &mut refs)?;
+            } else {
+                for args in f.instantiations {
+                    let env = self.fn_env(f, args, base_env.as_ref());
+                    self.collect_fn_uses(f, Some(&env), &mut refs)?;
+                }
+            }
         }
         for c in iface.constants {
             self.collect_uses(c.ty, None, &mut refs)?;
@@ -499,6 +635,68 @@ impl<'a> Plan<'a> {
     }
 }
 
+/// Plan-independent mangled fragment for a type argument: the subset of
+/// [`Plan::mangle_type`] that never touches registered type names. Used by
+/// the runtime foreign caller, which has no plan; `Ref`, `Instance`, and
+/// `GenericParam` arguments error. KEEP IN SYNC with [`Plan::mangle_type`].
+#[cfg_attr(not(feature = "runtime"), allow(dead_code))]
+pub(crate) fn mangle_plain_type(ty: &TypeDescriptor<'_>) -> Result<String, WitGenError> {
+    let err = |detail: &str| WitGenError::UnrepresentableType {
+        context: "generic instantiation argument".to_string(),
+        detail: detail.to_string(),
+    };
+    Ok(match ty {
+        TypeDescriptor::Primitive(p) => match p {
+            PrimitiveType::Bool => "bool".into(),
+            PrimitiveType::I8 => "s8".into(),
+            PrimitiveType::I16 => "s16".into(),
+            PrimitiveType::I32 => "s32".into(),
+            PrimitiveType::I64 => "s64".into(),
+            PrimitiveType::U8 => "u8".into(),
+            PrimitiveType::U16 => "u16".into(),
+            PrimitiveType::U32 => "u32".into(),
+            PrimitiveType::U64 => "u64".into(),
+            PrimitiveType::F32 => "f32".into(),
+            PrimitiveType::F64 => "f64".into(),
+            PrimitiveType::Char => "char".into(),
+            _ => return Err(err("unsupported primitive in instantiation")),
+        },
+        TypeDescriptor::String => "string".into(),
+        TypeDescriptor::Bytes => "bytes".into(),
+        TypeDescriptor::Unit => "unit".into(),
+        TypeDescriptor::Option(t) => format!("option-{}", mangle_plain_type(t)?),
+        TypeDescriptor::List(t) => format!("list-{}", mangle_plain_type(t)?),
+        TypeDescriptor::Array(t, n) => format!("list{n}-{}", mangle_plain_type(t)?),
+        TypeDescriptor::Map(k, v) => {
+            format!("map-{}-{}", mangle_plain_type(k)?, mangle_plain_type(v)?)
+        }
+        TypeDescriptor::Tuple(es) => {
+            let mut s = format!("tuple{}", es.len());
+            for e in *es {
+                s.push('-');
+                s.push_str(&mangle_plain_type(e)?);
+            }
+            s
+        }
+        TypeDescriptor::Result(o, e) => {
+            format!("result-{}-{}", mangle_plain_type(o)?, mangle_plain_type(e)?)
+        }
+        TypeDescriptor::Stream(inner) => match inner {
+            TypeDescriptor::Unit => "stream".to_string(),
+            _ => format!("stream-{}", mangle_plain_type(inner)?),
+        },
+        TypeDescriptor::Future(inner) => match inner {
+            TypeDescriptor::Unit => "future".to_string(),
+            _ => format!("future-{}", mangle_plain_type(inner)?),
+        },
+        _ => {
+            return Err(err(
+                "type arguments referencing registered types are not supported at runtime",
+            ));
+        }
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn flatten_module<'a>(
     module: &'a ModuleDescriptor<'a>,
@@ -532,6 +730,8 @@ fn flatten_module<'a>(
         constants: module.constants,
         type_ids,
         instance_indices: Vec::new(),
+        direction: Direction::Provided,
+        foreign_instance: None,
     });
     for sub in module.submodules {
         flatten_module(sub, &name, interfaces, owner_of, iface_names, generics)?;
