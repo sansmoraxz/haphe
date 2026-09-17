@@ -8,7 +8,7 @@ use syn::{Ident, Type};
 use crate::fn_desc::ReceiverShape;
 
 use super::gates::{is_reference, strip_ref, substitute_type_params};
-use super::{BindMethod, DynBindMethod};
+use super::{BindMethod, GenericBindMethod};
 
 // ---------------------------------------------------------------------------
 // Method registration
@@ -412,12 +412,13 @@ pub(crate) fn gen_method_registration(self_ty: &Type, method: &BindMethod) -> To
     }
 }
 
-/// Registrations for a `dyn`-dispatched generic method: one monomorphized
-/// wrapper per declared instantiation, each handed to the descriptor-carrying
-/// `method_dyn*` channel matching the receiver and asyncness. The descriptor
-/// is materialized as a block-local `static` so candidates share one
-/// `&'static` ranking source.
-pub fn gen_dyn_method_registration(self_ty: &Type, dm: &DynBindMethod) -> TokenStream {
+/// Registrations for a generic method: one monomorphized wrapper per
+/// declared instantiation. `dyn` dispatch hands each candidate to the
+/// descriptor-carrying `method_dyn*` channel matching the receiver and
+/// asyncness (the descriptor is materialized as a block-local `static` so
+/// candidates share one `&'static` ranking source); static dispatch hands
+/// the same wrappers to `method_generic*`, keyed on `(name, type_args)`.
+pub fn gen_generic_method_registration(self_ty: &Type, dm: &GenericBindMethod) -> TokenStream {
     let descriptor = &dm.descriptor;
     let ident = &dm.method.ident;
     let regs: Vec<TokenStream> = dm
@@ -460,6 +461,57 @@ pub fn gen_dyn_method_registration(self_ty: &Type, dm: &DynBindMethod) -> TokenS
                 ReceiverShape::Ref => quote! { let __t: &#self_ty = &__recv; },
                 _ => TokenStream::new(),
             };
+            if !dm.dyn_dispatch {
+                let name = &dm.method.name;
+                return match (dm.is_async, dm.method.receiver) {
+                    (false, ReceiverShape::RefMut) => quote::quote_spanned! {*span=>
+                        __b.method_generic_mut(
+                            #name,
+                            #type_args,
+                            (|__t: &mut #self_ty, __args: &[::haphe::ScriptValue]| -> ::core::result::Result<::haphe::ScriptValue, ::haphe::ScriptConvertError> {
+                                #(#extractions)*
+                                ::core::result::Result::Ok(#sync_result)
+                            }) as fn(&mut #self_ty, &[::haphe::ScriptValue]) -> ::core::result::Result<::haphe::ScriptValue, ::haphe::ScriptConvertError>,
+                        )?;
+                    },
+                    (false, _) => quote::quote_spanned! {*span=>
+                        __b.method_generic(
+                            #name,
+                            #type_args,
+                            (|__recv: ::haphe::ScriptCow<'_, #self_ty>, __args: &[::haphe::ScriptValue]| -> ::core::result::Result<::haphe::ScriptValue, ::haphe::ScriptConvertError> {
+                                #recv_prep
+                                #(#extractions)*
+                                ::core::result::Result::Ok(#sync_result)
+                            }) as for<'a> fn(::haphe::ScriptCow<'a, #self_ty>, &[::haphe::ScriptValue]) -> ::core::result::Result<::haphe::ScriptValue, ::haphe::ScriptConvertError>,
+                        )?;
+                    },
+                    (true, ReceiverShape::RefMut) => quote::quote_spanned! {*span=>
+                        __b.method_generic_async_mut(
+                            #name,
+                            #type_args,
+                            (|__t: &mut #self_ty, __args: &[::haphe::ScriptValue]| -> ::haphe::ScriptCallFuture<'_> {
+                                ::std::boxed::Box::pin(async move {
+                                    #(#extractions)*
+                                    ::core::result::Result::Ok(#async_result)
+                                })
+                            }) as for<'a> fn(&'a mut #self_ty, &'a [::haphe::ScriptValue]) -> ::haphe::ScriptCallFuture<'a>,
+                        )?;
+                    },
+                    (true, _) => quote::quote_spanned! {*span=>
+                        __b.method_generic_async(
+                            #name,
+                            #type_args,
+                            (|__recv: ::haphe::ScriptCow<'_, #self_ty>, __args: &[::haphe::ScriptValue]| -> ::haphe::ScriptCallFuture<'_> {
+                                ::std::boxed::Box::pin(async move {
+                                    #recv_prep
+                                    #(#extractions)*
+                                    ::core::result::Result::Ok(#async_result)
+                                })
+                            }) as for<'a> fn(::haphe::ScriptCow<'a, #self_ty>, &'a [::haphe::ScriptValue]) -> ::haphe::ScriptCallFuture<'a>,
+                        )?;
+                    },
+                };
+            }
             match (dm.is_async, dm.method.receiver) {
                 (false, ReceiverShape::RefMut) => quote::quote_spanned! {*span=>
                     __b.method_dyn_mut(
@@ -510,9 +562,14 @@ pub fn gen_dyn_method_registration(self_ty: &Type, dm: &DynBindMethod) -> TokenS
             }
         })
         .collect();
+    let shared_desc = if dm.dyn_dispatch {
+        quote! { static __HAPHE_DYN_DESC: ::haphe::FunctionDescriptor<'static> = #descriptor; }
+    } else {
+        TokenStream::new()
+    };
     quote! {
         {
-            static __HAPHE_DYN_DESC: ::haphe::FunctionDescriptor<'static> = #descriptor;
+            #shared_desc
             #(#regs)*
         }
     }

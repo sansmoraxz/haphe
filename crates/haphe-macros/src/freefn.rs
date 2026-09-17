@@ -230,12 +230,7 @@ pub fn expand(mut item: ItemFn) -> TokenStream {
             })
             .collect();
         let is_dyn = fn_args.dyn_dispatch.is_some();
-        // Async generics bind only in dyn mode (static async generics have
-        // no async monomorph channel yet).
-        let can = (!info.is_async || is_dyn)
-            && cfgs.is_empty()
-            && !substs.is_empty()
-            && substs.iter().all(&compatible);
+        let can = cfgs.is_empty() && !substs.is_empty() && substs.iter().all(&compatible);
         let registrations: Vec<TokenStream> = fn_args
             .instantiate
             .iter()
@@ -256,6 +251,15 @@ pub fn expand(mut item: ItemFn) -> TokenStream {
                     quote_spanned! {*span=>
                         __binder.function_dyn(
                             &<#ident as ::haphe::ScriptFunction>::DESCRIPTOR,
+                            #type_args,
+                            #wrapper,
+                        )?;
+                    }
+                } else if info.is_async {
+                    let wrapper = make_async_wrapper(subst);
+                    quote_spanned! {*span=>
+                        __binder.function_async(
+                            #exposed_name,
                             #type_args,
                             #wrapper,
                         )?;

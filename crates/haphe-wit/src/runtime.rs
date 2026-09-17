@@ -502,20 +502,23 @@ impl<T: 'static> RuntimeBinder for WasmBinder<T> {
                 if let Some(TypeKind::Enum(e)) = registry.get_type(&haphe::TypeId::new(id)) {
                     let value = self.regs.values.get(*id).cloned();
                     for m in e.methods {
-                        let name = member_names.insert(&format!("{}_{}", e.name, m.name))?;
-                        match value.as_ref().filter(|v| v.methods.contains_key(m.name)) {
-                            Some(v) => define_enum_companion(
-                                &mut inst,
-                                &name,
-                                v.clone(),
-                                m.name.to_string(),
-                                &cx,
-                            )?,
-                            None => stub_func_msg(
-                                &mut inst,
-                                &name,
-                                "enum companion method not registered; call `register_enum`",
-                            )?,
+                        for (name, key) in enum_companion_defs(
+                            e.name,
+                            "_",
+                            m,
+                            value.as_deref(),
+                            &mut member_names,
+                        )? {
+                            match (key, value.as_ref()) {
+                                (Some(key), Some(v)) => {
+                                    define_enum_companion(&mut inst, &name, v.clone(), key, &cx)?
+                                }
+                                _ => stub_func_msg(
+                                    &mut inst,
+                                    &name,
+                                    "enum companion method not registered; call `register_enum`",
+                                )?,
+                            }
                         }
                     }
                 }
@@ -529,22 +532,24 @@ impl<T: 'static> RuntimeBinder for WasmBinder<T> {
                         .ok()
                         .and_then(|k| self.regs.values.get(&k).cloned());
                     for m in e.methods {
-                        let name =
-                            member_names.insert(&format!("{}-{}", planned.wit_name, m.name))?;
-                        match value.as_ref().filter(|v| v.methods.contains_key(m.name)) {
-                            Some(v) => define_enum_companion(
-                                &mut inst,
-                                &name,
-                                v.clone(),
-                                m.name.to_string(),
-                                &cx,
-                            )?,
-                            None => stub_func_msg(
-                                &mut inst,
-                                &name,
-                                "enum companion method not registered; call \
-                                 `register_enum_instance`",
-                            )?,
+                        for (name, key) in enum_companion_defs(
+                            &planned.wit_name,
+                            "-",
+                            m,
+                            value.as_deref(),
+                            &mut member_names,
+                        )? {
+                            match (key, value.as_ref()) {
+                                (Some(key), Some(v)) => {
+                                    define_enum_companion(&mut inst, &name, v.clone(), key, &cx)?
+                                }
+                                _ => stub_func_msg(
+                                    &mut inst,
+                                    &name,
+                                    "enum companion method not registered; call \
+                                     `register_enum_instance`",
+                                )?,
+                            }
                         }
                     }
                 }
@@ -1907,21 +1912,64 @@ fn define_record_projection<T: 'static>(
 
 /// Dispatches one enum companion function: `args[0]` is the lowered enum
 /// value (the receiver), the rest are the method's parameters.
+/// Bind-time-resolved dispatch key for one enum companion: a plain method
+/// by name, or one statically dispatched generic monomorph by its index in
+/// the value entry's `generic_methods`.
+enum ValueMethodKey {
+    Named(String),
+    Generic(usize),
+}
+
+/// Linker names + dispatch keys for one enum method's companion functions:
+/// one entry for a plain method, one per declared instantiation for a
+/// generic one (same mangled names the generator emits). A `None` key marks
+/// a companion with no dispatch channel (stubbed by the caller).
+fn enum_companion_defs(
+    owner: &str,
+    sep: &str,
+    m: &haphe::FunctionDescriptor<'_>,
+    value: Option<&ValueEntry>,
+    member_names: &mut NameMap,
+) -> Result<Vec<(String, Option<ValueMethodKey>)>, WasmBindError> {
+    let mut out = Vec::new();
+    if m.generic_params.is_empty() {
+        let name = member_names.insert(&format!("{owner}{sep}{}", m.name))?;
+        let key = value
+            .filter(|v| v.methods.contains_key(m.name))
+            .map(|_| ValueMethodKey::Named(m.name.to_string()));
+        out.push((name, key));
+        return Ok(out);
+    }
+    for args in m.instantiations {
+        let mangled = mangle_generic_name(m.name, args)?;
+        let name = member_names.insert(&format!("{owner}{sep}{mangled}"))?;
+        let key = value.and_then(|v| {
+            v.generic_methods
+                .iter()
+                .position(|((n, a), _)| *n == m.name && a[..] == args[..])
+                .map(ValueMethodKey::Generic)
+        });
+        out.push((name, key));
+    }
+    Ok(out)
+}
+
 fn define_enum_companion<T: 'static>(
     inst: &mut LinkerInstance<'_, T>,
     name: &str,
     entry: Arc<ValueEntry>,
-    method: String,
+    method: ValueMethodKey,
     cx: &DispatchCx,
 ) -> Result<(), WasmBindError> {
     let cx = cx.clone();
     let msg_name = name.to_string();
     inst.func_new(name, move |mut store, fty, params, results| {
         let args = lift_args(&cx, &mut store, params, 0, &msg_name)?;
-        let m = entry
-            .methods
-            .get(method.as_str())
-            .ok_or_else(|| trap(&msg_name, "enum method has no dispatch channel"))?;
+        let m = match &method {
+            ValueMethodKey::Named(n) => entry.methods.get(n.as_str()),
+            ValueMethodKey::Generic(i) => entry.generic_methods.get(*i).map(|(_, m)| m),
+        }
+        .ok_or_else(|| trap(&msg_name, "enum method has no dispatch channel"))?;
         let (this, rest) = args
             .split_first()
             .ok_or_else(|| trap(&msg_name, "companion call is missing its receiver"))?;
@@ -2001,39 +2049,65 @@ fn bind_resource_live<T: 'static>(
     }
 
     for m in s.methods {
-        let name = members.insert(m.name)?;
-        let prefixed = match m.receiver {
-            Some(Receiver::Ref | Receiver::RefMut) => format!("[method]{res}.{name}"),
-            Some(Receiver::Owned) | None => format!("[static]{res}.{name}"),
-        };
-        if m.receiver.is_none() {
-            // Receiver-less associated functions have no dispatch channel
-            // through `TypeBinder` that carries no value; descriptive trap.
-            stub_func_msg(
+        // Plain methods define one member; generic methods define one
+        // monomorph per declared instantiation under the same mangled names
+        // the generator emits.
+        let monomorphs: Vec<(String, Option<&[TypeDescriptor<'_>]>)> =
+            if m.generic_params.is_empty() {
+                vec![(members.insert(m.name)?, None)]
+            } else {
+                let mut out = Vec::new();
+                for args in m.instantiations {
+                    let mangled = mangle_generic_name(m.name, args)?;
+                    out.push((members.insert(&mangled)?, Some(*args)));
+                }
+                out
+            };
+        for (name, type_args) in monomorphs {
+            let prefixed = match m.receiver {
+                Some(Receiver::Ref | Receiver::RefMut) => format!("[method]{res}.{name}"),
+                Some(Receiver::Owned) | None => format!("[static]{res}.{name}"),
+            };
+            if m.receiver.is_none() {
+                // Receiver-less associated functions have no dispatch channel
+                // through `TypeBinder` that carries no value; descriptive trap.
+                stub_func_msg(
+                    inst,
+                    &prefixed,
+                    "associated functions without a receiver are not yet bridged",
+                )?;
+                continue;
+            }
+            let key = match type_args {
+                None if entry.methods.contains_key(m.name) => {
+                    Some(MethodKey::Named(m.name.to_string()))
+                }
+                Some(args) => entry
+                    .generic_methods
+                    .iter()
+                    .position(|((n, a), _)| *n == m.name && a[..] == args[..])
+                    .map(MethodKey::Generic),
+                None => None,
+            };
+            let Some(key) = key else {
+                // Descriptor-only (e.g. signature types without value
+                // conversions): declared, described, but not bridgeable.
+                stub_func_msg(
+                    inst,
+                    &prefixed,
+                    "declared but not bridgeable (its signature types lack value conversions)",
+                )?;
+                continue;
+            };
+            define_method(
                 inst,
                 &prefixed,
-                "associated functions without a receiver are not yet bridged",
+                key,
+                m.receiver.expect("checked above"),
+                &entry,
+                cx,
             )?;
-            continue;
         }
-        if !entry.methods.contains_key(m.name) {
-            // Descriptor-only (e.g. signature types without value
-            // conversions): declared, described, but not bridgeable.
-            stub_func_msg(
-                inst,
-                &prefixed,
-                "declared but not bridgeable (its signature types lack value conversions)",
-            )?;
-            continue;
-        }
-        define_method(
-            inst,
-            &prefixed,
-            m.name.to_string(),
-            m.receiver.expect("checked above"),
-            &entry,
-            cx,
-        )?;
     }
 
     for proj in projected_trait_members(s)? {
@@ -2248,10 +2322,19 @@ fn define_ctor<T: 'static>(
     Ok(())
 }
 
+/// Bind-time-resolved dispatch key for one resource method: a plain method
+/// by name, or one statically dispatched generic monomorph by its index in
+/// the entry's `generic_methods` (the entry is frozen behind an `Arc`, so
+/// the index is stable).
+enum MethodKey {
+    Named(String),
+    Generic(usize),
+}
+
 fn define_method<T: 'static>(
     inst: &mut LinkerInstance<'_, T>,
     linker_name: &str,
-    method: String,
+    method: MethodKey,
     receiver: Receiver,
     entry: &Arc<ResourceEntry>,
     cx: &DispatchCx,
@@ -2261,10 +2344,11 @@ fn define_method<T: 'static>(
     inst.func_new(linker_name, move |mut store, fty, params, results| {
         let rep = self_rep(&mut store, params, &msg)?;
         let args = lift_args(&cx, &mut store, params, 1, &msg)?;
-        let m = entry
-            .methods
-            .get(method.as_str())
-            .ok_or_else(|| trap(&msg, "method has no bridge channel"))?;
+        let m = match &method {
+            MethodKey::Named(name) => entry.methods.get(name.as_str()),
+            MethodKey::Generic(i) => entry.generic_methods.get(*i).map(|(_, m)| m),
+        }
+        .ok_or_else(|| trap(&msg, "method has no bridge channel"))?;
         let out = match (m, receiver) {
             // Owned receiver: consume the entry (stale later use traps).
             (EMethod::Cow(f), Receiver::Owned) => {
@@ -2624,12 +2708,23 @@ fn bind_resource_stub<T: 'static>(
     }
 
     for m in s.methods {
-        let name = members.insert(m.name)?;
-        let prefixed = match m.receiver {
-            Some(Receiver::Ref | Receiver::RefMut) => format!("[method]{res}.{name}"),
-            Some(Receiver::Owned) | None => format!("[static]{res}.{name}"),
+        let names: Vec<String> = if m.generic_params.is_empty() {
+            vec![members.insert(m.name)?]
+        } else {
+            let mut out = Vec::new();
+            for args in m.instantiations {
+                let mangled = mangle_generic_name(m.name, args)?;
+                out.push(members.insert(&mangled)?);
+            }
+            out
         };
-        stub_func_msg(inst, &prefixed, unregistered)?;
+        for name in names {
+            let prefixed = match m.receiver {
+                Some(Receiver::Ref | Receiver::RefMut) => format!("[method]{res}.{name}"),
+                Some(Receiver::Owned) | None => format!("[static]{res}.{name}"),
+            };
+            stub_func_msg(inst, &prefixed, unregistered)?;
+        }
     }
 
     for proj in projected_trait_members(s)? {

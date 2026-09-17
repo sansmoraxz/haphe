@@ -260,7 +260,7 @@ fn foreign_interface_describes_the_callbacks_table() {
 }
 
 #[test]
-fn generic_module_function_is_rejected() {
+fn generic_module_function_stubs_each_monomorph() {
     /// Echoes a value.
     #[script(instantiate(i64))]
     fn echo<T>(value: T) -> T {
@@ -273,11 +273,15 @@ fn generic_module_function_is_rejected() {
         };
     }
 
-    let err = haphe::generate(&LuaDeclGenerator::new(), &GENERIC_REGISTRY).unwrap_err();
-    let haphe::GenerateError::Backend(LuaDeclError::GenericFunction { name }) = err else {
-        panic!("expected GenericFunction, got: {err:?}");
-    };
-    assert_eq!(name, "echo");
+    // Static generic functions stub one callable per instantiation under
+    // its mangled monomorph name, matching the runtime's table entries.
+    let output = haphe::generate(&LuaDeclGenerator::new(), &GENERIC_REGISTRY).unwrap();
+    let s = String::from_utf8(output.files[0].content.clone()).unwrap();
+    assert!(
+        s.contains("function util.echo__i64(value) end"),
+        "got:\n{s}"
+    );
+    assert!(s.contains("---@param value integer"), "got:\n{s}");
 }
 
 #[test]

@@ -383,15 +383,27 @@ fn double<T: Clone + std::ops::Add<Output = T>>(x: T) -> T {
     x.clone() + x
 }
 
-/// Lua dispatches by name only, so monomorphized instantiations of a generic
-/// function are rejected at bind time (generics as a Lua extension are a
-/// possible future feature).
+/// Lua dispatches by name only: without the `generics` feature,
+/// monomorphized instantiations of a generic function are rejected at bind
+/// time; with it, each lands under its mangled monomorph name.
+#[cfg(not(feature = "generics"))]
 #[test]
 fn generic_free_fn_is_rejected() {
     let lua = Lua::new();
     let tbl = lua.create_table().unwrap();
     let err = bind_fn::<double>(&lua, &tbl).unwrap_err();
     assert!(err.to_string().contains("generic function `double`"));
+}
+
+#[cfg(feature = "generics")]
+#[test]
+fn generic_free_fn_binds_mangled_monomorph() {
+    let lua = Lua::new();
+    let tbl = lua.create_table().unwrap();
+    bind_fn::<double>(&lua, &tbl).unwrap();
+    lua.globals().set("fns", tbl).unwrap();
+    let out: i64 = lua.load("return fns.double__i32(4)").eval().unwrap();
+    assert_eq!(out, 8);
 }
 
 // ---------------------------------------------------------------------------

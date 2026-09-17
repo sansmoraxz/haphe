@@ -107,7 +107,7 @@ pub fn expand(mut item: ItemImpl) -> TokenStream {
     let mut bind_methods: Vec<crate::bind::BindMethod> = Vec::new();
     let mut async_methods: Vec<crate::bind::BindMethod> = Vec::new();
     let mut dispatch_methods: Vec<crate::bind::BindMethod> = Vec::new();
-    let mut dyn_methods: Vec<crate::bind::DynBindMethod> = Vec::new();
+    let mut generic_methods: Vec<crate::bind::GenericBindMethod> = Vec::new();
     let mut bind_constructors: Vec<crate::bind::BindMethod> = Vec::new();
     let mut async_constructors: Vec<crate::bind::BindMethod> = Vec::new();
 
@@ -122,9 +122,10 @@ pub fn expand(mut item: ItemImpl) -> TokenStream {
             continue;
         }
         // A function's own generic parameters are supported on plain methods
-        // only, and only in `dyn` dispatch mode — there is no per-method
-        // static monomorph channel. Bare `dyn` on a single-parameter generic
-        // gets the default candidate set, like free functions.
+        // only, in either dispatch mode: static (declared `instantiate(...)`
+        // monomorphs keyed on (name, type_args)) or `dyn` (runtime candidate
+        // scan). Bare `dyn` on a single-parameter generic gets the default
+        // candidate set, like free functions.
         let fn_type_params: Vec<syn::Ident> = func
             .sig
             .generics
@@ -151,11 +152,14 @@ pub fn expand(mut item: ItemImpl) -> TokenStream {
                 strip_param_script_attrs(&mut func.sig);
                 continue;
             }
-            if fn_args.dyn_dispatch.is_none() {
+            if fn_args.dyn_dispatch.is_none() && fn_args.instantiate.is_empty() {
+                // Static dispatch: monomorphs keyed on (name, type_args),
+                // like static generic free functions — each use must be
+                // declared.
                 errors.spanned(
                     span,
-                    "generic impl-block functions require `dyn` dispatch: add `dyn` to \
-                     `#[script(...)]` (with `instantiate(...)` for multi-parameter generics)",
+                    "generic impl-block functions need `instantiate(...)` declarations \
+                     (or `dyn` for runtime dispatch)",
                 );
                 strip_param_script_attrs(&mut func.sig);
                 continue;
@@ -326,7 +330,7 @@ pub fn expand(mut item: ItemImpl) -> TokenStream {
             // bridge-compatible signatures. Generic impls bypass the
             // compatibility check — bounds are enforced at monomorphization.
             if has_fn_generics {
-                // `dyn` methods: each declared instantiation must produce a
+                // Generic methods: each declared instantiation must produce a
                 // bridgeable signature — an unbindable candidate is a
                 // compile error, never a silent drop.
                 let method = extract_bind_method(func, &info);
@@ -374,11 +378,12 @@ pub fn expand(mut item: ItemImpl) -> TokenStream {
                     }
                 }
                 if cfgs.is_empty() {
-                    dyn_methods.push(crate::bind::DynBindMethod {
+                    generic_methods.push(crate::bind::GenericBindMethod {
                         method,
                         type_params: fn_type_params.clone(),
                         instantiations: fn_args.instantiate.clone(),
                         is_async: info.is_async,
+                        dyn_dispatch: fn_args.dyn_dispatch.is_some(),
                         descriptor: info.descriptor.clone(),
                     });
                 }
@@ -527,7 +532,7 @@ pub fn expand(mut item: ItemImpl) -> TokenStream {
             methods: &bind_methods,
             async_methods: &async_methods,
             dispatch_methods: &dispatch_methods,
-            dyn_methods: &dyn_methods,
+            generic_methods: &generic_methods,
             constructors: &bind_constructors,
             async_constructors: &async_constructors,
             property_regs: &property_regs,

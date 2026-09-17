@@ -166,9 +166,14 @@ pub fn derive_script(input: TokenStream) -> TokenStream {
 /// ```
 ///
 /// The same applies to generic methods in `#[script] impl` blocks (on
-/// non-generic self types): they are `dyn`-only — there is no per-method
-/// static monomorph channel — and register one candidate per instantiation
-/// through the receiver-shaped `method_dyn*` binder channels.
+/// non-generic self types), in both modes: with `instantiate(...)` alone
+/// they dispatch statically — one monomorph per declaration, registered
+/// through the `method_generic*` channels and keyed on `(name, type_args)`
+/// (backends typically mangle a per-monomorph method name) — and with `dyn`
+/// they register one candidate per instantiation through the
+/// receiver-shaped `method_dyn*` channels for the runtime scan. Async
+/// generic functions and methods bind in both modes, through the async
+/// siblings of those channels.
 ///
 /// ```
 /// use haphe::{Script, script};

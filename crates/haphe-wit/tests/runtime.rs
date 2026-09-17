@@ -2487,3 +2487,119 @@ fn unregistered_property_stubs_keep_register_type_message() {
         "got: {msg}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Static generic METHOD monomorphs dispatch live (feature `generics`)
+// ---------------------------------------------------------------------------
+
+/// A box with statically dispatched generic methods.
+#[cfg(feature = "generics")]
+#[derive(Script, Clone)]
+#[script(thread_safety = send_sync, methods)]
+struct GBox {
+    total: i64,
+}
+
+#[cfg(feature = "generics")]
+#[script]
+impl GBox {
+    #[script(constructor)]
+    fn new(total: i64) -> Self {
+        GBox { total }
+    }
+
+    fn get(&self) -> i64 {
+        self.total
+    }
+
+    /// Picks the first of two values.
+    #[script(instantiate(i64), instantiate(String))]
+    fn first_of<T>(&self, a: T, b: T) -> T {
+        let _ = b;
+        a
+    }
+
+    /// Accumulates a value in place.
+    #[script(instantiate(i64))]
+    fn add_in<T: Into<i64>>(&mut self, value: T) {
+        self.total += value.into();
+    }
+
+    /// Fetches the total scaled by a key, asynchronously.
+    #[script(instantiate(i64))]
+    async fn scaled<T: Into<i64>>(&self, key: T) -> i64 {
+        self.total * key.into()
+    }
+}
+
+#[cfg(feature = "generics")]
+haphe::registry! {
+    pub static GENERIC_METHOD_REGISTRY = {
+        structs: [GBox],
+        modules: [
+            mod boxes {
+                types: [GBox],
+            },
+        ],
+    };
+}
+
+/// first-of-s64(7, 8) = 7; add-in-s64(5) then get = 15; scaled-s64(2) = 30.
+/// total = 7 + 15 + 30 = 52.
+#[cfg(feature = "generics")]
+const GENERIC_METHOD_GUEST: &str = r#"
+(component
+  (import "haphe:demo/boxes" (instance $bx
+    (export "g-box" (type $gb (sub resource)))
+    (export "[constructor]g-box" (func (param "total" s64) (result (own $gb))))
+    (export "[method]g-box.first-of-s64" (func (param "self" (borrow $gb)) (param "a" s64) (param "b" s64) (result s64)))
+    (export "[method]g-box.add-in-s64" (func (param "self" (borrow $gb)) (param "value" s64)))
+    (export "[method]g-box.scaled-s64" (func (param "self" (borrow $gb)) (param "key" s64) (result s64)))
+    (export "[method]g-box.get" (func (param "self" (borrow $gb)) (result s64)))
+  ))
+  (core func $ctor (canon lower (func $bx "[constructor]g-box")))
+  (core func $first (canon lower (func $bx "[method]g-box.first-of-s64")))
+  (core func $addin (canon lower (func $bx "[method]g-box.add-in-s64")))
+  (core func $scaled (canon lower (func $bx "[method]g-box.scaled-s64")))
+  (core func $get (canon lower (func $bx "[method]g-box.get")))
+  (core module $m
+    (import "bx" "ctor" (func $ctor (param i64) (result i32)))
+    (import "bx" "first" (func $first (param i32 i64 i64) (result i64)))
+    (import "bx" "addin" (func $addin (param i32 i64)))
+    (import "bx" "scaled" (func $scaled (param i32 i64) (result i64)))
+    (import "bx" "get" (func $get (param i32) (result i64)))
+    (func (export "run") (result i64) (local $b i32) (local $acc i64)
+      (local.set $b (call $ctor (i64.const 10)))
+      (local.set $acc (call $first (local.get $b) (i64.const 7) (i64.const 8)))
+      (call $addin (local.get $b) (i64.const 5))
+      (local.set $acc (i64.add (local.get $acc) (call $get (local.get $b))))
+      (local.set $acc (i64.add (local.get $acc) (call $scaled (local.get $b) (i64.const 2))))
+      (local.get $acc))
+  )
+  (core instance $mi (instantiate $m
+    (with "bx" (instance
+      (export "ctor" (func $ctor))
+      (export "first" (func $first))
+      (export "addin" (func $addin))
+      (export "scaled" (func $scaled))
+      (export "get" (func $get))))
+  ))
+  (func (export "run") (result s64) (canon lift (core func $mi "run")))
+)
+"#;
+
+/// Generic method monomorphs dispatch through the mangled member names:
+/// `&self` picks, `&mut self` writes back in place, async drives to
+/// completion on-thread.
+#[cfg(feature = "generics")]
+#[test]
+fn generic_method_monomorphs_dispatch_live() {
+    let engine = Engine::default();
+    let mut linker = Linker::new(&engine);
+    let mut b = WasmBinder::new(WitGenerator::new("haphe:demo"));
+    b.register_type::<GBox>().unwrap();
+    haphe::bind(&b, &GENERIC_METHOD_REGISTRY, &mut linker).expect("binding succeeds");
+
+    let result = run_guest(&engine, &linker, (), GENERIC_METHOD_GUEST).expect("guest runs");
+    assert!(matches!(result, Val::S64(52)), "got: {result:?}");
+}

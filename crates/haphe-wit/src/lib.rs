@@ -423,13 +423,24 @@ impl WitGenerator {
             }
         }
 
-        // Companion functions for enum methods (WIT enums/variants have none).
+        // Companion functions for enum methods (WIT enums/variants have
+        // none). Generic methods emit one mangled companion per declared
+        // instantiation, like resource methods.
         for id in &iface.type_ids {
             if let Some(TypeKind::Enum(e)) = registry.get_type(&haphe::TypeId::new(id)) {
                 let enum_name = plan.type_name(id).to_string();
                 for m in e.methods {
-                    let fn_name = member_names.insert(&format!("{}_{}", e.name, m.name))?;
-                    emit_function(p, m, Some(&enum_name), &fn_name, plan, None)?;
+                    if m.generic_params.is_empty() {
+                        let fn_name = member_names.insert(&format!("{}_{}", e.name, m.name))?;
+                        emit_function(p, m, Some(&enum_name), &fn_name, plan, None)?;
+                        continue;
+                    }
+                    for args in m.instantiations {
+                        let mangled = plan.mangle_fn_instance(m.name, args, None)?;
+                        let fn_name = member_names.insert(&format!("{}_{}", e.name, mangled))?;
+                        let fenv = plan.fn_env(m, args, None);
+                        emit_function(p, m, Some(&enum_name), &fn_name, plan, Some(&fenv))?;
+                    }
                 }
             }
         }
@@ -439,8 +450,19 @@ impl WitGenerator {
             {
                 let env = plan.env_for(registry, inst);
                 for m in e.methods {
-                    let fn_name = member_names.insert(&format!("{}-{}", inst.wit_name, m.name))?;
-                    emit_function(p, m, Some(&inst.wit_name), &fn_name, plan, Some(&env))?;
+                    if m.generic_params.is_empty() {
+                        let fn_name =
+                            member_names.insert(&format!("{}-{}", inst.wit_name, m.name))?;
+                        emit_function(p, m, Some(&inst.wit_name), &fn_name, plan, Some(&env))?;
+                        continue;
+                    }
+                    for args in m.instantiations {
+                        let mangled = plan.mangle_fn_instance(m.name, args, Some(&env))?;
+                        let fn_name =
+                            member_names.insert(&format!("{}-{}", inst.wit_name, mangled))?;
+                        let fenv = plan.fn_env(m, args, Some(&env));
+                        emit_function(p, m, Some(&inst.wit_name), &fn_name, plan, Some(&fenv))?;
+                    }
                 }
             }
         }
@@ -621,27 +643,29 @@ fn emit_resource(
 
     for m in s.methods {
         let context = format!("{}::{}", s.name, m.name);
-        p.doc(m.doc);
-        if let Some(kind) = m.error_kind {
-            p.doc(Some(&format!("Errors: {kind}")));
+        if m.generic_params.is_empty() {
+            let name = members.insert(m.name)?;
+            emit_resource_method(p, m, &name, wit_name, plan, env, &context)?;
+            continue;
         }
-        let name = members.insert(m.name)?;
-        let params = render_params(m, plan, env, &context)?;
-        let ret = render_fn_return(m, plan, env, &context)?;
-        let kw = fn_keyword(m);
-        match m.receiver {
-            Some(Receiver::Ref | Receiver::RefMut) => {
-                p.line(&format!("{name}: {kw}({params}){ret};"));
-            }
-            Some(Receiver::Owned) => {
-                let sep = if params.is_empty() { "" } else { ", " };
-                p.line(&format!(
-                    "{name}: static {kw}(this: {wit_name}{sep}{params}){ret};"
-                ));
-            }
-            None => {
-                p.line(&format!("{name}: static {kw}({params}){ret};"));
-            }
+        // Generic methods: one member per declared instantiation, under the
+        // same deterministic mangled name as generic free functions, with
+        // the type parameters substituted (dispatch-mode neutral — static
+        // and `dyn` declare the same monomorph set).
+        for args in m.instantiations {
+            let mangled = plan.mangle_fn_instance(m.name, args, env)?;
+            let name = members.insert(&mangled)?;
+            let arg_names: Vec<String> = args
+                .iter()
+                .map(|a| plan.mangle_type(a, env))
+                .collect::<Result<_, _>>()?;
+            p.doc(Some(&format!(
+                "haphe:generic-instance = {}<{}>",
+                m.name,
+                arg_names.join(", ")
+            )));
+            let fenv = plan.fn_env(m, args, env);
+            emit_resource_method(p, m, &name, wit_name, plan, Some(&fenv), &context)?;
         }
     }
 
@@ -657,6 +681,41 @@ fn emit_resource(
     }
 
     p.close();
+    Ok(())
+}
+
+/// Renders one resource member line for a method (plain, or one generic
+/// monomorph under its mangled `name` with the instantiation's `env`).
+fn emit_resource_method(
+    p: &mut Printer,
+    m: &FunctionDescriptor<'_>,
+    name: &str,
+    wit_name: &str,
+    plan: &Plan<'_>,
+    env: Option<&Env<'_, '_>>,
+    context: &str,
+) -> Result<(), WitGenError> {
+    p.doc(m.doc);
+    if let Some(kind) = m.error_kind {
+        p.doc(Some(&format!("Errors: {kind}")));
+    }
+    let params = render_params(m, plan, env, context)?;
+    let ret = render_fn_return(m, plan, env, context)?;
+    let kw = fn_keyword(m);
+    match m.receiver {
+        Some(Receiver::Ref | Receiver::RefMut) => {
+            p.line(&format!("{name}: {kw}({params}){ret};"));
+        }
+        Some(Receiver::Owned) => {
+            let sep = if params.is_empty() { "" } else { ", " };
+            p.line(&format!(
+                "{name}: static {kw}(this: {wit_name}{sep}{params}){ret};"
+            ));
+        }
+        None => {
+            p.line(&format!("{name}: static {kw}({params}){ret};"));
+        }
+    }
     Ok(())
 }
 

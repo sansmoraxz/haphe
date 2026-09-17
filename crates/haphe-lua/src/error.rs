@@ -46,6 +46,13 @@ pub enum LuaBindError {
         /// The colliding constructor name.
         name: &'static str,
     },
+    /// Two callables resolve to one entry (metatable method or module-table
+    /// function) — a static generic monomorph's mangled name collided with
+    /// another registration; the later would silently overwrite the earlier.
+    DuplicateMethod {
+        /// The colliding (mangled) name.
+        name: String,
+    },
     /// Two unit cases of an enum resolve to the same name in its Lua case
     /// table.
     DuplicateEnumCase {
@@ -157,6 +164,14 @@ impl std::fmt::Display for LuaBindError {
                      `traits(Default)` registers an implicit `default` constructor)"
                 )
             }
+            Self::DuplicateMethod { name } => {
+                write!(
+                    f,
+                    "two callables resolve to the entry `{name}`; a static generic \
+                     monomorph's mangled name must not collide with another \
+                     registration — rename it or adjust the instantiations"
+                )
+            }
             Self::UnsupportedAsyncCall { reason } => {
                 write!(
                     f,
@@ -225,6 +240,7 @@ impl std::error::Error for LuaBindError {
             Self::GenericForeignInterface { .. } => None,
             Self::ReservedMethod { .. } => None,
             Self::DuplicateConstructor { .. } => None,
+            Self::DuplicateMethod { .. } => None,
             Self::UnsupportedAsyncProperty { .. } => None,
             Self::DuplicateField { .. } => None,
             Self::DuplicateEnumCase { .. } => None,

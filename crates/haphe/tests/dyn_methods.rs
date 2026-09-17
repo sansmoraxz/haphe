@@ -36,6 +36,9 @@ struct DynBinder<T> {
     dyn_mut_methods: Vec<(Desc, Args, DynMutFn<T>)>,
     dyn_async_methods: Vec<(Desc, Args, DynAsyncFn<T>)>,
     dyn_async_mut_methods: Vec<(Desc, Args, DynAsyncMutFn<T>)>,
+    generic_methods: Vec<(&'static str, Args, DynFn<T>)>,
+    generic_mut_methods: Vec<(&'static str, Args, DynMutFn<T>)>,
+    generic_async_methods: Vec<(&'static str, Args, DynAsyncFn<T>)>,
     plain_methods: Vec<&'static str>,
 }
 
@@ -71,6 +74,36 @@ impl<T> TypeBinder<T> for DynBinder<T> {
         _: &'static str,
         _: for<'a> fn(&'a mut T, &'a [ScriptValue]) -> haphe::ScriptCallFuture<'a>,
     ) -> Result<(), NeverError> {
+        Ok(())
+    }
+
+    fn method_generic(
+        &mut self,
+        name: &'static str,
+        args: Args,
+        f: DynFn<T>,
+    ) -> Result<(), NeverError> {
+        self.generic_methods.push((name, args, f));
+        Ok(())
+    }
+
+    fn method_generic_mut(
+        &mut self,
+        name: &'static str,
+        args: Args,
+        f: DynMutFn<T>,
+    ) -> Result<(), NeverError> {
+        self.generic_mut_methods.push((name, args, f));
+        Ok(())
+    }
+
+    fn method_generic_async(
+        &mut self,
+        name: &'static str,
+        args: Args,
+        f: DynAsyncFn<T>,
+    ) -> Result<(), NeverError> {
+        self.generic_async_methods.push((name, args, f));
         Ok(())
     }
 
@@ -241,6 +274,9 @@ fn bound<T: ScriptBind>() -> DynBinder<T> {
         dyn_mut_methods: Vec::new(),
         dyn_async_methods: Vec::new(),
         dyn_async_mut_methods: Vec::new(),
+        generic_methods: Vec::new(),
+        generic_mut_methods: Vec::new(),
+        generic_async_methods: Vec::new(),
         plain_methods: Vec::new(),
     };
     T::bind(&mut binder).unwrap();
@@ -294,6 +330,26 @@ impl Holder {
     #[script(dyn, instantiate(i64))]
     async fn bump<T: Acc>(&mut self, value: T) {
         self.total += value.acc();
+    }
+
+    /// Static dispatch: declared monomorphs keyed on (name, type_args), no
+    /// runtime scan.
+    #[script(instantiate(i64), instantiate(String))]
+    fn first_of<T>(&self, a: T, b: T) -> T {
+        let _ = b;
+        a
+    }
+
+    /// Static dispatch on a `&mut self` generic.
+    #[script(instantiate(f64))]
+    fn add_in<T: Acc>(&mut self, value: T) {
+        self.total += value.acc();
+    }
+
+    /// Async static generic: monomorphs through the async sibling channel.
+    #[script(instantiate(i64))]
+    async fn tag_static<T: ToString>(&self, value: T) -> String {
+        value.to_string()
     }
 
     /// Non-generic methods still take the plain channel.
@@ -429,6 +485,70 @@ fn async_mut_dyn_methods_write_back_in_place() {
         ));
     }
     assert_eq!(holder.total, 10);
+}
+
+#[test]
+fn static_generic_methods_register_monomorphs() {
+    use haphe::ScriptImpl;
+    let binder = bound::<Holder>();
+    let firsts: Vec<_> = binder
+        .generic_methods
+        .iter()
+        .filter(|(name, _, _)| *name == "first_of")
+        .collect();
+    assert_eq!(firsts.len(), 2);
+    let (_, args, wrapper) = firsts[1];
+    assert_eq!(args[0], TypeDescriptor::String);
+    let holder = Holder { total: 0 };
+    let out = wrapper(
+        haphe::ScriptCow::Borrowed(&holder),
+        &[
+            ScriptValue::String("a".into()),
+            ScriptValue::String("b".into()),
+        ],
+    )
+    .unwrap();
+    assert!(matches!(out, ScriptValue::String(s) if s == "a"));
+    // The descriptor stays Static-dispatch.
+    assert!(Holder::METHODS.iter().any(|m| m.name == "first_of"
+        && m.dispatch == Dispatch::Static
+        && m.instantiations.len() == 2));
+
+    assert_eq!(binder.generic_mut_methods.len(), 1);
+    let (name, args, wrapper) = &binder.generic_mut_methods[0];
+    assert_eq!(*name, "add_in");
+    assert_eq!(
+        args[0],
+        TypeDescriptor::Primitive(haphe::PrimitiveType::F64)
+    );
+    let mut holder = Holder { total: 1 };
+    wrapper(&mut holder, &[ScriptValue::F64(4.0)]).unwrap();
+    assert_eq!(holder.total, 5);
+}
+
+#[test]
+fn async_static_generic_methods_use_the_async_sibling_channel() {
+    use std::future::Future;
+    use std::pin::pin;
+    use std::task::{Context, Poll, Waker};
+
+    let binder = bound::<Holder>();
+    assert_eq!(binder.generic_async_methods.len(), 1);
+    let (name, args, wrapper) = &binder.generic_async_methods[0];
+    assert_eq!(*name, "tag_static");
+    assert_eq!(
+        args[0],
+        TypeDescriptor::Primitive(haphe::PrimitiveType::I64)
+    );
+    let holder = Holder { total: 0 };
+    let script_args = [ScriptValue::I64(9)];
+    let fut = wrapper(haphe::ScriptCow::Borrowed(&holder), &script_args);
+    let mut fut = pin!(fut);
+    let mut cx = Context::from_waker(Waker::noop());
+    match fut.as_mut().poll(&mut cx) {
+        Poll::Ready(Ok(ScriptValue::String(s))) => assert_eq!(s, "9"),
+        other => panic!("unexpected poll result: {other:?}"),
+    }
 }
 
 #[test]

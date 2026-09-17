@@ -174,6 +174,68 @@ fn async_free_fn_binds_and_awaits() {
     }
 }
 
+// A STATIC async generic registers one monomorph per instantiation through
+// `function_async`, keyed on (name, type_args) — same channel non-generic
+// async functions use.
+#[haphe::script(instantiate(i64), instantiate(String))]
+async fn delayed_echo<T>(value: T) -> T {
+    value
+}
+
+#[test]
+fn async_static_generic_free_fn_binds_monomorphs() {
+    use std::future::Future;
+    use std::pin::pin;
+    use std::task::{Context, Poll, Waker};
+
+    use haphe::{FnBinder, ScriptBindFn, ScriptCallFuture, ScriptValue, TypeDescriptor};
+
+    type AsyncWrapper = for<'a> fn(&'a [ScriptValue]) -> ScriptCallFuture<'a>;
+    #[derive(Default)]
+    struct CollectAsync(
+        Vec<(
+            &'static str,
+            &'static [TypeDescriptor<'static>],
+            AsyncWrapper,
+        )>,
+    );
+    impl FnBinder for CollectAsync {
+        type Error = std::convert::Infallible;
+        fn function(
+            &mut self,
+            _: &'static str,
+            _: &'static [TypeDescriptor<'static>],
+            _: fn(&[ScriptValue]) -> Result<ScriptValue, haphe::ScriptConvertError>,
+        ) -> Result<(), Self::Error> {
+            panic!("async generic must not use the sync channel");
+        }
+        fn function_async(
+            &mut self,
+            name: &'static str,
+            type_args: &'static [TypeDescriptor<'static>],
+            f: AsyncWrapper,
+        ) -> Result<(), Self::Error> {
+            self.0.push((name, type_args, f));
+            Ok(())
+        }
+    }
+
+    let mut binder = CollectAsync::default();
+    <delayed_echo as ScriptBindFn>::bind(&mut binder).unwrap();
+    assert_eq!(binder.0.len(), 2);
+    let (name, type_args, f) = binder.0[1];
+    assert_eq!(name, "delayed_echo");
+    assert_eq!(type_args[0], TypeDescriptor::String);
+    let args = [ScriptValue::String("hi".into())];
+    let fut = f(&args);
+    let mut fut = pin!(fut);
+    let mut cx = Context::from_waker(Waker::noop());
+    match fut.as_mut().poll(&mut cx) {
+        Poll::Ready(Ok(ScriptValue::String(s))) => assert_eq!(s, "hi"),
+        other => panic!("unexpected poll result: {other:?}"),
+    }
+}
+
 // A dyn generic registers one candidate per instantiation through the dyn
 // channel, carrying the full descriptor for runtime ranking.
 #[haphe::script(dyn, instantiate(i64), instantiate(String))]

@@ -91,6 +91,23 @@ fn no_match_try_calls_in_order_then_lists_candidates() {
     assert!(err.contains("which<string>(value: string)"), "got: {err}");
 }
 
+#[cfg(feature = "generics")]
+#[test]
+fn static_generic_binds_mangled_monomorphs() {
+    // Static generics now monomorphize under mangled names (one table
+    // entry per instantiation) instead of being rejected.
+    let lua = Lua::new();
+    let table = lua.create_table().unwrap();
+    haphe_lua::bind_fn::<stat>(&lua, &table).unwrap();
+    lua.globals().set("fns", table).unwrap();
+    let out: i64 = lua.load("return fns.stat__i64(7)").eval().unwrap();
+    assert_eq!(out, 7);
+    // The unmangled name stays absent — static dispatch has no scan.
+    let is_nil: bool = lua.load("return fns.stat == nil").eval().unwrap();
+    assert!(is_nil);
+}
+
+#[cfg(not(feature = "generics"))]
 #[test]
 fn static_generic_still_rejected_at_bind() {
     let lua = Lua::new();

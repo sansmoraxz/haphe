@@ -283,10 +283,10 @@ fn emit_struct(
 
     // Methods, colon syntax. `self`-consuming methods are exposed the same
     // way at runtime; static methods (no receiver) live on the type table
-    // with the constructors. Generic methods are dyn-only (one callable
-    // scanning instantiations), stubbed like dyn free functions; static
-    // generic methods have no runtime dispatch, so nothing truthful exists
-    // to describe.
+    // with the constructors. Generic methods stub per their dispatch mode:
+    // `dyn` gets one callable scanning instantiations (like dyn free
+    // functions); static dispatch gets one stub per instantiation under its
+    // mangled monomorph name — matching the runtime's metatable entries.
     for m in s.methods {
         if m.receiver.is_some() {
             let prefix = format!("{}:", s.name);
@@ -294,9 +294,17 @@ fn emit_struct(
             if !m.generic_params.is_empty() {
                 if m.dispatch == haphe::Dispatch::Dyn {
                     emit_dyn_signature(out, registry, m, m.instantiations, &prefix, &context)?;
-                    continue;
+                } else {
+                    emit_static_generic_signatures(
+                        out,
+                        registry,
+                        m,
+                        m.instantiations,
+                        &prefix,
+                        &context,
+                    )?;
                 }
-                return Err(LuaDeclError::GenericFunction { name: context });
+                continue;
             }
             emit_function(out, registry, m, &prefix, &context)?;
         }
@@ -544,9 +552,17 @@ fn emit_module(
                                     &prefix,
                                     &context,
                                 )?;
-                                continue;
+                            } else {
+                                emit_static_generic_signatures(
+                                    out,
+                                    registry,
+                                    m,
+                                    m.instantiations,
+                                    &prefix,
+                                    &context,
+                                )?;
                             }
-                            return Err(LuaDeclError::GenericFunction { name: context });
+                            continue;
                         }
                         emit_function(out, registry, m, &prefix, &context)?;
                     }
@@ -579,9 +595,17 @@ fn emit_module(
                 )?;
                 continue;
             }
-            return Err(LuaDeclError::GenericFunction {
-                name: function.name.to_string(),
-            });
+            let instantiations: Vec<&[TypeDescriptor<'_>]> =
+                module.instantiations_of(function).collect();
+            emit_static_generic_signatures(
+                out,
+                registry,
+                function,
+                &instantiations,
+                &format!("{path}."),
+                &format!("{path}.{}", function.name),
+            )?;
+            continue;
         }
         emit_function(
             out,
@@ -731,6 +755,54 @@ fn emit_dyn_signature(
         f.name,
         names.join(", ")
     );
+    Ok(())
+}
+
+/// Emits a STATICALLY dispatched generic method: one full stub per declared
+/// instantiation under its mangled monomorph name (`first_of__i64`), the
+/// signature substituted with that instantiation's type arguments —
+/// matching the runtime's per-monomorph metatable entries exactly.
+fn emit_static_generic_signatures(
+    out: &mut String,
+    registry: &ValidatedRegistry<'_>,
+    f: &FunctionDescriptor<'_>,
+    instantiations: &[&[TypeDescriptor<'_>]],
+    prefix: &str,
+    context: &str,
+) -> Result<(), LuaDeclError> {
+    if instantiations.is_empty() {
+        // Unreachable through the macro (static generics require
+        // instantiate), but hand-written descriptors stay loud.
+        return Err(LuaDeclError::GenericFunction {
+            name: context.to_string(),
+        });
+    }
+    for args in instantiations {
+        let mangled = crate::binder::mangle_generic_name(f.name, args);
+        let subst = haphe::dispatch::GenericSubst {
+            params: f.generic_params,
+            args,
+        };
+        emit_doc(out, f.doc);
+        let mut names = Vec::new();
+        for p in f.params {
+            let ty = render_subst(registry, p.ty, context, Some(&subst))?;
+            let _ = writeln!(out, "---@param {} {ty}", p.name);
+            names.push(p.name);
+        }
+        match f.return_type {
+            TypeDescriptor::Unit => {}
+            ty => {
+                let ret = render_subst(registry, ty, context, Some(&subst))?;
+                let _ = writeln!(out, "---@return {ret}");
+            }
+        }
+        let _ = writeln!(
+            out,
+            "function {prefix}{mangled}({}) end\n",
+            names.join(", ")
+        );
+    }
     Ok(())
 }
 

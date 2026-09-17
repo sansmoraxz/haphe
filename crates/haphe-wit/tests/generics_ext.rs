@@ -4,7 +4,7 @@
 #![cfg(feature = "generics")]
 #![allow(dead_code)]
 
-use haphe::{ForeignError, script};
+use haphe::{ForeignError, Script, script};
 use haphe_wit::WitGenerator;
 
 /// Echoes a value.
@@ -153,6 +153,140 @@ fn mixed_sources_dedupe_and_union() {
     );
     assert!(
         wit.contains("echo-bool: func(value: bool) -> bool;"),
+        "got:\n{wit}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Static generic METHOD monomorphs: resource members and enum companions
+// under the same mangled names as generic free functions.
+// ---------------------------------------------------------------------------
+
+/// Holds a running total.
+#[derive(Script, Clone)]
+#[script(thread_safety = send_sync, methods)]
+struct Holder {
+    total: i64,
+}
+
+#[script]
+impl Holder {
+    /// Picks the first of two values.
+    #[script(instantiate(i64), instantiate(String))]
+    fn first_of<T>(&self, a: T, b: T) -> T {
+        let _ = b;
+        a
+    }
+
+    /// Accumulates a value.
+    #[script(instantiate(i64))]
+    fn add_in<T: Into<i64>>(&mut self, value: T) {
+        self.total += value.into();
+    }
+}
+
+/// Selection mode.
+#[derive(Script, Clone)]
+#[script(thread_safety = send_sync, methods)]
+enum Mode {
+    First,
+    Second,
+}
+
+#[script]
+impl Mode {
+    /// Picks by mode.
+    #[script(instantiate(bool))]
+    fn pick<T>(&self, a: T, b: T) -> T {
+        match self {
+            Mode::First => a,
+            Mode::Second => b,
+        }
+    }
+}
+
+haphe::registry! {
+    pub static METHOD_MONOMORPHS = {
+        structs: [Holder],
+        enums: [Mode],
+    };
+}
+
+#[test]
+fn generic_method_monomorphs_are_emitted() {
+    let wit = generate_from(&METHOD_MONOMORPHS);
+    assert!(
+        wit.contains("/// haphe:generic-instance = first_of<s64>"),
+        "got:\n{wit}"
+    );
+    assert!(
+        wit.contains("first-of-s64: func(a: s64, b: s64) -> s64;"),
+        "got:\n{wit}"
+    );
+    assert!(
+        wit.contains("first-of-string: func(a: string, b: string) -> string;"),
+        "got:\n{wit}"
+    );
+    assert!(wit.contains("add-in-s64: func(value: s64);"), "got:\n{wit}");
+    // The un-mangled generic signatures never appear.
+    assert!(!wit.contains("first-of: func"), "got:\n{wit}");
+}
+
+#[test]
+fn generic_enum_method_monomorphs_are_companions() {
+    let wit = generate_from(&METHOD_MONOMORPHS);
+    assert!(
+        wit.contains("mode-pick-bool: func(this: mode, a: bool, b: bool) -> bool;"),
+        "got:\n{wit}"
+    );
+}
+
+// Async generic methods emit monomorphs too (async is a runtime lifting
+// concern; the text is dispatch- and asyncness-agnostic apart from the
+// keyword). Hand-built: the descriptor is all the generator consumes.
+static ASYNC_GENERIC_METHOD: [haphe::FunctionDescriptor; 1] = [haphe::FunctionDescriptor {
+    name: "fetch",
+    doc: None,
+    receiver: Some(haphe::Receiver::Ref),
+    generic_params: &[haphe::GenericParam {
+        name: "T",
+        bounds: &[],
+        default: None,
+    }],
+    instantiations: &[&[haphe::TypeDescriptor::I64]],
+    dispatch: haphe::Dispatch::Static,
+    params: &[haphe::ParamDescriptor {
+        name: "key",
+        ty: &haphe::TypeDescriptor::GenericParam("T"),
+        ownership: haphe::Ownership::Owned,
+    }],
+    return_type: &haphe::TypeDescriptor::GenericParam("T"),
+    return_ownership: haphe::Ownership::Owned,
+    is_async: true,
+    error_kind: None,
+}];
+
+static ASYNC_HOLDER: [haphe::StructDescriptor; 1] = [haphe::StructDescriptor {
+    id: haphe::TypeId::new("test::AsyncHolder"),
+    name: "AsyncHolder",
+    doc: None,
+    fields: &[],
+    methods: &ASYNC_GENERIC_METHOD,
+    constructors: &[],
+    properties: &[],
+    trait_impls: &[],
+    thread_safety: haphe::ThreadSafety::SEND_SYNC,
+    generic_params: &[],
+}];
+
+static ASYNC_REGISTRY: haphe::TypeRegistry =
+    haphe::TypeRegistry::new(&ASYNC_HOLDER, &[], &[], &[], &[], &[]);
+
+#[test]
+fn async_generic_method_monomorphs_are_emitted() {
+    let wit = generate_from(&ASYNC_REGISTRY);
+    assert!(
+        wit.contains("fetch-s64: async func(key: s64) -> s64;"),
         "got:\n{wit}"
     );
 }

@@ -33,15 +33,18 @@ pub struct BindMethod {
     pub return_ty: Option<Type>,
 }
 
-/// A `dyn`-dispatched generic method: one wrapper per declared instantiation,
-/// registered through the descriptor-carrying `method_dyn*` channels.
-pub struct DynBindMethod {
+/// A generic method: one monomorphized wrapper per declared instantiation.
+/// `dyn`-dispatched ones register through the descriptor-carrying
+/// `method_dyn*` channels; statically dispatched ones through
+/// `method_generic*`, keyed on `(name, type_args)`.
+pub struct GenericBindMethod {
     pub method: BindMethod,
     /// The function's own generic type parameters, in declaration order.
     pub type_params: Vec<Ident>,
     /// Declared instantiations: concrete type arguments per entry.
     pub instantiations: Vec<(Vec<Type>, proc_macro2::Span)>,
     pub is_async: bool,
+    pub dyn_dispatch: bool,
     /// The method's `FunctionDescriptor { ... }` literal.
     pub descriptor: TokenStream,
 }
@@ -205,7 +208,7 @@ pub struct BindImplInput<'a> {
     pub methods: &'a [BindMethod],
     pub async_methods: &'a [BindMethod],
     pub dispatch_methods: &'a [BindMethod],
-    pub dyn_methods: &'a [DynBindMethod],
+    pub generic_methods: &'a [GenericBindMethod],
     pub constructors: &'a [BindMethod],
     pub async_constructors: &'a [BindMethod],
     pub property_regs: &'a [TokenStream],
@@ -219,7 +222,7 @@ pub fn gen_impl_bind_methods(input: BindImplInput<'_>) -> TokenStream {
         methods,
         async_methods,
         dispatch_methods,
-        dyn_methods,
+        generic_methods,
         constructors,
         async_constructors,
         property_regs,
@@ -227,9 +230,9 @@ pub fn gen_impl_bind_methods(input: BindImplInput<'_>) -> TokenStream {
     } = input;
     let mod_ident = hidden_mod_ident(ident);
     let method_regs = methods.iter().map(|m| gen_method_registration(self_ty, m));
-    let dyn_regs = dyn_methods
+    let generic_regs = generic_methods
         .iter()
-        .map(|m| gen_dyn_method_registration(self_ty, m));
+        .map(|m| gen_generic_method_registration(self_ty, m));
     let async_ctor_regs = async_constructors
         .iter()
         .map(|c| gen_async_constructor_registration(self_ty, c));
@@ -265,7 +268,7 @@ pub fn gen_impl_bind_methods(input: BindImplInput<'_>) -> TokenStream {
                 #(#method_regs)*
                 #(#async_regs)*
                 #(#dispatch_regs)*
-                #(#dyn_regs)*
+                #(#generic_regs)*
                 ::core::result::Result::Ok(())
             }
         }

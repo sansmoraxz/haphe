@@ -217,6 +217,53 @@ type ScalarOverload<T> = (
     ScriptArithScalar<T>,
 );
 
+/// Mangled per-monomorph name for a STATICALLY dispatched generic method:
+/// the exposed name, a double underscore, then each type argument's
+/// identifier-safe rendering joined by single underscores —
+/// `first_of__i64`, `first_of__string`, `pick__i64_bool`. Lua dispatches by
+/// name only, so every declared instantiation gets its own metatable entry
+/// under this name (`obj:first_of__i64(...)`); decl stubs use the same
+/// spelling.
+pub(crate) fn mangle_generic_name(name: &str, type_args: &[haphe::TypeDescriptor<'_>]) -> String {
+    let args: Vec<String> = type_args.iter().map(mangle_ty).collect();
+    format!("{name}__{}", args.join("_"))
+}
+
+/// Identifier-safe rendering of one concrete type argument for
+/// [`mangle_generic_name`]. Lowercase, `[a-z0-9_]` only.
+fn mangle_ty(ty: &haphe::TypeDescriptor<'_>) -> String {
+    use haphe::TypeDescriptor as T;
+    match crate::peel_borrowed(ty) {
+        T::Primitive(p) => format!("{p:?}").to_lowercase(),
+        T::String => "string".into(),
+        T::Bytes => "bytes".into(),
+        T::Unit => "unit".into(),
+        T::Option(inner) => format!("opt_{}", mangle_ty(inner)),
+        T::List(inner) | T::Array(inner, _) => format!("list_{}", mangle_ty(inner)),
+        T::Map(k, v) => format!("map_{}_{}", mangle_ty(k), mangle_ty(v)),
+        T::Tuple(elems) => {
+            let parts: Vec<String> = elems.iter().map(mangle_ty).collect();
+            format!("tuple_{}", parts.join("_"))
+        }
+        T::Ref(id) | T::Instance { id, .. } => id
+            .as_str()
+            .rsplit("::")
+            .next()
+            .unwrap_or("ref")
+            .to_lowercase(),
+        other => format!("{other:?}")
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() {
+                    c.to_ascii_lowercase()
+                } else {
+                    '_'
+                }
+            })
+            .collect(),
+    }
+}
+
 struct FieldReg<T: 'static> {
     name: &'static str,
     getter: FieldGetFn<T>,
@@ -295,6 +342,15 @@ pub(crate) struct LuaTypeBinder<T: 'static> {
     dyn_methods: Vec<(&'static str, Vec<DynFn<CowMethodFn<T>>>)>,
     #[cfg(feature = "generics")]
     dyn_mut_methods: Vec<(&'static str, Vec<DynFn<ScriptMethodMut<T>>>)>,
+    /// Static generic monomorphs, keyed by mangled per-instantiation name.
+    #[cfg(feature = "generics")]
+    generic_methods: Vec<(String, CowMethodFn<T>)>,
+    #[cfg(feature = "generics")]
+    generic_mut_methods: Vec<(String, ScriptMethodMut<T>)>,
+    #[cfg(all(feature = "generics", feature = "async", not(feature = "send")))]
+    generic_async_methods: Vec<(String, AsyncCowFn<T>)>,
+    #[cfg(all(feature = "generics", feature = "async", not(feature = "send")))]
+    generic_async_mut_methods: Vec<(String, AsyncMutFn<T>)>,
     #[cfg(all(feature = "generics", feature = "async", not(feature = "send")))]
     dyn_async_methods: Vec<(&'static str, Vec<DynFn<AsyncCowFn<T>>>)>,
     #[cfg(all(feature = "generics", feature = "async", not(feature = "send")))]
@@ -338,6 +394,14 @@ impl<T: 'static + Clone + mlua::MaybeSend + mlua::MaybeSync> LuaTypeBinder<T> {
             dyn_methods: Vec::new(),
             #[cfg(feature = "generics")]
             dyn_mut_methods: Vec::new(),
+            #[cfg(feature = "generics")]
+            generic_methods: Vec::new(),
+            #[cfg(feature = "generics")]
+            generic_mut_methods: Vec::new(),
+            #[cfg(all(feature = "generics", feature = "async", not(feature = "send")))]
+            generic_async_methods: Vec::new(),
+            #[cfg(all(feature = "generics", feature = "async", not(feature = "send")))]
+            generic_async_mut_methods: Vec::new(),
             #[cfg(all(feature = "generics", feature = "async", not(feature = "send")))]
             dyn_async_methods: Vec::new(),
             #[cfg(all(feature = "generics", feature = "async", not(feature = "send")))]
@@ -374,6 +438,34 @@ impl<T: 'static + Clone + mlua::MaybeSend + mlua::MaybeSync> LuaTypeBinder<T> {
         {
             dyn_method_names.extend(self.dyn_methods.iter().map(|(n, _)| *n));
             dyn_method_names.extend(self.dyn_mut_methods.iter().map(|(n, _)| *n));
+        }
+        // Static generic monomorphs land under mangled names; a collision
+        // (same-named mangles, or a mangle shadowing a declared method)
+        // would silently overwrite the earlier metatable entry.
+        #[cfg(feature = "generics")]
+        {
+            let mut seen: Vec<&str> = self
+                .methods
+                .iter()
+                .map(|m| m.name)
+                .chain(self.mut_methods.iter().map(|m| m.name))
+                .chain(dyn_method_names.iter().copied())
+                .collect();
+            let generic_names = self
+                .generic_methods
+                .iter()
+                .map(|(n, _)| n)
+                .chain(self.generic_mut_methods.iter().map(|(n, _)| n));
+            #[cfg(all(feature = "async", not(feature = "send")))]
+            let generic_names = generic_names
+                .chain(self.generic_async_methods.iter().map(|(n, _)| n))
+                .chain(self.generic_async_mut_methods.iter().map(|(n, _)| n));
+            for name in generic_names {
+                if seen.contains(&name.as_str()) {
+                    return Err(LuaBindError::DuplicateMethod { name: name.clone() });
+                }
+                seen.push(name.as_str());
+            }
         }
         #[cfg(all(feature = "generics", feature = "async", not(feature = "send")))]
         {
@@ -574,6 +666,81 @@ impl<T: 'static + Clone + mlua::MaybeSend + mlua::MaybeSync> LuaTypeBinder<T> {
                         f(&mut *this, &sv_args).map_err(|e| mlua::Error::runtime(e.to_string()))?;
                     script_to_lua(lua, result)
                 });
+            }
+
+            // Static generic monomorphs: one plain method per declared
+            // instantiation under its mangled name — dispatch is exact (no
+            // scan, no fall-through; a wrong-typed argument is a conversion
+            // error like any non-generic method).
+            #[cfg(feature = "generics")]
+            for (name, f) in &self.generic_methods {
+                let f = *f;
+                reg.add_function(name.as_str(), move |lua, args: mlua::MultiValue| {
+                    let mut v = args.into_vec();
+                    let ud: mlua::AnyUserData = mlua::FromLua::from_lua(v.remove(0), lua)?;
+                    let this = ud.borrow::<T>()?;
+                    let sv_args: Vec<ScriptValue> =
+                        v.iter().map(lua_to_script).collect::<mlua::Result<_>>()?;
+                    let result = f(ScriptCow::Borrowed(&this), &sv_args)
+                        .map_err(|e| mlua::Error::runtime(e.to_string()))?;
+                    script_to_lua(lua, result)
+                });
+            }
+            #[cfg(feature = "generics")]
+            for (name, f) in &self.generic_mut_methods {
+                let f = *f;
+                reg.add_function(name.as_str(), move |lua, args: mlua::MultiValue| {
+                    let mut v = args.into_vec();
+                    let ud: mlua::AnyUserData = mlua::FromLua::from_lua(v.remove(0), lua)?;
+                    let mut this = ud.borrow_mut::<T>()?;
+                    let sv_args: Vec<ScriptValue> =
+                        v.iter().map(lua_to_script).collect::<mlua::Result<_>>()?;
+                    let result =
+                        f(&mut *this, &sv_args).map_err(|e| mlua::Error::runtime(e.to_string()))?;
+                    script_to_lua(lua, result)
+                });
+            }
+
+            // Async static generic monomorphs: same per-instantiation
+            // mangled entries, awaited bodies — the async block owns the
+            // guard, the wrapper's future borrows it (mutably for
+            // `&mut self`, so mutation persists).
+            #[cfg(all(feature = "generics", feature = "async", not(feature = "send")))]
+            for (name, f) in &self.generic_async_methods {
+                let f = *f;
+                reg.add_async_method(
+                    name.as_str(),
+                    move |lua, this: mlua::UserDataRef<T>, args: mlua::MultiValue| {
+                        let sv_args: mlua::Result<Vec<ScriptValue>> =
+                            args.into_vec().iter().map(lua_to_script).collect();
+                        async move {
+                            let sv_args = sv_args?;
+                            let out = f(ScriptCow::Borrowed(&this), &sv_args)
+                                .await
+                                .map_err(|e| mlua::Error::runtime(e.to_string()))?;
+                            script_to_lua(&lua, out)
+                        }
+                    },
+                );
+            }
+            #[cfg(all(feature = "generics", feature = "async", not(feature = "send")))]
+            for (name, f) in &self.generic_async_mut_methods {
+                let f = *f;
+                reg.add_async_method_mut(
+                    name.as_str(),
+                    move |lua, this: mlua::UserDataRefMut<T>, args: mlua::MultiValue| {
+                        let sv_args: mlua::Result<Vec<ScriptValue>> =
+                            args.into_vec().iter().map(lua_to_script).collect();
+                        async move {
+                            let mut this = this;
+                            let sv_args = sv_args?;
+                            let out = f(&mut this, &sv_args)
+                                .await
+                                .map_err(|e| mlua::Error::runtime(e.to_string()))?;
+                            script_to_lua(&lua, out)
+                        }
+                    },
+                );
             }
 
             // Dyn generic methods: ONE Lua method per name scans its
@@ -1361,6 +1528,116 @@ impl<T: 'static + Clone + mlua::MaybeSend + mlua::MaybeSync> TypeBinder<T> for L
         }
     }
 
+    fn method_generic(
+        &mut self,
+        name: &'static str,
+        type_args: &'static [haphe::TypeDescriptor<'static>],
+        f: CowMethodFn<T>,
+    ) -> Result<(), Self::Error> {
+        #[cfg(not(feature = "generics"))]
+        {
+            let _ = (type_args, f);
+            Err(LuaBindError::GenericFunction { name })
+        }
+        #[cfg(feature = "generics")]
+        {
+            self.generic_methods
+                .push((mangle_generic_name(name, type_args), f));
+            Ok(())
+        }
+    }
+
+    fn method_generic_mut(
+        &mut self,
+        name: &'static str,
+        type_args: &'static [haphe::TypeDescriptor<'static>],
+        f: ScriptMethodMut<T>,
+    ) -> Result<(), Self::Error> {
+        #[cfg(not(feature = "generics"))]
+        {
+            let _ = (type_args, f);
+            Err(LuaBindError::GenericFunction { name })
+        }
+        #[cfg(feature = "generics")]
+        {
+            self.generic_mut_methods
+                .push((mangle_generic_name(name, type_args), f));
+            Ok(())
+        }
+    }
+
+    fn method_generic_async(
+        &mut self,
+        name: &'static str,
+        type_args: &'static [haphe::TypeDescriptor<'static>],
+        f: AsyncCowFn<T>,
+    ) -> Result<(), Self::Error> {
+        #[cfg(not(feature = "generics"))]
+        {
+            let _ = (type_args, f);
+            Err(LuaBindError::GenericFunction { name })
+        }
+        #[cfg(all(feature = "generics", not(feature = "async")))]
+        {
+            let _ = (type_args, f);
+            Err(LuaBindError::UnsupportedAsyncMethod {
+                name,
+                reason: "enable this backend's `async` feature",
+            })
+        }
+        #[cfg(all(feature = "generics", feature = "async", feature = "send"))]
+        {
+            let _ = (type_args, f);
+            Err(LuaBindError::UnsupportedAsyncMethod {
+                name,
+                reason: "the `send` feature demands `Send` futures, and async method \
+                         futures are deliberately not Send",
+            })
+        }
+        #[cfg(all(feature = "generics", feature = "async", not(feature = "send")))]
+        {
+            self.generic_async_methods
+                .push((mangle_generic_name(name, type_args), f));
+            Ok(())
+        }
+    }
+
+    fn method_generic_async_mut(
+        &mut self,
+        name: &'static str,
+        type_args: &'static [haphe::TypeDescriptor<'static>],
+        f: AsyncMutFn<T>,
+    ) -> Result<(), Self::Error> {
+        #[cfg(not(feature = "generics"))]
+        {
+            let _ = (type_args, f);
+            Err(LuaBindError::GenericFunction { name })
+        }
+        #[cfg(all(feature = "generics", not(feature = "async")))]
+        {
+            let _ = (type_args, f);
+            Err(LuaBindError::UnsupportedAsyncMethod {
+                name,
+                reason: "enable this backend's `async` feature",
+            })
+        }
+        #[cfg(all(feature = "generics", feature = "async", feature = "send"))]
+        {
+            let _ = (type_args, f);
+            Err(LuaBindError::UnsupportedAsyncMethod {
+                name,
+                reason: "the `send` feature demands `Send` futures, and async method \
+                         futures are deliberately not Send",
+            })
+        }
+        #[cfg(all(feature = "generics", feature = "async", not(feature = "send")))]
+        {
+            self.generic_async_mut_methods
+                .push((mangle_generic_name(name, type_args), f));
+            Ok(())
+        }
+    }
+
     fn method_dyn(
         &mut self,
         descriptor: &'static haphe::FunctionDescriptor<'static>,
@@ -1645,6 +1922,11 @@ pub(crate) struct LuaFnBinder {
     functions: Vec<(&'static str, ScriptFnPtr)>,
     #[cfg(all(feature = "async", not(feature = "send")))]
     async_functions: Vec<(&'static str, AsyncFnPtr)>,
+    /// Static generic monomorphs, keyed by mangled per-instantiation name.
+    #[cfg(feature = "generics")]
+    generic_functions: Vec<(String, ScriptFnPtr)>,
+    #[cfg(all(feature = "generics", feature = "async", not(feature = "send")))]
+    generic_async_functions: Vec<(String, AsyncFnPtr)>,
     #[cfg(feature = "generics")]
     dyn_functions: Vec<(&'static str, Vec<DynFn<ScriptFnPtr>>)>,
     #[cfg(all(feature = "generics", feature = "async", not(feature = "send")))]
@@ -1658,6 +1940,10 @@ impl LuaFnBinder {
             #[cfg(all(feature = "async", not(feature = "send")))]
             async_functions: Vec::new(),
             #[cfg(feature = "generics")]
+            generic_functions: Vec::new(),
+            #[cfg(all(feature = "generics", feature = "async", not(feature = "send")))]
+            generic_async_functions: Vec::new(),
+            #[cfg(feature = "generics")]
             dyn_functions: Vec::new(),
             #[cfg(all(feature = "generics", feature = "async", not(feature = "send")))]
             dyn_async_functions: Vec::new(),
@@ -1666,6 +1952,55 @@ impl LuaFnBinder {
 
     /// Register all collected functions onto the given Lua table.
     pub fn apply(self, lua: &Lua, table: &mlua::Table) -> Result<(), LuaBindError> {
+        // Static generic monomorphs land under mangled names next to the
+        // plain functions; a collision would silently overwrite the earlier
+        // table entry.
+        #[cfg(feature = "generics")]
+        {
+            let mut seen: Vec<&str> = self.functions.iter().map(|(n, _)| *n).collect();
+            #[cfg(all(feature = "async", not(feature = "send")))]
+            seen.extend(self.async_functions.iter().map(|(n, _)| *n));
+            let generic_names = self.generic_functions.iter().map(|(n, _)| n);
+            #[cfg(all(feature = "async", not(feature = "send")))]
+            let generic_names =
+                generic_names.chain(self.generic_async_functions.iter().map(|(n, _)| n));
+            for name in generic_names {
+                if seen.contains(&name.as_str()) {
+                    return Err(LuaBindError::DuplicateMethod { name: name.clone() });
+                }
+                seen.push(name.as_str());
+            }
+        }
+        // Static generic monomorphs: one plain callable per declared
+        // instantiation under its mangled name — dispatch is exact, no scan.
+        #[cfg(feature = "generics")]
+        for (name, f) in self.generic_functions {
+            let lua_fn = lua.create_function(move |lua, args: mlua::MultiValue| {
+                let script_args: Vec<ScriptValue> = args
+                    .into_vec()
+                    .iter()
+                    .map(lua_to_script)
+                    .collect::<mlua::Result<_>>()?;
+                let result = f(&script_args).map_err(|e| mlua::Error::runtime(e.to_string()))?;
+                script_to_lua(lua, result)
+            })?;
+            table.set(name, lua_fn)?;
+        }
+        #[cfg(all(feature = "generics", feature = "async", not(feature = "send")))]
+        for (name, f) in self.generic_async_functions {
+            let lua_fn = lua.create_async_function(move |lua, args: mlua::MultiValue| {
+                let sv_args: mlua::Result<Vec<ScriptValue>> =
+                    args.into_vec().iter().map(lua_to_script).collect();
+                async move {
+                    let sv_args = sv_args?;
+                    let out = f(&sv_args)
+                        .await
+                        .map_err(|e| mlua::Error::runtime(e.to_string()))?;
+                    script_to_lua(&lua, out)
+                }
+            })?;
+            table.set(name, lua_fn)?;
+        }
         for (name, f) in self.functions {
             let lua_fn = lua.create_function(move |lua, args: mlua::MultiValue| {
                 let script_args: Vec<ScriptValue> = args
@@ -1760,10 +2095,21 @@ impl FnBinder for LuaFnBinder {
         type_args: &'static [haphe::TypeDescriptor<'static>],
         f: fn(&[ScriptValue]) -> Result<ScriptValue, haphe::ScriptConvertError>,
     ) -> Result<(), Self::Error> {
-        // Lua dispatch is by name only; monomorphized instantiations of a
-        // generic function would silently shadow each other.
+        // Lua dispatch is by name only: a static generic monomorph gets its
+        // own mangled table entry per instantiation (generics feature);
+        // without it, same-named instantiations would silently shadow each
+        // other.
         if !type_args.is_empty() {
-            return Err(LuaBindError::GenericFunction { name });
+            #[cfg(not(feature = "generics"))]
+            {
+                return Err(LuaBindError::GenericFunction { name });
+            }
+            #[cfg(feature = "generics")]
+            {
+                self.generic_functions
+                    .push((mangle_generic_name(name, type_args), f));
+                return Ok(());
+            }
         }
         self.functions.push((name, f));
         Ok(())
@@ -1775,12 +2121,13 @@ impl FnBinder for LuaFnBinder {
         type_args: &'static [haphe::TypeDescriptor<'static>],
         f: for<'a> fn(&'a [ScriptValue]) -> haphe::ScriptCallFuture<'a>,
     ) -> Result<(), Self::Error> {
+        #[cfg(not(feature = "generics"))]
         if !type_args.is_empty() {
             return Err(LuaBindError::GenericFunction { name });
         }
         #[cfg(not(feature = "async"))]
         {
-            let _ = f;
+            let _ = (type_args, f);
             Err(LuaBindError::UnsupportedAsyncFunction {
                 name,
                 reason: "enable this backend's `async` feature",
@@ -1788,7 +2135,7 @@ impl FnBinder for LuaFnBinder {
         }
         #[cfg(all(feature = "async", feature = "send"))]
         {
-            let _ = f;
+            let _ = (type_args, f);
             Err(LuaBindError::UnsupportedAsyncFunction {
                 name,
                 reason: "the `send` feature demands `Send` futures, and async function \
@@ -1797,6 +2144,12 @@ impl FnBinder for LuaFnBinder {
         }
         #[cfg(all(feature = "async", not(feature = "send")))]
         {
+            #[cfg(feature = "generics")]
+            if !type_args.is_empty() {
+                self.generic_async_functions
+                    .push((mangle_generic_name(name, type_args), f));
+                return Ok(());
+            }
             self.async_functions.push((name, f));
             Ok(())
         }

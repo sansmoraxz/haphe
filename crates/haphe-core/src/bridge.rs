@@ -546,6 +546,31 @@ pub trait TypeBinder<T>: Sized {
         self.method_mut(name, f)
     }
 
+    /// Async sibling of [`method_generic`](Self::method_generic);
+    /// async-capability gating applies, like
+    /// [`method_async`](Self::method_async).
+    fn method_generic_async(
+        &mut self,
+        name: &'static str,
+        type_args: &'static [crate::types::TypeDescriptor<'static>],
+        f: for<'a> fn(ScriptCow<'a, T>, &'a [ScriptValue]) -> ScriptCallFuture<'a>,
+    ) -> Result<(), Self::Error> {
+        let _ = type_args;
+        self.method_async(name, f)
+    }
+
+    /// Async `&mut self` sibling of
+    /// [`method_generic`](Self::method_generic).
+    fn method_generic_async_mut(
+        &mut self,
+        name: &'static str,
+        type_args: &'static [crate::types::TypeDescriptor<'static>],
+        f: for<'a> fn(&'a mut T, &'a [ScriptValue]) -> ScriptCallFuture<'a>,
+    ) -> Result<(), Self::Error> {
+        let _ = type_args;
+        self.method_async_mut(name, f)
+    }
+
     /// Register one candidate of a `dyn`-dispatched generic method (`&self`,
     /// consuming `self`, or receiver-less).
     ///

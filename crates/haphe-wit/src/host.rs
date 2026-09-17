@@ -144,6 +144,10 @@ type NewIndexFn<U> = fn(&mut U, &[Sv]) -> Result<(), Sce>;
 type FieldEntry<U> = (&'static str, FieldGet<U>, Option<FieldSet<U>>);
 type BinSelfEntry<U> = (&'static str, fn(U, U) -> U);
 
+/// Dispatch key for one statically dispatched generic-method monomorph: the
+/// method name plus the instantiation's type arguments.
+pub(crate) type GenericKey = (&'static str, &'static [TypeDescriptor<'static>]);
+
 /// Everything one `ScriptBind::bind` pass hands a binder, in typed form.
 pub(crate) struct RawTable<U> {
     pub fields: Vec<FieldEntry<U>>,
@@ -157,6 +161,10 @@ pub(crate) struct RawTable<U> {
     pub methods_mut: Vec<(&'static str, MutFn<U>)>,
     pub methods_async: Vec<(&'static str, AsyncCowFn<U>)>,
     pub methods_async_mut: Vec<(&'static str, AsyncMutFn<U>)>,
+    pub methods_generic: Vec<(GenericKey, CowFn<U>)>,
+    pub methods_generic_mut: Vec<(GenericKey, MutFn<U>)>,
+    pub methods_generic_async: Vec<(GenericKey, AsyncCowFn<U>)>,
+    pub methods_generic_async_mut: Vec<(GenericKey, AsyncMutFn<U>)>,
     pub tostring: Option<fn(&U) -> String>,
     pub concat: Option<fn(&U) -> String>,
     pub debug: Option<fn(&U) -> String>,
@@ -190,6 +198,10 @@ impl<U> Default for RawTable<U> {
             methods_mut: Vec::new(),
             methods_async: Vec::new(),
             methods_async_mut: Vec::new(),
+            methods_generic: Vec::new(),
+            methods_generic_mut: Vec::new(),
+            methods_generic_async: Vec::new(),
+            methods_generic_async_mut: Vec::new(),
             tostring: None,
             concat: None,
             debug: None,
@@ -249,6 +261,46 @@ impl<U: 'static> TypeBinder<U> for RawTable<U> {
 
     fn method_async_mut(&mut self, name: &'static str, f: AsyncMutFn<U>) -> Result<(), Infallible> {
         self.methods_async_mut.push((name, f));
+        Ok(())
+    }
+
+    fn method_generic(
+        &mut self,
+        name: &'static str,
+        type_args: &'static [TypeDescriptor<'static>],
+        f: CowFn<U>,
+    ) -> Result<(), Infallible> {
+        self.methods_generic.push(((name, type_args), f));
+        Ok(())
+    }
+
+    fn method_generic_mut(
+        &mut self,
+        name: &'static str,
+        type_args: &'static [TypeDescriptor<'static>],
+        f: MutFn<U>,
+    ) -> Result<(), Infallible> {
+        self.methods_generic_mut.push(((name, type_args), f));
+        Ok(())
+    }
+
+    fn method_generic_async(
+        &mut self,
+        name: &'static str,
+        type_args: &'static [TypeDescriptor<'static>],
+        f: AsyncCowFn<U>,
+    ) -> Result<(), Infallible> {
+        self.methods_generic_async.push(((name, type_args), f));
+        Ok(())
+    }
+
+    fn method_generic_async_mut(
+        &mut self,
+        name: &'static str,
+        type_args: &'static [TypeDescriptor<'static>],
+        f: AsyncMutFn<U>,
+    ) -> Result<(), Infallible> {
+        self.methods_generic_async_mut.push(((name, type_args), f));
         Ok(())
     }
 
@@ -470,6 +522,9 @@ pub(crate) struct ResourceEntry {
     pub ctors: HashMap<&'static str, ECtor>,
     pub ctors_async: HashMap<&'static str, EAsyncCtor>,
     pub methods: HashMap<&'static str, EMethod>,
+    /// Statically dispatched generic-method monomorphs, one per declared
+    /// instantiation, keyed by `(name, type_args)`.
+    pub generic_methods: Vec<(GenericKey, EMethod)>,
     pub metas: EMetas,
     /// Clones the live value into a fresh [`AnyBox`].
     pub clone_any: ECloneAny,
@@ -583,6 +638,32 @@ where
         );
     }
 
+    let mut generic_methods: Vec<(GenericKey, EMethod)> = Vec::new();
+    for (key, f) in raw.methods_generic {
+        generic_methods.push((
+            key,
+            EMethod::Cow(Box::new(move |recv, args| f(cow_of::<U>(recv), args))),
+        ));
+    }
+    for (key, f) in raw.methods_generic_mut {
+        generic_methods.push((
+            key,
+            EMethod::Mut(Box::new(move |any, args| f(expect_u_mut::<U>(any), args))),
+        ));
+    }
+    for (key, f) in raw.methods_generic_async {
+        generic_methods.push((
+            key,
+            EMethod::AsyncCow(Box::new(move |recv, args| f(cow_of::<U>(recv), args))),
+        ));
+    }
+    for (key, f) in raw.methods_generic_async_mut {
+        generic_methods.push((
+            key,
+            EMethod::AsyncMut(Box::new(move |any, args| f(expect_u_mut::<U>(any), args))),
+        ));
+    }
+
     let mut metas = default_metas();
     if let Some(f) = raw.tostring {
         metas.tostring = Some(Box::new(move |any| f(expect_u::<U>(any))));
@@ -650,6 +731,7 @@ where
         ctors,
         ctors_async,
         methods,
+        generic_methods,
         metas,
         clone_any: Box::new(|any| Box::new(expect_u::<U>(any).clone()) as AnyBox),
         to_userdata: Box::new(|any| Sv::UserData(OpaqueUserData::new(expect_u::<U>(any).clone()))),
@@ -677,6 +759,10 @@ pub(crate) struct ValueEntry {
     /// async ones are driven to completion internally). `&mut self` methods
     /// are absent: value semantics cannot write back.
     pub methods: HashMap<&'static str, ESelfFn>,
+    /// Statically dispatched generic-method monomorphs with value
+    /// semantics, keyed by `(name, type_args)`. Like plain value methods,
+    /// `&mut self` shapes are absent (no write-back channel).
+    pub generic_methods: Vec<(GenericKey, ESelfFn)>,
     pub ctors: HashMap<&'static str, EValueCtor>,
     /// Trait projections, keyed by projected member source name. Each takes
     /// the receiver (and, where applicable, further args) as `ScriptValue`s:
@@ -717,10 +803,25 @@ where
             }),
         );
     }
-    // `&mut self` methods (sync or async) are deliberately not inserted:
-    // the companion-function shape has no way to hand the mutated value
-    // back, so dispatch would silently lose the write. They trap with a
-    // descriptive message instead (see runtime.rs).
+    for ((name, args), f) in raw.methods_generic {
+        entry.generic_methods.push((
+            (name, args),
+            Box::new(move |this, a| f(ScriptCow::Owned(from_sv::<U>(&this)?), a)),
+        ));
+    }
+    for ((name, args), f) in raw.methods_generic_async {
+        entry.generic_methods.push((
+            (name, args),
+            Box::new(move |this, a| {
+                let u: U = from_sv(&this)?;
+                block_on(f(ScriptCow::Owned(u), a))
+            }),
+        ));
+    }
+    // `&mut self` methods (sync or async, generic included) are deliberately
+    // not inserted: the companion-function shape has no way to hand the
+    // mutated value back, so dispatch would silently lose the write. They
+    // trap with a descriptive message instead (see runtime.rs).
 
     for (name, f) in raw.ctors {
         entry

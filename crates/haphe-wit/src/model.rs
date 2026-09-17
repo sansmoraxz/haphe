@@ -547,7 +547,7 @@ impl<'a> Plan<'a> {
                     self.collect_uses(prop.ty, env, refs)?;
                 }
                 for f in s.methods.iter().chain(s.constructors) {
-                    self.collect_fn_uses(f, env, refs)?;
+                    self.collect_fn_uses_instantiated(f, env, refs)?;
                 }
             }
             TypeKind::Enum(e) => {
@@ -567,7 +567,7 @@ impl<'a> Plan<'a> {
                     }
                 }
                 for f in e.methods {
-                    self.collect_fn_uses(f, env, refs)?;
+                    self.collect_fn_uses_instantiated(f, env, refs)?;
                 }
             }
             TypeKind::TypeAlias(a) => self.collect_uses(a.inner, env, refs)?,
@@ -585,6 +585,26 @@ impl<'a> Plan<'a> {
             self.collect_uses(param.ty, env, refs)?;
         }
         self.collect_uses(f.return_type, env, refs)
+    }
+
+    /// Like [`collect_fn_uses`](Self::collect_fn_uses), but a generic
+    /// function's signature is walked once per declared instantiation with
+    /// its parameters bound — the raw signature mentions `GenericParam`s
+    /// that only resolve per monomorph.
+    fn collect_fn_uses_instantiated(
+        &self,
+        f: &'a FunctionDescriptor<'a>,
+        env: Option<&Env<'_, 'a>>,
+        refs: &mut BTreeSet<(usize, String)>,
+    ) -> Result<(), WitGenError> {
+        if f.generic_params.is_empty() {
+            return self.collect_fn_uses(f, env, refs);
+        }
+        for args in f.instantiations {
+            let fenv = self.fn_env(f, args, env);
+            self.collect_fn_uses(f, Some(&fenv), refs)?;
+        }
+        Ok(())
     }
 
     fn collect_uses(
