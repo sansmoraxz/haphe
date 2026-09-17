@@ -224,3 +224,43 @@ fn method_generics_dispatch_with_type_args() {
     let s: String = handle.convert("42".to_string());
     assert_eq!(s, "<42>");
 }
+
+// ── Declared dispatch modes: `dyn` formalizes erased addressing (one host
+// handler under the plain name); bare `dyn` gets the default candidate set.
+
+/// Renders host values.
+#[script(foreign)]
+pub trait Render {
+    #[script(dyn)]
+    fn show<U>(&self, value: U) -> String;
+
+    #[script(dyn, instantiate(i64), instantiate(bool))]
+    fn tag<U>(&self, value: U) -> String;
+}
+
+#[test]
+fn dyn_foreign_methods_declare_erased_dispatch() {
+    use haphe::Dispatch;
+    let desc = <RenderHandle as ScriptForeign>::DESCRIPTOR;
+    let show = &desc.functions[0];
+    assert_eq!(show.dispatch, Dispatch::Dyn);
+    // Bare `dyn` on a single-parameter generic: default candidate set.
+    assert_eq!(show.instantiations.len(), 5);
+    let tag = &desc.functions[1];
+    assert_eq!(tag.dispatch, Dispatch::Dyn);
+    assert_eq!(tag.instantiations.len(), 2);
+}
+
+#[test]
+fn dyn_foreign_calls_still_carry_type_args_as_data() {
+    // The handle's wrapper is identical in both modes — the caller decides
+    // what the declared dispatch means for its runtime.
+    let handle = RenderHandle::from_caller(Box::new(MapCaller(|f, type_args, args| {
+        assert_eq!(f, "show");
+        assert_eq!(type_args.len(), 1);
+        let [value] = args else { panic!("one arg") };
+        Ok(ScriptValue::String(format!("{value:?}")))
+    })));
+    let shown: String = handle.show(7i64);
+    assert!(shown.contains('7'));
+}

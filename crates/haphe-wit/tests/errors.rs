@@ -1175,3 +1175,74 @@ fn dyn_generic_enum_method_emits_a_companion_dispatcher() {
         "got:\n{text}"
     );
 }
+
+// ── Foreign dispatch modes (erased `dyn` imports)
+
+/// A generic FOREIGN function template with `&self` receiver, dyn-dispatched.
+const fn dyn_foreign_fn() -> FunctionDescriptor<'static> {
+    FunctionDescriptor {
+        receiver: Some(Receiver::Ref),
+        ..generic_module_fn(haphe::Dispatch::Dyn)
+    }
+}
+
+/// Without the feature, `dyn` FOREIGN functions are rejected by the
+/// capability check like provided ones — never silently routed.
+#[test]
+#[cfg(not(feature = "dyn-generics"))]
+fn dyn_generic_foreign_fn_rejected_by_capabilities() {
+    static FNS: [FunctionDescriptor; 1] = [dyn_foreign_fn()];
+    static FOREIGN: [haphe::ForeignInterfaceDescriptor; 1] =
+        [foreign_iface("test::Hooks", "Hooks", &[], &FNS)];
+    static REGISTRY: TypeRegistry = TypeRegistry::new(&[], &[], &[], &[], &[], &FOREIGN);
+
+    match haphe::generate(&WitGenerator::new("haphe:demo"), &REGISTRY) {
+        Err(haphe::GenerateError::Incompatible(errors)) => {
+            assert!(
+                errors.iter().any(|e| matches!(
+                    e,
+                    haphe::CompatibilityError::DynGenericsUnsupported { function: "echo" }
+                )),
+                "expected DynGenericsUnsupported, got: {errors:?}"
+            );
+        }
+        other => panic!("expected Incompatible, got: {other:?}"),
+    }
+}
+
+/// A `dyn` FOREIGN function declares ERASED addressing: exactly ONE import
+/// under the PLAIN name whose generic slots are the shared case variants —
+/// no monomorph imports (they would demand guest exports that don't exist),
+/// and no `-dyn` suffix (there is no static sibling to distinguish from).
+#[test]
+#[cfg(feature = "dyn-generics")]
+fn dyn_foreign_fn_emits_one_erased_import() {
+    static INSTS: [&[TypeDescriptor]; 2] = [
+        &[TypeDescriptor::Primitive(PrimitiveType::I64)],
+        &[TypeDescriptor::String],
+    ];
+    static FNS: [FunctionDescriptor; 1] = [FunctionDescriptor {
+        instantiations: &INSTS,
+        ..dyn_foreign_fn()
+    }];
+    static FOREIGN: [haphe::ForeignInterfaceDescriptor; 1] =
+        [foreign_iface("test::Hooks", "Hooks", &[], &FNS)];
+    static REGISTRY: TypeRegistry = TypeRegistry::new(&[], &[], &[], &[], &[], &FOREIGN);
+
+    let out = haphe::generate(&WitGenerator::new("haphe:demo"), &REGISTRY)
+        .expect("dyn foreign registries generate with the feature on");
+    let text = String::from_utf8_lossy(&out.files[0].content);
+    assert!(text.contains("variant echo-dyn-value {"), "got:\n{text}");
+    assert!(text.contains("%s64(s64),"), "got:\n{text}");
+    assert!(text.contains("string(string),"), "got:\n{text}");
+    assert!(
+        text.contains("/// haphe:dyn-foreign = echo"),
+        "got:\n{text}"
+    );
+    assert!(
+        text.contains("echo: func(value: echo-dyn-value) -> echo-dyn-value;"),
+        "got:\n{text}"
+    );
+    assert!(!text.contains("echo-s64"), "no monomorphs — got:\n{text}");
+    assert!(!text.contains("echo-dyn:"), "plain name — got:\n{text}");
+}

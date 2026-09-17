@@ -823,6 +823,115 @@ fn generic_foreign_handle_resolves_monomorphized_export() {
 }
 
 // ---------------------------------------------------------------------------
+// Foreign dispatch modes: static routes to mangled monomorphs, `dyn` to one
+// erased variant import
+// ---------------------------------------------------------------------------
+
+/// Method-level STATIC generics: the host provides one export per declared
+/// instantiation under the mangled member name.
+#[cfg(feature = "generics")]
+#[script(foreign, thread_safety = none)]
+trait Parser {
+    #[script(instantiate(i64))]
+    fn parse<T>(&self, raw: i64) -> T;
+}
+
+#[cfg(feature = "generics")]
+const PARSER_GUEST: &str = r#"
+(component
+  (core module $m
+    (func (export "parse") (param i64) (result i64) (local.get 0)))
+  (core instance $mi (instantiate $m))
+  (func $parse (param "raw" s64) (result s64)
+    (canon lift (core func $mi "parse")))
+  (instance $i (export "parse-s64" (func $parse)))
+  (export "haphe:demo/parser" (instance $i))
+)
+"#;
+
+/// A declared instantiation dispatches through its mangled export.
+#[cfg(feature = "generics")]
+#[test]
+fn static_foreign_method_generics_route_to_mangles() {
+    let parser: ParserHandle = foreign_handle_from_wat(PARSER_GUEST).unwrap();
+    let n: i64 = parser.parse(41);
+    assert_eq!(n, 41);
+}
+
+/// A call whose type arguments match no DECLARED instantiation fails
+/// descriptively, naming the declared set — never a silent miss.
+#[cfg(feature = "generics")]
+#[test]
+#[should_panic(
+    expected = "no declared instantiation matches these type arguments; declared: [s64]"
+)]
+fn static_foreign_method_generics_reject_undeclared_type_args() {
+    let parser: ParserHandle = foreign_handle_from_wat(PARSER_GUEST).unwrap();
+    let _: f64 = parser.parse(41);
+}
+
+/// Method-level `dyn` generics: ERASED addressing — the host provides ONE
+/// export under the plain name, generic slots crossing as case variants.
+#[cfg(feature = "dyn-generics")]
+#[script(foreign, thread_safety = none)]
+trait DynCodec {
+    #[script(dyn, instantiate(i64), instantiate(f64))]
+    fn bump<T>(&self, value: T) -> T;
+}
+
+/// One guest export `bump` serving both cases: s64 payloads gain 1,
+/// f64 payloads gain 0.5. Variant param flattens to (disc: i32, payload:
+/// i64-join); the variant result returns indirectly (disc u8 at +0, payload
+/// at +8).
+#[cfg(feature = "dyn-generics")]
+const DYN_CODEC_GUEST: &str = r#"
+(component
+  (type $vt (variant (case "s64" s64) (case "f64" f64)))
+  (core module $m
+    (memory (export "mem") 1)
+    (func (export "bump") (param i32 i64) (result i32)
+      (if (i32.eqz (local.get 0))
+        (then (i64.store offset=8 (i32.const 16) (i64.add (local.get 1) (i64.const 1))))
+        (else (f64.store offset=8 (i32.const 16)
+          (f64.add (f64.reinterpret_i64 (local.get 1)) (f64.const 0.5)))))
+      (i32.store8 (i32.const 16) (local.get 0))
+      (i32.const 16))
+  )
+  (core instance $mi (instantiate $m))
+  (func $bump (param "value" $vt) (result $vt)
+    (canon lift (core func $mi "bump") (memory (core memory $mi "mem"))))
+  (instance $i
+    (export "bump-dyn-value" (type $vt))
+    (export "bump" (func $bump)))
+  (export "haphe:demo/dyn-codec" (instance $i))
+)
+"#;
+
+/// Both cases route through the single erased export; the case tag carries
+/// the instantiation, so type-ambiguous payloads never guess.
+#[cfg(feature = "dyn-generics")]
+#[test]
+fn dyn_foreign_method_dispatches_through_one_erased_export() {
+    let codec: DynCodecHandle = foreign_handle_from_wat(DYN_CODEC_GUEST).unwrap();
+    let n: i64 = codec.bump(41);
+    assert_eq!(n, 42);
+    let f: f64 = codec.bump(2.0f64);
+    assert_eq!(f, 2.5);
+}
+
+/// An undeclared instantiation fails descriptively, naming the declared
+/// case set.
+#[cfg(feature = "dyn-generics")]
+#[test]
+#[should_panic(
+    expected = "no declared instantiation matches these type arguments; declared: [s64, f64]"
+)]
+fn dyn_foreign_method_rejects_undeclared_type_args() {
+    let codec: DynCodecHandle = foreign_handle_from_wat(DYN_CODEC_GUEST).unwrap();
+    let _: String = codec.bump("x".to_string());
+}
+
+// ---------------------------------------------------------------------------
 // Composite values through the foreign caller
 // ---------------------------------------------------------------------------
 

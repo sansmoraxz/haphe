@@ -14,6 +14,36 @@ pub(crate) fn peel_borrowed<'b, 'a>(mut ty: &'b TypeDescriptor<'a>) -> &'b TypeD
     ty
 }
 
+/// Whether a signature type mentions one of the function's own generic
+/// parameters. Such positions carry the concrete instantiation in dynamic
+/// dispatch: they become case variants in synthesized dispatchers and in
+/// erased (`dyn`) foreign imports.
+#[cfg_attr(
+    not(any(feature = "runtime", feature = "dyn-generics")),
+    allow(dead_code)
+)]
+pub(crate) fn mentions_generic(ty: &TypeDescriptor<'_>) -> bool {
+    match ty {
+        TypeDescriptor::GenericParam(_) => true,
+        TypeDescriptor::Option(inner)
+        | TypeDescriptor::List(inner)
+        | TypeDescriptor::Stream(inner)
+        | TypeDescriptor::Future(inner)
+        | TypeDescriptor::Borrowed { inner, .. } => mentions_generic(inner),
+        TypeDescriptor::Array(inner, _) => mentions_generic(inner),
+        TypeDescriptor::Map(k, v) | TypeDescriptor::Result(k, v) => {
+            mentions_generic(k) || mentions_generic(v)
+        }
+        TypeDescriptor::Tuple(elems) => elems.iter().any(mentions_generic),
+        TypeDescriptor::Callback {
+            params,
+            return_type,
+        } => params.iter().any(mentions_generic) || mentions_generic(return_type),
+        TypeDescriptor::Instance { args, .. } => args.iter().any(mentions_generic),
+        _ => false,
+    }
+}
+
 /// Where a type appears; determines resource handle rendering and whether
 /// Unit is allowed.
 #[derive(Clone, Copy)]

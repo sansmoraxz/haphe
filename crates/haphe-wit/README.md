@@ -26,6 +26,7 @@ let output = haphe::generate(&generator, &REGISTRY)?;
 | type alias | `type x = y;` |
 | module constants | nullary getter functions (value preserved in a doc comment); configurable via `ConstantMode` |
 | `&T`/`&mut T` params where `T` is a resource | `borrow<t>` |
+| `Borrowed { lifetime, inner }` (lifetime carriers, e.g. `Cow<'a, T>`) | lowered as `inner` — WIT values cross by copy, so the carried lifetime does not exist in the text |
 | `Result<T, E>` | `result<t, e>` (unit sides collapse) |
 | `HashMap<K, V>` | `list<tuple<k, v>>` |
 | `[T; N]` | `list<T, N>` (fixed-length list) |
@@ -141,6 +142,100 @@ type is emitted with a deterministic marker doc line before its own docs:
 record labeled-string-s32 { ... }
 ```
 
+### Dispatch modes: static monomorphs emitted, `dyn` rejected
+
+A generic function or struct/enum method declared with `instantiate(...)`
+alone dispatches **statically**: this backend emits one member per declared
+instantiation under the same deterministic mangled names as generic free
+functions — resource methods become mangled members
+(`first-of-s64: func(a: s64, b: s64) -> s64;`), enum methods become mangled
+companion functions (`mode-pick-bool`), each carrying its
+`haphe:generic-instance` doc marker. The `runtime` feature serves them
+through the `method_generic*` binder channels, keyed on
+`(name, type_args)` — sync and async alike (async monomorphs are driven to
+completion on-thread like other async methods). `&mut self` generic
+monomorphs on VALUE types stay unbridged like their plain siblings (no
+write-back channel).
+
+Declared `#[script(dyn, ...)]` instead asks the runtime to pick the
+matching instantiation at call time by scanning the registered candidates.
+WIT guests always name a monomorph statically, so without the
+`dyn-generics` cargo feature this backend reports `dyn_generics: false` and
+a dyn function or method fails the capability check with
+`DynGenericsUnsupported`. The emitted WIT is then **dispatch-mode neutral**:
+text depends only on the monomorph set, never on how a runtime dispatches
+into it.
+
+### Injected dynamic dispatch (`dyn-generics` cargo feature)
+
+Behind the feature (which implies `generics`), dynamic dispatch is
+*injected* rather than native: the capability flips to `dyn_generics: true`
+and the generator additionally emits — the static monomorphs remain,
+additive — one synthesized dispatcher per dyn function, per dyn method (a
+resource member), and per dyn enum method (a companion function taking
+`this` first). WIT admits no anonymous variants, so every generic-typed
+parameter and return becomes a **named** variant type with one case per
+declared instantiation, the case named by the instantiation's mangled type
+arguments:
+
+```wit
+/// Candidate payloads for the `echo` dynamic dispatcher.
+variant echo-dyn-value {
+  %s64(s64),
+  %string(string),
+}
+/// haphe:dyn-dispatcher = echo
+echo-dyn: func(value: echo-dyn-value) -> echo-dyn-value;
+```
+
+Variant names derive from the dispatcher and position
+(`{fn}-dyn-{param}` / `{fn}-dyn-result`, owner-prefixed for methods, e.g.
+`holder-echo-dyn-value`); identical shapes deduplicate onto the first
+definition within an interface, so `echo`'s parameter and return share one
+type above. Method dispatcher variants are emitted at interface level,
+before the resource that uses them. Non-generic positions pass through
+unchanged; a name collision with a hand-written type surfaces through the
+wit-parser validation pass.
+
+The `runtime` host implements each dispatcher by reading the case tag
+(which names the instantiation, so matching degenerates to exact), running
+the SAME shared core resolver (`haphe::dispatch::resolve_dyn_candidate`)
+over the candidates collected through the `function_dyn*`/`method_dyn*`
+binder channels, calling the winner (rejected conversions fall through in
+declaration order), and lifting the result back under the winning case.
+Multiple variant-typed parameters must carry the SAME tag — they all name
+the one instantiation being selected — and a tag matching no candidate
+traps descriptively, listing every declared candidate. The static monomorph
+members of a dyn function or method serve from the same candidate table
+(dyn registrations flow only through the dyn channels).
+
+One documented divergence: a dyn METHOD dispatcher acquires its receiver
+by borrow-and-clone per attempt — a consuming (`self`) candidate does not
+consume the handle, keeping fall-through possible.
+
+### Foreign dispatch modes
+
+Generic FOREIGN methods declare their dispatch mode at the source
+(`instantiate(...)` alone = static, `dyn` = erased); the Rust call site is
+always concretely typed, so foreign dispatch is pure ADDRESSING — never
+resolution.
+
+- **Static**: the guest exports one function per declared instantiation
+  under the mangled member name (`parse-s64`), same scheme as provided
+  monomorphs. A call whose type arguments match no declared instantiation
+  fails descriptively, naming the declared set.
+- **`dyn`** (feature `dyn-generics`): the guest exports exactly ONE function
+  under the PLAIN name — no `-dyn` suffix, since erased addressing replaces
+  the monomorphs rather than standing beside them — whose generic-typed
+  positions are the same synthesized case variants (marker doc line
+  `haphe:dyn-foreign = {fn}`). The caller wraps each call's concrete type
+  arguments into the matching case (a tag lookup, no resolver), so the case
+  tag still tells the guest which instantiation was meant, and unwraps the
+  return expecting the same case back — an undeclared instantiation or a
+  mismatched return case fails descriptively. Without the feature, `dyn`
+  foreign functions are rejected by the capability check (and, on the
+  direct caller API, by `WitGenError::DynForeignFunction`).
+
 ## Validation
 
 Every generated document is resolved through
@@ -165,4 +260,28 @@ every linker definition against the guest component at instantiation.
   (`haphe::GenerateError::Incompatible`).
 - WIT `constructor` cannot be `async`, so an async constructor is emitted as a
   `static async func` returning the resource instead.
-- `trait_impls` metadata is not represented in the output.
+- Declared `trait_impls` are PROJECTED into WIT-native named functions
+  (interusability: every trait a type declares is reachable from guests).
+  On resources they are members; on records they are interface-level
+  functions named `{type}-{member}` taking `this` by value (mutating
+  projections return the updated record). The deterministic table:
+
+  | Trait | WIT member |
+  |---|---|
+  | `Add`/`Sub`/`Mul`/`Div`/`Rem`/`IDiv`/`Mod`/`Pow`/`BitAnd`/`BitOr`/`BitXor`/`Shl`/`Shr` | `add`/`sub`/… `: func(rhs: borrow<T> \| SCALAR) -> OUT` |
+  | `Neg` / `Not` | `neg`/`not: func() -> OUT` |
+  | `PartialEq`/`Eq` (deduplicated) | `eq: func(other: borrow<T>) -> bool` |
+  | `PartialOrd`/`Ord` (deduplicated) | `lt`/`le: func(other: borrow<T>) -> bool` |
+  | `Display`/`ToString` (deduplicated) | `to-string: func() -> string` |
+  | `Debug` | `to-debug-string: func() -> string` |
+  | `Hash` | `hash: func() -> u64` |
+  | `Call` / `AsyncCall` | `call: [async] func(a0: A, …) -> O` (declaring both is an error) |
+  | `Index` / `IndexMut` | `at: func(index: I) -> OUT` / `set-at: func(index: I, value: OUT)` |
+  | `Iterator`/`IntoIterator` (deduplicated) | `items: func() -> list<ITEM>` + `length: func() -> u64` — an **eager snapshot** (lazy iteration is not WIT-native; the semantic difference is documented in the generated doc comment) |
+  | `Default` | `default: static func() -> T` (never the `constructor` slot) |
+  | `Clone` | unprojected (handles give guests sharing; value types copy structurally) |
+
+  Projected names share the member namespace: a user member spelled `add`,
+  `at`, `call`, … collides with the projection as a descriptive generation
+  error, as do multiple overloads of one operator — expose a named method
+  instead. Enum `trait_impls` are not yet projected.

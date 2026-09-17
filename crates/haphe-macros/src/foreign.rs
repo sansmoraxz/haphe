@@ -158,7 +158,7 @@ pub fn expand(mut item: ItemTrait) -> TokenStream {
             );
             continue;
         };
-        let fn_args = parse_fn_args(&m.attrs, &mut errors, "a foreign method");
+        let mut fn_args = parse_fn_args(&m.attrs, &mut errors, "a foreign method");
         for (flag, span) in [
             ("skip", fn_args.skip),
             ("constructor", fn_args.constructor),
@@ -195,6 +195,28 @@ pub fn expand(mut item: ItemTrait) -> TokenStream {
                 }
                 // Const generics are rejected by `build_fn_info`.
                 syn::GenericParam::Const(_) => {}
+            }
+        }
+        // Method-level generics declare their dispatch mode, mirroring impl
+        // blocks: `instantiate(...)` alone is STATIC — the host provides one
+        // handler per declared instantiation, addressed by the backend's
+        // per-monomorph mangle — and `dyn` is ERASED — one handler under the
+        // plain name, type arguments crossing as data only. The Rust call
+        // site is always concretely typed, so no runtime resolution exists
+        // in either mode. Bare `dyn` on a single-parameter generic gets the
+        // default candidate set.
+        if !method_type_params.is_empty() {
+            if fn_args.dyn_dispatch.is_some() {
+                fn_args.inject_bare_dyn_defaults(method_type_params.len());
+            } else if fn_args.instantiate.is_empty() {
+                errors.spanned(
+                    m.sig.generics.span(),
+                    "generic foreign methods need `instantiate(...)` declarations \
+                     (or `dyn` for erased dispatch)",
+                );
+                strip_param_script_attrs(&mut m.sig);
+                strip_script_attrs(&mut m.attrs);
+                continue;
             }
         }
         for input in &m.sig.inputs {

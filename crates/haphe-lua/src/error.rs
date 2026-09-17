@@ -26,6 +26,17 @@ pub enum LuaBindError {
         /// The missing function's exposed name.
         function: &'static str,
     },
+    /// A statically dispatched generic foreign function's callbacks table
+    /// lacks the handler for one of its declared instantiations (the field
+    /// under the mangled monomorph name is missing or not a Lua function).
+    MissingForeignInstantiation {
+        /// The foreign interface's exposed name.
+        interface: &'static str,
+        /// The generic function's exposed name.
+        function: &'static str,
+        /// The missing handler's mangled monomorph name.
+        mangled: String,
+    },
     /// A generic foreign interface was used without the `generics` feature.
     GenericForeignInterface {
         /// The interface's exposed name.
@@ -139,6 +150,18 @@ impl std::fmt::Display for LuaBindError {
                      function `{function}`"
                 )
             }
+            Self::MissingForeignInstantiation {
+                interface,
+                function,
+                mangled,
+            } => {
+                write!(
+                    f,
+                    "callbacks table for foreign interface `{interface}` has no \
+                     function `{mangled}`: static dispatch of generic `{function}` \
+                     needs one handler per declared instantiation"
+                )
+            }
             Self::GenericForeignInterface { name } => {
                 write!(
                     f,
@@ -237,6 +260,7 @@ impl std::error::Error for LuaBindError {
             Self::InvalidConstant { .. } => None,
             Self::GenericFunction { .. } => None,
             Self::MissingForeignFunction { .. } => None,
+            Self::MissingForeignInstantiation { .. } => None,
             Self::GenericForeignInterface { .. } => None,
             Self::ReservedMethod { .. } => None,
             Self::DuplicateConstructor { .. } => None,

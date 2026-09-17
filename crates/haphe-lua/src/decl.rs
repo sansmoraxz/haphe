@@ -473,28 +473,70 @@ fn emit_foreign(
             });
         }
         let context = format!("{}.{}", fi.name, f.name);
-        let mut params = Vec::new();
-        for p in f.params {
-            let ty = render_type(registry, p.ty, &context)?;
-            params.push(format!("{}: {ty}", p.name));
-        }
-        let ret = match f.return_type {
-            TypeDescriptor::Unit => String::new(),
-            ty => format!(": {}", render_type(registry, ty, &context)?),
-        };
         let note = match f.error_kind {
             Some(kind) => format!(" May raise ({kind})."),
             None => String::new(),
         };
-        let _ = writeln!(
-            out,
-            "---@field {} fun({}){ret}{note}",
-            f.name,
-            params.join(", ")
-        );
+        // Function-level generics stub per their declared dispatch: STATIC
+        // emits one field per instantiation under the mangled monomorph
+        // name (matching the handler the caller resolves); DYN emits one
+        // plain-named field whose type is the union of the substituted
+        // signatures.
+        if !f.generic_params.is_empty() {
+            if f.instantiations.is_empty() {
+                // Unreachable through the macro (generic foreign methods
+                // declare instantiate or dyn with the default set), but
+                // hand-written descriptors stay loud.
+                return Err(LuaDeclError::GenericFunction { name: context });
+            }
+            if f.dispatch == haphe::Dispatch::Dyn {
+                let mut sigs = Vec::new();
+                for args in f.instantiations {
+                    let subst = haphe::dispatch::GenericSubst {
+                        params: f.generic_params,
+                        args,
+                    };
+                    sigs.push(render_fun_sig(registry, f, &context, Some(&subst))?);
+                }
+                let _ = writeln!(out, "---@field {} {}{note}", f.name, sigs.join("|"));
+            } else {
+                for args in f.instantiations {
+                    let mangled = crate::binder::mangle_generic_name(f.name, args);
+                    let subst = haphe::dispatch::GenericSubst {
+                        params: f.generic_params,
+                        args,
+                    };
+                    let sig = render_fun_sig(registry, f, &context, Some(&subst))?;
+                    let _ = writeln!(out, "---@field {mangled} {sig}{note}");
+                }
+            }
+            continue;
+        }
+        let sig = render_fun_sig(registry, f, &context, None)?;
+        let _ = writeln!(out, "---@field {} {sig}{note}", f.name);
     }
     out.push('\n');
     Ok(())
+}
+
+/// Renders one `fun(a: t): r` signature for a foreign callbacks field,
+/// resolving `GenericParam`s through `subst` when given.
+fn render_fun_sig(
+    registry: &ValidatedRegistry<'_>,
+    f: &FunctionDescriptor<'_>,
+    context: &str,
+    subst: Option<&haphe::dispatch::GenericSubst<'_>>,
+) -> Result<String, LuaDeclError> {
+    let mut params = Vec::new();
+    for p in f.params {
+        let ty = render_subst(registry, p.ty, context, subst)?;
+        params.push(format!("{}: {ty}", p.name));
+    }
+    let ret = match f.return_type {
+        TypeDescriptor::Unit => String::new(),
+        ty => format!(": {}", render_subst(registry, ty, context, subst)?),
+    };
+    Ok(format!("fun({}){ret}", params.join(", ")))
 }
 
 fn emit_module(

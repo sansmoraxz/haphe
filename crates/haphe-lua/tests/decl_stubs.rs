@@ -284,6 +284,43 @@ fn generic_module_function_stubs_each_monomorph() {
     assert!(s.contains("---@param value integer"), "got:\n{s}");
 }
 
+#[cfg(feature = "generics")]
+#[test]
+fn generic_foreign_methods_stub_per_their_dispatch() {
+    /// Converts host values.
+    #[script(foreign)]
+    pub trait Convert {
+        #[script(instantiate(i64), instantiate(String))]
+        fn convert<U>(&self, raw: String) -> U;
+
+        #[script(dyn, instantiate(i64), instantiate(String))]
+        fn show<U>(&self, value: U) -> String;
+    }
+
+    haphe::registry! {
+        static FOREIGN_GENERIC_REGISTRY = {
+            foreign: [ConvertHandle],
+        };
+    }
+
+    let output = haphe::generate(&LuaDeclGenerator::new(), &FOREIGN_GENERIC_REGISTRY).unwrap();
+    let s = String::from_utf8(output.files[0].content.clone()).unwrap();
+    // Static: one field per instantiation under the mangled handler name.
+    assert!(
+        s.contains("---@field convert__i64 fun(raw: string): integer"),
+        "got:\n{s}"
+    );
+    assert!(
+        s.contains("---@field convert__string fun(raw: string): string"),
+        "got:\n{s}"
+    );
+    // Dyn: one plain-named field, the union of substituted signatures.
+    assert!(
+        s.contains("---@field show fun(value: integer): string|fun(value: string): string"),
+        "got:\n{s}"
+    );
+}
+
 #[test]
 fn duplicate_exposed_type_names_are_rejected() {
     mod a {

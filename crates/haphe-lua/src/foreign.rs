@@ -5,25 +5,38 @@ use std::collections::HashMap;
 use std::fmt;
 
 use haphe::{
-    ForeignCaller, ForeignError, ForeignErrorKind, ForeignHandle, ForeignInterfaceDescriptor,
-    ScriptForeign, ScriptValue, TypeDescriptor,
+    Dispatch, ForeignCaller, ForeignError, ForeignErrorKind, ForeignHandle,
+    ForeignInterfaceDescriptor, ScriptForeign, ScriptValue, TypeDescriptor,
 };
 use mlua::{Function, Lua, Table};
 
 use crate::LuaBindError;
-use crate::binder::{lua_to_script, script_to_lua};
+use crate::binder::{lua_to_script, mangle_generic_name, script_to_lua};
 
 /// Builds a [`ForeignCaller`] backed by Lua functions looked up in `table`,
 /// one per function of `descriptor`, keyed by the exposed function name.
 /// Every function is resolved up front; a missing or non-function field
-/// fails with [`MissingForeignFunction`](LuaBindError::MissingForeignFunction).
+/// fails with [`MissingForeignFunction`](LuaBindError::MissingForeignFunction)
+/// (or [`MissingForeignInstantiation`](LuaBindError::MissingForeignInstantiation)
+/// for a static generic's monomorph handler).
 ///
 /// Connecting to a callbacks table involves no binder or registration
 /// machinery — only an existing Lua state and the table.
 ///
-/// Generic interfaces and generic functions require the `generics` feature:
-/// Lua dispatch is dynamic, so one Lua function serves every instantiation
-/// and `type_args` are ignored.
+/// Generic interfaces and generic functions require the `generics` feature.
+/// A function-level generic honors its declared dispatch mode:
+///
+/// - STATIC (`instantiate(...)` without `dyn`): the table provides one
+///   handler per declared instantiation under its mangled monomorph name
+///   (`convert__i64`), the same spelling inbound static generics use; a
+///   call whose type arguments match no declared instantiation fails
+///   descriptively at call time.
+/// - DYN: one handler under the plain name serves every instantiation —
+///   type arguments are erased at the boundary (Lua values are
+///   self-describing).
+///
+/// Trait-level generics stay erased: one table serves every instantiation
+/// of a generic interface.
 pub fn foreign_caller(
     lua: &Lua,
     table: Table,
@@ -38,19 +51,56 @@ pub fn foreign_caller(
     // One table serves every instantiation of a generic interface.
     let _ = type_args;
 
+    let resolve = |name: &str| -> Result<Option<Function>, LuaBindError> {
+        let value: mlua::Value = table.get(name).map_err(LuaBindError::Lua)?;
+        match value {
+            mlua::Value::Function(func) => Ok(Some(func)),
+            _ => Ok(None),
+        }
+    };
+
     let mut funcs = HashMap::new();
     for f in descriptor.functions {
         if !cfg!(feature = "generics") && !f.generic_params.is_empty() {
             return Err(LuaBindError::GenericFunction { name: f.name });
         }
-        let value: mlua::Value = table.get(f.name).map_err(LuaBindError::Lua)?;
-        let mlua::Value::Function(func) = value else {
-            return Err(LuaBindError::MissingForeignFunction {
-                interface: descriptor.name,
-                function: f.name,
-            });
+        let entry = if !f.generic_params.is_empty() && f.dispatch == Dispatch::Static {
+            // Static dispatch: one handler per DECLARED instantiation,
+            // addressed by the mangled monomorph name.
+            let mut by_mangle = HashMap::new();
+            let mut declared = Vec::new();
+            for args in f.instantiations {
+                let mangled = mangle_generic_name(f.name, args);
+                let Some(func) = resolve(&mangled)? else {
+                    return Err(LuaBindError::MissingForeignInstantiation {
+                        interface: descriptor.name,
+                        function: f.name,
+                        mangled,
+                    });
+                };
+                declared.push(mangled.clone());
+                by_mangle.insert(mangled, func);
+            }
+            if by_mangle.is_empty() {
+                // Unreachable through the macro (static generics require
+                // instantiate), but hand-built descriptors stay loud.
+                return Err(LuaBindError::GenericFunction { name: f.name });
+            }
+            FnEntry::Static {
+                by_mangle,
+                declared: declared.join(", "),
+            }
+        } else {
+            // Non-generic, or `dyn` (erased): one handler, plain name.
+            let Some(func) = resolve(f.name)? else {
+                return Err(LuaBindError::MissingForeignFunction {
+                    interface: descriptor.name,
+                    function: f.name,
+                });
+            };
+            FnEntry::Plain(func)
         };
-        funcs.insert(f.name, func);
+        funcs.insert(f.name, entry);
     }
     Ok(Box::new(LuaForeignCaller {
         lua: lua.clone(),
@@ -73,11 +123,23 @@ pub fn foreign_handle<H: ScriptForeign + ForeignHandle>(
     )?))
 }
 
+/// One function's resolved handler(s), shaped by its declared dispatch.
+enum FnEntry {
+    /// Non-generic, or `dyn` (erased): one handler under the plain name.
+    Plain(Function),
+    /// Static generic: one handler per declared instantiation, keyed by the
+    /// mangled monomorph name; `declared` is the rendered list for errors.
+    Static {
+        by_mangle: HashMap<String, Function>,
+        declared: String,
+    },
+}
+
 /// [`ForeignCaller`] over Lua functions resolved from a callbacks table.
 struct LuaForeignCaller {
     lua: Lua,
     interface: &'static str,
-    funcs: HashMap<&'static str, Function>,
+    funcs: HashMap<&'static str, FnEntry>,
 }
 
 /// A Lua error carried through [`ForeignErrorKind::Call`] (`mlua::Error` is
@@ -101,20 +163,49 @@ fn call_error(function: &'static str, message: String) -> ForeignError {
 }
 
 impl LuaForeignCaller {
-    fn lower_args(
+    /// Resolves the handler honoring the function's declared dispatch: the
+    /// plain-named handler for non-generic and `dyn` functions, the mangled
+    /// monomorph handler for static generics — where type arguments outside
+    /// the declared instantiation set fail descriptively.
+    fn resolve(
         &self,
         function: &'static str,
-        args: &[ScriptValue],
-    ) -> Result<(&Function, mlua::MultiValue), ForeignError> {
-        let func = self.funcs.get(function).ok_or_else(|| {
-            call_error(
+        type_args: &[TypeDescriptor<'static>],
+    ) -> Result<&Function, ForeignError> {
+        match self.funcs.get(function) {
+            None => Err(call_error(
                 function,
                 format!(
                     "function was not resolved from foreign interface `{}`",
                     self.interface
                 ),
-            )
-        })?;
+            )),
+            Some(FnEntry::Plain(func)) => Ok(func),
+            Some(FnEntry::Static {
+                by_mangle,
+                declared,
+            }) => {
+                let mangled = mangle_generic_name(function, type_args);
+                by_mangle.get(&mangled).ok_or_else(|| {
+                    call_error(
+                        function,
+                        format!(
+                            "no handler for instantiation `{mangled}`: static dispatch \
+                             serves only the declared instantiations ({declared})"
+                        ),
+                    )
+                })
+            }
+        }
+    }
+
+    fn lower_args(
+        &self,
+        function: &'static str,
+        type_args: &[TypeDescriptor<'static>],
+        args: &[ScriptValue],
+    ) -> Result<(&Function, mlua::MultiValue), ForeignError> {
+        let func = self.resolve(function, type_args)?;
         let mut lowered = Vec::with_capacity(args.len());
         for arg in args {
             lowered.push(
@@ -133,9 +224,7 @@ impl ForeignCaller for LuaForeignCaller {
         type_args: &[TypeDescriptor<'static>],
         args: &[ScriptValue],
     ) -> Result<ScriptValue, ForeignError> {
-        // Dynamic dispatch: every instantiation shares one Lua function.
-        let _ = type_args;
-        let (func, lowered) = self.lower_args(function, args)?;
+        let (func, lowered) = self.lower_args(function, type_args, args)?;
         let ret: mlua::Value = func
             .call(lowered)
             .map_err(|e| call_error(function, e.to_string()))?;
@@ -150,9 +239,8 @@ impl ForeignCaller for LuaForeignCaller {
         args: &'a [ScriptValue],
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<ScriptValue, ForeignError>> + 'a>>
     {
-        let _ = type_args;
         Box::pin(async move {
-            let (func, lowered) = self.lower_args(function, args)?;
+            let (func, lowered) = self.lower_args(function, type_args, args)?;
             let ret: mlua::Value = func
                 .call_async(lowered)
                 .await

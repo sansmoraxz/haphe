@@ -1029,10 +1029,19 @@ pub struct BindTarget<'a> {
 ///
 /// `type_args` carries the concrete type arguments of a function-level
 /// generic call, in declaration order — empty for non-generic functions.
-/// Backends that monomorphize select the implementation by comparing them
-/// against the interface's recorded
-/// [`MethodInstantiation`](crate::MethodInstantiation)s; dynamic backends may
-/// ignore them.
+/// The Rust call site is always concretely typed, so there is never anything
+/// to resolve at runtime; the function's declared
+/// [`dispatch`](crate::FunctionDescriptor::dispatch) mode is an ADDRESSING
+/// contract the caller honors:
+///
+/// - [`Static`](crate::Dispatch::Static): the host provides one handler per
+///   declared instantiation; the caller selects it from `type_args` (by the
+///   backend's per-monomorph mangle or by comparing against the recorded
+///   instantiations), and a call whose `type_args` match no declared
+///   instantiation fails descriptively — never silently.
+/// - [`Dyn`](crate::Dispatch::Dyn): the host provides ONE handler under the
+///   plain name; type arguments are erased at the boundary (crossing as data
+///   at most), and the handler serves every instantiation.
 pub trait ForeignCaller {
     /// Invokes the named host function synchronously.
     fn call(

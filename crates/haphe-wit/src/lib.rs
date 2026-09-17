@@ -261,6 +261,15 @@ pub enum WitGenError {
         /// The function's name.
         function: String,
     },
+    /// A foreign function declaring `dyn` (erased) dispatch; the single
+    /// variant-typed import it addresses exists only with the
+    /// `dyn-generics` feature.
+    DynForeignFunction {
+        /// The containing interface's WIT name.
+        interface: String,
+        /// The function's name.
+        function: String,
+    },
 }
 
 impl fmt::Display for WitGenError {
@@ -318,6 +327,15 @@ impl fmt::Display for WitGenError {
                 f,
                 "function `{function}` in interface `{interface}` is generic; WIT dispatches \
                  by name only and cannot distinguish instantiations"
+            ),
+            Self::DynForeignFunction {
+                interface,
+                function,
+            } => write!(
+                f,
+                "foreign function `{function}` in interface `{interface}` declares `dyn` \
+                 (erased) dispatch; enable the `dyn-generics` feature of haphe-wit to \
+                 address its single variant-typed import"
             ),
         }
     }
@@ -587,6 +605,24 @@ impl WitGenerator {
                 emit_function(p, func, None, &name, plan, base_env.as_ref())?;
                 continue;
             }
+            // A `dyn` FOREIGN function declares erased addressing: the host
+            // implements exactly ONE function under the plain name — no
+            // monomorph imports, which would demand guest exports that do
+            // not exist. Generic-typed positions cross as the shared case
+            // variants (`dyn-generics` feature), so the case tag still tells
+            // the host which instantiation was meant.
+            if dyn_gen::is_dyn(func) && iface.direction == Direction::Foreign {
+                let sig = dyn_cx.dispatcher(p, func, None, plan, base_env.as_ref())?;
+                let name = member_names.insert(func.name)?;
+                p.doc(Some(&format!("haphe:dyn-foreign = {}", func.name)));
+                p.line(&format!(
+                    "{name}: {}({}){};",
+                    sig.keyword(),
+                    sig.param_list(),
+                    sig.arrow()
+                ));
+                continue;
+            }
             // One deterministically-named monomorph per declared
             // instantiation — fn-site and registry-level sources unioned
             // (`generics` feature; rejected in `Plan::build` otherwise).
@@ -605,10 +641,8 @@ impl WitGenerator {
                 )));
                 emit_function(p, func, None, &name, plan, Some(&env))?;
             }
-            // A `dyn` declaration additionally synthesizes one dispatcher
-            // (`dyn-generics` feature). Foreign interfaces get monomorphs
-            // only: a dispatcher there would demand a guest-side
-            // implementation that does not exist.
+            // A `dyn` PROVIDED function additionally synthesizes one
+            // dispatcher next to its monomorphs (`dyn-generics` feature).
             if dyn_gen::is_dyn(func) && iface.direction == Direction::Provided {
                 let sig = dyn_cx.dispatcher(p, func, None, plan, base_env.as_ref())?;
                 let name = member_names.insert(&sig.raw_name)?;

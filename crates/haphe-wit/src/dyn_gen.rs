@@ -36,29 +36,7 @@ pub(crate) fn is_dyn(f: &FunctionDescriptor<'_>) -> bool {
     !f.generic_params.is_empty() && matches!(f.dispatch, Dispatch::Dyn)
 }
 
-/// Whether a signature type mentions one of the function's own generic
-/// parameters (such positions become variants in the dispatcher).
-pub(crate) fn mentions_generic(ty: &TypeDescriptor<'_>) -> bool {
-    match ty {
-        TypeDescriptor::GenericParam(_) => true,
-        TypeDescriptor::Option(inner)
-        | TypeDescriptor::List(inner)
-        | TypeDescriptor::Stream(inner)
-        | TypeDescriptor::Future(inner)
-        | TypeDescriptor::Borrowed { inner, .. } => mentions_generic(inner),
-        TypeDescriptor::Array(inner, _) => mentions_generic(inner),
-        TypeDescriptor::Map(k, v) | TypeDescriptor::Result(k, v) => {
-            mentions_generic(k) || mentions_generic(v)
-        }
-        TypeDescriptor::Tuple(elems) => elems.iter().any(mentions_generic),
-        TypeDescriptor::Callback {
-            params,
-            return_type,
-        } => params.iter().any(mentions_generic) || mentions_generic(return_type),
-        TypeDescriptor::Instance { args, .. } => args.iter().any(mentions_generic),
-        _ => false,
-    }
-}
+pub(crate) use crate::types::mentions_generic;
 
 /// One rendered dispatcher signature: parameter and return types are final
 /// WIT text (variant names or passed-through plain types).

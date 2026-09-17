@@ -1069,6 +1069,7 @@ fn resolve_foreign<T: 'static>(
     // to a monomorphized `echo<i64>`). Runs before any guest lookup.
     let mut export_names = NameMap::new();
     let mut planned: Vec<(ForeignKey, String)> = Vec::new();
+    let mut planned_dyn: Vec<(&'static haphe::FunctionDescriptor<'static>, String)> = Vec::new();
     for f in descriptor.functions {
         if f.generic_params.is_empty() {
             planned.push(((f.name, &[] as _), export_names.insert(f.name)?));
@@ -1081,6 +1082,20 @@ fn resolve_foreign<T: 'static>(
             }
             .into());
         }
+        // `dyn` declares ERASED addressing: exactly one guest export under
+        // the plain name, generic slots crossing as case variants — the
+        // `dyn-generics` machinery.
+        if matches!(f.dispatch, haphe::Dispatch::Dyn) {
+            if !cfg!(feature = "dyn-generics") {
+                return Err(WitGenError::DynForeignFunction {
+                    interface: iface_name.clone(),
+                    function: f.name.to_string(),
+                }
+                .into());
+            }
+            planned_dyn.push((f, export_names.insert(f.name)?));
+            continue;
+        }
         for args in f.instantiations {
             let mangled = match plan {
                 Some(p) => p.mangle_fn_instance(f.name, args, None)?,
@@ -1091,6 +1106,7 @@ fn resolve_foreign<T: 'static>(
     }
 
     let mut funcs: Vec<(ForeignKey, ForeignFn)> = Vec::new();
+    let mut dyn_funcs: Vec<(&'static str, DynForeignFn)> = Vec::new();
     {
         let mut store = store.lock().expect("store mutex poisoned");
         let iface_idx = instance
@@ -1098,24 +1114,60 @@ fn resolve_foreign<T: 'static>(
             .ok_or_else(|| WasmBindError::MissingForeignInstance {
                 interface: instance_name.clone(),
             })?;
-        for (key, export_name) in planned {
+        let resolve = |store: &mut Store<T>, export_name: &str| {
             let missing = || WasmBindError::MissingForeignExport {
                 interface: instance_name.clone(),
-                function: export_name.clone(),
+                function: export_name.to_string(),
             };
             let (item, idx) = instance
-                .get_export(&mut *store, Some(&iface_idx), &export_name)
+                .get_export(&mut *store, Some(&iface_idx), export_name)
                 .ok_or_else(missing)?;
             let ComponentItem::ComponentFunc(fty) = item else {
                 return Err(missing());
             };
             let func = instance.get_func(&mut *store, idx).ok_or_else(missing)?;
-            funcs.push((
-                key,
-                ForeignFn {
-                    func,
-                    params: fty.params().map(|(_, t)| t).collect(),
-                    result: fty.results().next(),
+            Ok::<_, WasmBindError>(ForeignFn {
+                func,
+                params: fty.params().map(|(_, t)| t).collect(),
+                result: fty.results().next(),
+            })
+        };
+        for (key, export_name) in planned {
+            funcs.push((key, resolve(&mut store, &export_name)?));
+        }
+        for (f, export_name) in planned_dyn {
+            let resolved = resolve(&mut store, &export_name)?;
+            // Case keys: one per declared instantiation, deduplicated —
+            // KEEP IN SYNC with the generator's variant case naming.
+            let mut cases: Vec<(String, &'static [TypeDescriptor<'static>])> = Vec::new();
+            for args in f.instantiations {
+                let key = match plan {
+                    Some(p) => {
+                        let fragments: Vec<String> = args
+                            .iter()
+                            .map(|a| p.mangle_type(a, None))
+                            .collect::<Result<_, _>>()?;
+                        fragments.join("-")
+                    }
+                    None => mangle_args(args)?,
+                };
+                if !cases.iter().any(|(k, _)| *k == key) {
+                    cases.push((key, args));
+                }
+            }
+            let ret = crate::types::peel_borrowed(f.return_type);
+            dyn_funcs.push((
+                f.name,
+                DynForeignFn {
+                    f: resolved,
+                    cases,
+                    wrap_param: f
+                        .params
+                        .iter()
+                        .map(|p| crate::types::mentions_generic(p.ty))
+                        .collect(),
+                    unwrap_return: !matches!(ret, TypeDescriptor::Unit)
+                        && crate::types::mentions_generic(ret),
                 },
             ));
         }
@@ -1123,6 +1175,7 @@ fn resolve_foreign<T: 'static>(
     Ok(CallerInner {
         store,
         funcs,
+        dyn_funcs,
         enum_cases,
         drops: Arc::new(Mutex::new(Vec::new())),
     })
@@ -1151,6 +1204,21 @@ struct ForeignFn {
     func: Func,
     params: Vec<Type>,
     result: Option<Type>,
+}
+
+/// A pre-resolved `dyn` (erased) foreign export: one guest function under
+/// the plain name whose generic-typed positions are the synthesized case
+/// variants. The call's concrete `type_args` select the case by declared
+/// instantiation — a tag lookup, never a resolver.
+struct DynForeignFn {
+    f: ForeignFn,
+    /// `(case key, declared type arguments)` per instantiation, in
+    /// declaration order, deduplicated.
+    cases: Vec<(String, &'static [TypeDescriptor<'static>])>,
+    /// Which parameter positions cross wrapped in the case variant.
+    wrap_param: Vec<bool>,
+    /// Whether the return crosses wrapped in the case variant.
+    unwrap_return: bool,
 }
 
 /// Dispatch key: descriptor function name plus the instantiation's type
@@ -1198,6 +1266,9 @@ fn declared_enum_cases(registry: &ValidatedRegistry<'_>) -> EnumNames {
 struct CallerInner<T: 'static> {
     store: Arc<Mutex<Store<T>>>,
     funcs: Vec<(ForeignKey, ForeignFn)>,
+    /// `dyn` (erased) foreign functions by name; empty without the
+    /// `dyn-generics` feature (resolution rejects them up front).
+    dyn_funcs: Vec<(&'static str, DynForeignFn)>,
     enum_cases: EnumNames,
     /// Guest resource handles whose host wrappers were dropped: drained
     /// (each `resource_drop`) at the start of every dispatch, since `Drop`
@@ -1250,11 +1321,108 @@ impl<T: 'static> CallerInner<T> {
             .find(|((name, args), _)| *name == function && *args == type_args)
             .map(|(_, f)| f)
             .ok_or_else(|| {
+                let declared: Vec<String> = self
+                    .funcs
+                    .iter()
+                    .filter(|((name, _), _)| *name == function)
+                    .map(|((_, args), _)| {
+                        if args.is_empty() {
+                            "(non-generic)".to_string()
+                        } else {
+                            mangle_args(args).unwrap_or_else(|_| "?".to_string())
+                        }
+                    })
+                    .collect();
                 call_error(
                     function,
-                    "no declared instantiation matches these type arguments".to_string(),
+                    format!(
+                        "no declared instantiation matches these type arguments; declared: [{}]",
+                        declared.join(", ")
+                    ),
                 )
             })
+    }
+
+    /// The `dyn` (erased) foreign function registered under `function`, if
+    /// any — checked before the static monomorph table.
+    fn find_dyn(&self, function: &str) -> Option<&DynForeignFn> {
+        self.dyn_funcs
+            .iter()
+            .find(|(name, _)| *name == function)
+            .map(|(_, d)| d)
+    }
+
+    /// Prepares a `dyn` call: selects the case from the concrete
+    /// `type_args` (declared-instantiation lookup — never a resolver),
+    /// wraps generic-typed arguments in the case variant's crossing shape,
+    /// and returns the case expected back when the return is generic-typed.
+    fn dyn_call_parts(
+        d: &DynForeignFn,
+        function: &'static str,
+        type_args: &[TypeDescriptor<'static>],
+        args: &[ScriptValue],
+    ) -> Result<(Vec<ScriptValue>, Option<String>), ForeignError> {
+        let Some((case, _)) = d.cases.iter().find(|(_, cargs)| *cargs == type_args) else {
+            let declared: Vec<&str> = d.cases.iter().map(|(k, _)| k.as_str()).collect();
+            return Err(call_error(
+                function,
+                format!(
+                    "no declared instantiation matches these type arguments; declared: [{}]",
+                    declared.join(", ")
+                ),
+            ));
+        };
+        if args.len() != d.wrap_param.len() {
+            return Err(call_error(
+                function,
+                format!(
+                    "declared {} parameter(s), got {} argument(s)",
+                    d.wrap_param.len(),
+                    args.len()
+                ),
+            ));
+        }
+        let wrapped = args
+            .iter()
+            .zip(&d.wrap_param)
+            .map(|(arg, wrap)| {
+                if *wrap {
+                    ScriptValue::Map(vec![(case.clone(), arg.clone())])
+                } else {
+                    arg.clone()
+                }
+            })
+            .collect();
+        Ok((wrapped, d.unwrap_return.then(|| case.clone())))
+    }
+
+    /// Unwraps a `dyn` call's variant return, verifying the guest answered
+    /// under the case the call selected.
+    fn dyn_unwrap(
+        function: &'static str,
+        expected: &str,
+        value: ScriptValue,
+    ) -> Result<ScriptValue, ForeignError> {
+        match value {
+            ScriptValue::Map(mut pairs) if pairs.len() == 1 => {
+                let (case, payload) = pairs.remove(0);
+                if case == expected {
+                    Ok(payload)
+                } else {
+                    Err(call_error(
+                        function,
+                        format!("guest returned case `{case}`, expected `{expected}`"),
+                    ))
+                }
+            }
+            other => Err(call_error(
+                function,
+                format!(
+                    "guest returned {}, expected a variant under case `{expected}`",
+                    other.variant_name()
+                ),
+            )),
+        }
     }
 
     /// Reclaims guest handles whose host wrappers were dropped since the
@@ -1401,7 +1569,24 @@ impl<T: 'static> CallerInner<T> {
         type_args: &[TypeDescriptor<'static>],
         args: &[ScriptValue],
     ) -> Result<ScriptValue, ForeignError> {
+        if let Some(d) = self.find_dyn(function) {
+            let (wrapped, expect) = Self::dyn_call_parts(d, function, type_args, args)?;
+            let out = self.call_sync(&d.f, function, &wrapped)?;
+            return match expect {
+                Some(case) => Self::dyn_unwrap(function, &case, out),
+                None => Ok(out),
+            };
+        }
         let f = self.find(function, type_args)?;
+        self.call_sync(f, function, args)
+    }
+
+    fn call_sync(
+        &self,
+        f: &ForeignFn,
+        function: &'static str,
+        args: &[ScriptValue],
+    ) -> Result<ScriptValue, ForeignError> {
         let mut store = self.store.lock().expect("store mutex poisoned");
         self.drain_drops(&mut store, function)?;
         let vals = self.lower_args(&mut store, f, function, args)?;
@@ -1425,7 +1610,25 @@ impl<T: Send + 'static> CallerInner<T> {
         type_args: &[TypeDescriptor<'static>],
         args: &[ScriptValue],
     ) -> Result<ScriptValue, ForeignError> {
+        if let Some(d) = self.find_dyn(function) {
+            let (wrapped, expect) = Self::dyn_call_parts(d, function, type_args, args)?;
+            let out = self.call_async_inner(&d.f, function, &wrapped).await?;
+            return match expect {
+                Some(case) => Self::dyn_unwrap(function, &case, out),
+                None => Ok(out),
+            };
+        }
         let f = self.find(function, type_args)?;
+        self.call_async_inner(f, function, args).await
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    async fn call_async_inner(
+        &self,
+        f: &ForeignFn,
+        function: &'static str,
+        args: &[ScriptValue],
+    ) -> Result<ScriptValue, ForeignError> {
         let mut store = self.store.lock().expect("store mutex poisoned");
         self.drain_drops(&mut store, function)?;
         let vals = self.lower_args(&mut store, f, function, args)?;

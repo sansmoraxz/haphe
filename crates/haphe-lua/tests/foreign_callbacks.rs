@@ -183,11 +183,23 @@ pub trait Store<T> {
     fn get(&self, key: String) -> Option<T>;
 }
 
-/// Converts raw values, generic per method.
+/// Converts raw values, generic per method (STATIC dispatch: one Lua
+/// handler per declared instantiation, addressed by the mangled name).
 #[script(foreign)]
 pub trait Conv {
     #[script(instantiate(i64), instantiate(String))]
     fn convert<U>(&self, raw: String) -> U;
+
+    #[script(instantiate(i64))]
+    fn parse<U>(&self, raw: String) -> Result<U, HookError>;
+}
+
+/// Renders values, generic per method (`dyn`: one erased Lua handler under
+/// the plain name serves every instantiation).
+#[script(foreign)]
+pub trait Render {
+    #[script(dyn, instantiate(i64), instantiate(String))]
+    fn show<U>(&self, value: U) -> String;
 }
 
 const DYNAMIC_CALLBACKS: &str = r#"
@@ -197,7 +209,10 @@ return {
         if key == "s" then return "seven" end
         return nil
     end,
-    convert = function(raw) return raw .. "!" end,
+    convert__i64 = function(raw) return tonumber(raw) end,
+    convert__string = function(raw) return raw .. "!" end,
+    parse__i64 = function(raw) return tonumber(raw) end,
+    show = function(value) return tostring(value) end,
 }
 "#;
 
@@ -229,7 +244,8 @@ fn generic_foreign_method_rejected_without_feature() {
     );
 }
 
-/// One Lua function serves every instantiation: Lua is dynamically typed.
+/// Trait-level generics stay erased: one Lua table serves every
+/// instantiation of the interface.
 #[cfg(feature = "generics")]
 #[test]
 fn generic_interfaces_dispatch_dynamically() {
@@ -242,14 +258,82 @@ fn generic_interfaces_dispatch_dynamically() {
     assert_eq!(ints.get("missing".to_string()), None);
 }
 
+/// STATIC dispatch routes each Rust instantiation to its mangled handler.
 #[cfg(feature = "generics")]
 #[test]
-fn generic_methods_dispatch_dynamically() {
+fn static_generic_methods_route_to_mangled_handlers() {
     let lua = Lua::new();
     let table: mlua::Table = lua.load(DYNAMIC_CALLBACKS).eval().unwrap();
     let conv: ConvHandle = foreign_handle(&lua, table).unwrap();
+    let n: i64 = conv.convert("41".to_string());
+    assert_eq!(n, 41);
     let s: String = conv.convert("x".to_string());
     assert_eq!(s, "x!");
+}
+
+/// A call whose type arguments match no declared instantiation fails
+/// descriptively, listing the declared set.
+#[cfg(feature = "generics")]
+#[test]
+fn undeclared_static_instantiation_errors_with_declared_set() {
+    let lua = Lua::new();
+    let table: mlua::Table = lua.load(DYNAMIC_CALLBACKS).eval().unwrap();
+    let conv: ConvHandle = foreign_handle(&lua, table).unwrap();
+    let HookError(message) = conv.parse::<bool>("true".to_string()).unwrap_err();
+    assert!(
+        message.contains("no handler for instantiation `parse__bool`"),
+        "got: {message}"
+    );
+    assert!(
+        message.contains("declared instantiations (parse__i64)"),
+        "got: {message}"
+    );
+}
+
+/// A declared instantiation without its mangled handler fails at
+/// construction, like any other missing callback.
+#[cfg(feature = "generics")]
+#[test]
+fn missing_mangled_handler_is_a_build_time_error() {
+    let lua = Lua::new();
+    let table: mlua::Table = lua
+        .load(
+            r#"
+            return {
+                convert__i64 = function(raw) return tonumber(raw) end,
+                parse__i64 = function(raw) return tonumber(raw) end,
+                show = function(value) return tostring(value) end,
+            }
+            "#,
+        )
+        .eval()
+        .unwrap();
+    let Err(err) = foreign_handle::<ConvHandle>(&lua, table) else {
+        panic!("expected an error");
+    };
+    match err {
+        LuaBindError::MissingForeignInstantiation {
+            interface,
+            function,
+            mangled,
+        } => {
+            assert_eq!(interface, "Conv");
+            assert_eq!(function, "convert");
+            assert_eq!(mangled, "convert__string");
+        }
+        other => panic!("expected MissingForeignInstantiation, got: {other}"),
+    }
+}
+
+/// `dyn`: one plain-named handler serves every Rust instantiation.
+#[cfg(feature = "generics")]
+#[test]
+fn dyn_generic_methods_dispatch_through_one_handler() {
+    let lua = Lua::new();
+    let table: mlua::Table = lua.load(DYNAMIC_CALLBACKS).eval().unwrap();
+    let render: RenderHandle = foreign_handle(&lua, table).unwrap();
+    assert_eq!(render.show(7i64), "7");
+    assert_eq!(render.show("x".to_string()), "x");
 }
 
 // ---------------------------------------------------------------------------
@@ -279,6 +363,32 @@ mod async_dispatch {
                 let hooks: AsyncHooksHandle = foreign_handle(&lua, table).unwrap();
                 let body = hooks.fetch("http://example".to_string()).await.unwrap();
                 assert_eq!(body, "body of http://example");
+            })
+            .await;
+    }
+
+    /// Async static generics route to mangled handlers like sync ones.
+    #[cfg(feature = "generics")]
+    #[script(foreign, thread_safety = none)]
+    pub trait AsyncConv {
+        #[script(instantiate(i64))]
+        async fn fetch<U>(&self, key: String) -> Result<U, HookError>;
+    }
+
+    #[cfg(feature = "generics")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn async_static_generic_routes_to_mangled_handler() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let lua = Lua::new();
+                let table: mlua::Table = lua
+                    .load(r#"return { fetch__i64 = function(key) return #key end }"#)
+                    .eval()
+                    .unwrap();
+                let conv: AsyncConvHandle = foreign_handle(&lua, table).unwrap();
+                let n: i64 = conv.fetch("abcd".to_string()).await.unwrap();
+                assert_eq!(n, 4);
             })
             .await;
     }
