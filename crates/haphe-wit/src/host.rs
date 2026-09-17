@@ -148,6 +148,15 @@ type BinSelfEntry<U> = (&'static str, fn(U, U) -> U);
 /// method name plus the instantiation's type arguments.
 pub(crate) type GenericKey = (&'static str, &'static [TypeDescriptor<'static>]);
 
+/// Dispatch key for one `dyn`-dispatched generic-method candidate: the full
+/// descriptor (the dispatcher ranks candidates against its parameters) plus
+/// the candidate's type arguments.
+#[cfg(feature = "dyn-generics")]
+pub(crate) type DynKey = (
+    &'static haphe::FunctionDescriptor<'static>,
+    &'static [TypeDescriptor<'static>],
+);
+
 /// Everything one `ScriptBind::bind` pass hands a binder, in typed form.
 pub(crate) struct RawTable<U> {
     pub fields: Vec<FieldEntry<U>>,
@@ -165,6 +174,14 @@ pub(crate) struct RawTable<U> {
     pub methods_generic_mut: Vec<(GenericKey, MutFn<U>)>,
     pub methods_generic_async: Vec<(GenericKey, AsyncCowFn<U>)>,
     pub methods_generic_async_mut: Vec<(GenericKey, AsyncMutFn<U>)>,
+    #[cfg(feature = "dyn-generics")]
+    pub methods_dyn: Vec<(DynKey, CowFn<U>)>,
+    #[cfg(feature = "dyn-generics")]
+    pub methods_dyn_mut: Vec<(DynKey, MutFn<U>)>,
+    #[cfg(feature = "dyn-generics")]
+    pub methods_dyn_async: Vec<(DynKey, AsyncCowFn<U>)>,
+    #[cfg(feature = "dyn-generics")]
+    pub methods_dyn_async_mut: Vec<(DynKey, AsyncMutFn<U>)>,
     pub tostring: Option<fn(&U) -> String>,
     pub concat: Option<fn(&U) -> String>,
     pub debug: Option<fn(&U) -> String>,
@@ -202,6 +219,14 @@ impl<U> Default for RawTable<U> {
             methods_generic_mut: Vec::new(),
             methods_generic_async: Vec::new(),
             methods_generic_async_mut: Vec::new(),
+            #[cfg(feature = "dyn-generics")]
+            methods_dyn: Vec::new(),
+            #[cfg(feature = "dyn-generics")]
+            methods_dyn_mut: Vec::new(),
+            #[cfg(feature = "dyn-generics")]
+            methods_dyn_async: Vec::new(),
+            #[cfg(feature = "dyn-generics")]
+            methods_dyn_async_mut: Vec::new(),
             tostring: None,
             concat: None,
             debug: None,
@@ -301,6 +326,55 @@ impl<U: 'static> TypeBinder<U> for RawTable<U> {
         f: AsyncMutFn<U>,
     ) -> Result<(), Infallible> {
         self.methods_generic_async_mut.push(((name, type_args), f));
+        Ok(())
+    }
+
+    // Dyn candidates are collected (never delegated to the plain channels,
+    // which would collide monomorphs under one name); the synthesized
+    // dispatcher serves them. Without the feature the core defaults stand,
+    // safely: the capability check rejects dyn declarations before any bind.
+    #[cfg(feature = "dyn-generics")]
+    fn method_dyn(
+        &mut self,
+        descriptor: &'static haphe::FunctionDescriptor<'static>,
+        type_args: &'static [TypeDescriptor<'static>],
+        f: CowFn<U>,
+    ) -> Result<(), Infallible> {
+        self.methods_dyn.push(((descriptor, type_args), f));
+        Ok(())
+    }
+
+    #[cfg(feature = "dyn-generics")]
+    fn method_dyn_mut(
+        &mut self,
+        descriptor: &'static haphe::FunctionDescriptor<'static>,
+        type_args: &'static [TypeDescriptor<'static>],
+        f: MutFn<U>,
+    ) -> Result<(), Infallible> {
+        self.methods_dyn_mut.push(((descriptor, type_args), f));
+        Ok(())
+    }
+
+    #[cfg(feature = "dyn-generics")]
+    fn method_dyn_async(
+        &mut self,
+        descriptor: &'static haphe::FunctionDescriptor<'static>,
+        type_args: &'static [TypeDescriptor<'static>],
+        f: AsyncCowFn<U>,
+    ) -> Result<(), Infallible> {
+        self.methods_dyn_async.push(((descriptor, type_args), f));
+        Ok(())
+    }
+
+    #[cfg(feature = "dyn-generics")]
+    fn method_dyn_async_mut(
+        &mut self,
+        descriptor: &'static haphe::FunctionDescriptor<'static>,
+        type_args: &'static [TypeDescriptor<'static>],
+        f: AsyncMutFn<U>,
+    ) -> Result<(), Infallible> {
+        self.methods_dyn_async_mut
+            .push(((descriptor, type_args), f));
         Ok(())
     }
 
@@ -525,6 +599,10 @@ pub(crate) struct ResourceEntry {
     /// Statically dispatched generic-method monomorphs, one per declared
     /// instantiation, keyed by `(name, type_args)`.
     pub generic_methods: Vec<(GenericKey, EMethod)>,
+    /// `dyn`-dispatched generic-method candidates (`dyn-generics` feature:
+    /// the synthesized dispatcher scans them through the core resolver).
+    #[cfg(feature = "dyn-generics")]
+    pub dyn_methods: Vec<(DynKey, EMethod)>,
     pub metas: EMetas,
     /// Clones the live value into a fresh [`AnyBox`].
     pub clone_any: ECloneAny,
@@ -664,6 +742,37 @@ where
         ));
     }
 
+    #[cfg(feature = "dyn-generics")]
+    let mut dyn_methods: Vec<(DynKey, EMethod)> = Vec::new();
+    #[cfg(feature = "dyn-generics")]
+    for (key, f) in raw.methods_dyn {
+        dyn_methods.push((
+            key,
+            EMethod::Cow(Box::new(move |recv, args| f(cow_of::<U>(recv), args))),
+        ));
+    }
+    #[cfg(feature = "dyn-generics")]
+    for (key, f) in raw.methods_dyn_mut {
+        dyn_methods.push((
+            key,
+            EMethod::Mut(Box::new(move |any, args| f(expect_u_mut::<U>(any), args))),
+        ));
+    }
+    #[cfg(feature = "dyn-generics")]
+    for (key, f) in raw.methods_dyn_async {
+        dyn_methods.push((
+            key,
+            EMethod::AsyncCow(Box::new(move |recv, args| f(cow_of::<U>(recv), args))),
+        ));
+    }
+    #[cfg(feature = "dyn-generics")]
+    for (key, f) in raw.methods_dyn_async_mut {
+        dyn_methods.push((
+            key,
+            EMethod::AsyncMut(Box::new(move |any, args| f(expect_u_mut::<U>(any), args))),
+        ));
+    }
+
     let mut metas = default_metas();
     if let Some(f) = raw.tostring {
         metas.tostring = Some(Box::new(move |any| f(expect_u::<U>(any))));
@@ -732,6 +841,8 @@ where
         ctors_async,
         methods,
         generic_methods,
+        #[cfg(feature = "dyn-generics")]
+        dyn_methods,
         metas,
         clone_any: Box::new(|any| Box::new(expect_u::<U>(any).clone()) as AnyBox),
         to_userdata: Box::new(|any| Sv::UserData(OpaqueUserData::new(expect_u::<U>(any).clone()))),
@@ -763,6 +874,11 @@ pub(crate) struct ValueEntry {
     /// semantics, keyed by `(name, type_args)`. Like plain value methods,
     /// `&mut self` shapes are absent (no write-back channel).
     pub generic_methods: Vec<(GenericKey, ESelfFn)>,
+    /// `dyn`-dispatched generic-method candidates with value semantics
+    /// (`dyn-generics` feature). `&mut self` shapes are absent, like the
+    /// static monomorphs.
+    #[cfg(feature = "dyn-generics")]
+    pub dyn_methods: Vec<(DynKey, ESelfFn)>,
     pub ctors: HashMap<&'static str, EValueCtor>,
     /// Trait projections, keyed by projected member source name. Each takes
     /// the receiver (and, where applicable, further args) as `ScriptValue`s:
@@ -812,6 +928,23 @@ where
     for ((name, args), f) in raw.methods_generic_async {
         entry.generic_methods.push((
             (name, args),
+            Box::new(move |this, a| {
+                let u: U = from_sv(&this)?;
+                block_on(f(ScriptCow::Owned(u), a))
+            }),
+        ));
+    }
+    #[cfg(feature = "dyn-generics")]
+    for (key, f) in raw.methods_dyn {
+        entry.dyn_methods.push((
+            key,
+            Box::new(move |this, a| f(ScriptCow::Owned(from_sv::<U>(&this)?), a)),
+        ));
+    }
+    #[cfg(feature = "dyn-generics")]
+    for (key, f) in raw.methods_dyn_async {
+        entry.dyn_methods.push((
+            key,
             Box::new(move |this, a| {
                 let u: U = from_sv(&this)?;
                 block_on(f(ScriptCow::Owned(u), a))

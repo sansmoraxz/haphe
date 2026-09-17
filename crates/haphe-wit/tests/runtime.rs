@@ -2603,3 +2603,230 @@ fn generic_method_monomorphs_dispatch_live() {
     let result = run_guest(&engine, &linker, (), GENERIC_METHOD_GUEST).expect("guest runs");
     assert!(matches!(result, Val::S64(52)), "got: {result:?}");
 }
+
+// ---------------------------------------------------------------------------
+// Injected dyn dispatchers execute live (feature `dyn-generics`)
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "dyn-generics")]
+trait Twice {
+    fn twice(self) -> Self;
+}
+
+#[cfg(feature = "dyn-generics")]
+impl Twice for i64 {
+    fn twice(self) -> Self {
+        self * 2
+    }
+}
+
+#[cfg(feature = "dyn-generics")]
+impl Twice for f64 {
+    fn twice(self) -> Self {
+        self * 2.0
+    }
+}
+
+/// Doubles a value; `dyn` dispatch over two candidates.
+#[cfg(feature = "dyn-generics")]
+#[script(dyn, instantiate(i64), instantiate(f64))]
+fn twice<T: Twice>(value: T) -> T {
+    value.twice()
+}
+
+/// Echoes a value asynchronously; single dyn candidate.
+#[cfg(feature = "dyn-generics")]
+#[script(dyn, instantiate(i64))]
+async fn later<T>(value: T) -> T {
+    value
+}
+
+#[cfg(feature = "dyn-generics")]
+haphe::registry! {
+    static DYN_FN_REGISTRY = {
+        modules: [
+            mod dispatchers { functions: [twice, later] },
+        ],
+    };
+}
+
+/// Guest calling the synthesized dispatchers with each case, plus one static
+/// monomorph (they remain additive). Dispatcher core shape: variant params
+/// flatten to (disc: i32, payload: i64-join); the variant result spills to a
+/// retptr (disc u8 at +0, payload at +8).
+///
+/// twice-dyn(s64(7)) = 14; twice-dyn(f64(2.5)) = 5.0 -> 5;
+/// later-dyn(s64(9)) = 9; twice-s64(3) = 6. Total 34.
+#[cfg(feature = "dyn-generics")]
+const DYN_DISPATCHER_GUEST: &str = r#"
+(component
+  (type $tvt (variant (case "s64" s64) (case "f64" f64)))
+  (type $lvt (variant (case "s64" s64)))
+  (import "haphe:demo/dispatchers" (instance $d
+    (export "twice-dyn-value" (type $tv (eq $tvt)))
+    (export "twice-dyn" (func (param "value" $tv) (result $tv)))
+    (export "later-dyn-value" (type $lv (eq $lvt)))
+    (export "later-dyn" (func (param "value" $lv) (result $lv)))
+    (export "twice-s64" (func (param "value" s64) (result s64)))
+  ))
+  (core module $libc (memory (export "mem") 1))
+  (core instance $li (instantiate $libc))
+  (core func $twice (canon lower (func $d "twice-dyn") (memory (core memory $li "mem"))))
+  (core func $later (canon lower (func $d "later-dyn") (memory (core memory $li "mem"))))
+  (core func $twice64 (canon lower (func $d "twice-s64")))
+  (core module $m
+    (import "libc" "mem" (memory 1))
+    (import "d" "twice" (func $twice (param i32 i64 i32)))
+    (import "d" "later" (func $later (param i32 i64 i32)))
+    (import "d" "twice64" (func $twice64 (param i64) (result i64)))
+    (func (export "run") (result i64) (local $acc i64)
+      ;; twice-dyn(s64(7)) -> s64(14)
+      (call $twice (i32.const 0) (i64.const 7) (i32.const 16))
+      (local.set $acc (i64.load offset=8 (i32.const 16)))
+      ;; twice-dyn(f64(2.5)) -> f64(5.0): the f64 payload crosses in the
+      ;; joined i64 flat slot, reinterpreted.
+      (call $twice (i32.const 1) (i64.reinterpret_f64 (f64.const 2.5)) (i32.const 32))
+      (local.set $acc (i64.add (local.get $acc) (i64.trunc_f64_s (f64.load offset=8 (i32.const 32)))))
+      ;; later-dyn(s64(9)) -> s64(9)
+      (call $later (i32.const 0) (i64.const 9) (i32.const 48))
+      (local.set $acc (i64.add (local.get $acc) (i64.load offset=8 (i32.const 48))))
+      ;; static monomorph stays callable
+      (local.set $acc (i64.add (local.get $acc) (call $twice64 (i64.const 3))))
+      (local.get $acc))
+  )
+  (core instance $mi (instantiate $m
+    (with "libc" (instance (export "mem" (memory $li "mem"))))
+    (with "d" (instance
+      (export "twice" (func $twice))
+      (export "later" (func $later))
+      (export "twice64" (func $twice64))))
+  ))
+  (func (export "run") (result s64) (canon lift (core func $mi "run")))
+)
+"#;
+
+/// The dispatchers route each case to its own monomorph through the shared
+/// core resolver; async candidates drive to completion on-thread; static
+/// monomorphs remain callable beside the dispatcher.
+#[cfg(feature = "dyn-generics")]
+#[test]
+fn dyn_dispatchers_execute_live() {
+    let engine = Engine::default();
+    let mut linker = Linker::new(&engine);
+    let mut b = WasmBinder::new(WitGenerator::new("haphe:demo"));
+    b.register_fn::<twice>().unwrap();
+    b.register_fn::<later>().unwrap();
+    haphe::bind(&b, &DYN_FN_REGISTRY, &mut linker).expect("binding succeeds");
+
+    let result = run_guest(&engine, &linker, (), DYN_DISPATCHER_GUEST).expect("guest runs");
+    assert!(matches!(result, Val::S64(34)), "got: {result:?}");
+}
+
+/// Without `register_fn`, the dispatcher stubs descriptively.
+#[cfg(feature = "dyn-generics")]
+#[test]
+fn unregistered_dyn_dispatcher_stubs_descriptively() {
+    let engine = Engine::default();
+    let mut linker = Linker::new(&engine);
+    let b = WasmBinder::<()>::new(WitGenerator::new("haphe:demo"));
+    haphe::bind(&b, &DYN_FN_REGISTRY, &mut linker).expect("stub binding succeeds");
+
+    let err =
+        run_guest(&engine, &linker, (), DYN_DISPATCHER_GUEST).expect_err("dispatcher stub traps");
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("dyn dispatcher has no registered candidates; call `register_fn`")
+            || msg.contains("not registered"),
+        "got: {msg}"
+    );
+}
+
+/// A box with a `dyn` generic method (two candidates).
+#[cfg(feature = "dyn-generics")]
+#[derive(Script, Clone)]
+#[script(thread_safety = send_sync, methods)]
+struct DynBox {
+    first: bool,
+}
+
+#[cfg(feature = "dyn-generics")]
+#[script]
+impl DynBox {
+    #[script(constructor)]
+    fn new(first: bool) -> Self {
+        DynBox { first }
+    }
+
+    /// Picks one of two values.
+    #[script(dyn, instantiate(i64), instantiate(f64))]
+    fn pick<T>(&self, a: T, b: T) -> T {
+        if self.first { a } else { b }
+    }
+}
+
+#[cfg(feature = "dyn-generics")]
+haphe::registry! {
+    static DYN_METHOD_REGISTRY = {
+        structs: [DynBox],
+        modules: [
+            mod dynboxes { types: [DynBox] },
+        ],
+    };
+}
+
+/// pick-dyn(s64(3), s64(4)) with first=true = 3; the static monomorph
+/// pick-s64(5, 6) = 5 (served from the same dyn candidate table). Total 8.
+#[cfg(feature = "dyn-generics")]
+const DYN_METHOD_GUEST: &str = r#"
+(component
+  (type $pvt (variant (case "s64" s64) (case "f64" f64)))
+  (import "haphe:demo/dynboxes" (instance $bx
+    (export "dyn-box" (type $db (sub resource)))
+    (export "dyn-box-pick-dyn-a" (type $pv (eq $pvt)))
+    (export "[constructor]dyn-box" (func (param "first" bool) (result (own $db))))
+    (export "[method]dyn-box.pick-dyn" (func (param "self" (borrow $db)) (param "a" $pv) (param "b" $pv) (result $pv)))
+    (export "[method]dyn-box.pick-s64" (func (param "self" (borrow $db)) (param "a" s64) (param "b" s64) (result s64)))
+  ))
+  (core module $libc (memory (export "mem") 1))
+  (core instance $li (instantiate $libc))
+  (core func $ctor (canon lower (func $bx "[constructor]dyn-box")))
+  (core func $pickdyn (canon lower (func $bx "[method]dyn-box.pick-dyn") (memory (core memory $li "mem"))))
+  (core func $pick64 (canon lower (func $bx "[method]dyn-box.pick-s64")))
+  (core module $m
+    (import "libc" "mem" (memory 1))
+    (import "bx" "ctor" (func $ctor (param i32) (result i32)))
+    (import "bx" "pickdyn" (func $pickdyn (param i32 i32 i64 i32 i64 i32)))
+    (import "bx" "pick64" (func $pick64 (param i32 i64 i64) (result i64)))
+    (func (export "run") (result i64) (local $b i32) (local $acc i64)
+      (local.set $b (call $ctor (i32.const 1)))
+      (call $pickdyn (local.get $b) (i32.const 0) (i64.const 3) (i32.const 0) (i64.const 4) (i32.const 16))
+      (local.set $acc (i64.load offset=8 (i32.const 16)))
+      (local.set $acc (i64.add (local.get $acc) (call $pick64 (local.get $b) (i64.const 5) (i64.const 6))))
+      (local.get $acc))
+  )
+  (core instance $mi (instantiate $m
+    (with "libc" (instance (export "mem" (memory $li "mem"))))
+    (with "bx" (instance
+      (export "ctor" (func $ctor))
+      (export "pickdyn" (func $pickdyn))
+      (export "pick64" (func $pick64))))
+  ))
+  (func (export "run") (result s64) (canon lift (core func $mi "run")))
+)
+"#;
+
+/// The method dispatcher unwraps both variant params (tags must agree),
+/// resolves through the core scan, and calls the winning monomorph; the
+/// static monomorph member serves from the same candidate table.
+#[cfg(feature = "dyn-generics")]
+#[test]
+fn dyn_method_dispatcher_executes_live() {
+    let engine = Engine::default();
+    let mut linker = Linker::new(&engine);
+    let mut b = WasmBinder::new(WitGenerator::new("haphe:demo"));
+    b.register_type::<DynBox>().unwrap();
+    haphe::bind(&b, &DYN_METHOD_REGISTRY, &mut linker).expect("binding succeeds");
+
+    let result = run_guest(&engine, &linker, (), DYN_METHOD_GUEST).expect("guest runs");
+    assert!(matches!(result, Val::S64(8)), "got: {result:?}");
+}

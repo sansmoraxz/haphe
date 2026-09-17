@@ -18,6 +18,12 @@ runtime = ["dep:wasmtime"]
 # descriptive error, since plain WIT dispatches by name only.
 generics = []
 
+# Injected dynamic dispatch for `dyn`-declared generics: in addition to the
+# static monomorphs, emits one synthesized variant-based dispatcher per dyn
+# function/method (`{name}-dyn`), served at runtime through the shared core
+# resolver. Flips the `dyn_generics` capability on. Implies `generics`.
+dyn-generics = ["generics"]
+
 # Individually selectable wasmtime extras (each implies `runtime`),
 
 # Additional compilation strategies

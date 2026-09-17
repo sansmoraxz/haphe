@@ -874,6 +874,7 @@ const fn dispatch_module(
 /// WIT guests always name a monomorph statically, so bare dyn dispatch is
 /// rejected by the capability check.
 #[test]
+#[cfg(not(feature = "dyn-generics"))]
 fn dyn_generic_fn_rejected_by_capabilities() {
     static FNS: [FunctionDescriptor; 1] = [generic_module_fn(haphe::Dispatch::Dyn)];
     static MODULES: [haphe::ModuleDescriptor; 1] = [dispatch_module(&FNS)];
@@ -898,7 +899,7 @@ fn dyn_generic_fn_rejected_by_capabilities() {
 /// capability check) emits byte-identical output to its static sibling.
 /// Generic emission requires the `generics` extension feature.
 #[test]
-#[cfg(feature = "generics")]
+#[cfg(all(feature = "generics", not(feature = "dyn-generics")))]
 fn wit_text_is_dispatch_mode_neutral() {
     use haphe::BindingGenerator;
 
@@ -928,6 +929,7 @@ fn wit_text_is_dispatch_mode_neutral() {
 /// `dyn` generic methods on structs are rejected by the capability check,
 /// like free functions: WIT guests always name a monomorph statically.
 #[test]
+#[cfg(not(feature = "dyn-generics"))]
 fn dyn_generic_struct_method_rejected_by_capabilities() {
     static METHODS: [FunctionDescriptor; 1] = [FunctionDescriptor {
         receiver: Some(Receiver::Ref),
@@ -955,6 +957,7 @@ fn dyn_generic_struct_method_rejected_by_capabilities() {
 
 /// `dyn` generic methods on enums are rejected the same way.
 #[test]
+#[cfg(not(feature = "dyn-generics"))]
 fn dyn_generic_enum_method_rejected_by_capabilities() {
     static METHODS: [FunctionDescriptor; 1] = [FunctionDescriptor {
         receiver: Some(Receiver::Ref),
@@ -998,7 +1001,7 @@ fn dyn_generic_enum_method_rejected_by_capabilities() {
 /// generic struct method produce the same generation outcome byte for byte
 /// (direct call bypasses the facade's capability check).
 #[test]
-#[cfg(feature = "generics")]
+#[cfg(all(feature = "generics", not(feature = "dyn-generics")))]
 fn wit_method_text_is_dispatch_mode_neutral() {
     use haphe::BindingGenerator;
 
@@ -1037,4 +1040,138 @@ fn wit_method_text_is_dispatch_mode_neutral() {
         ),
         (a, b) => panic!("outcomes diverged by dispatch mode: {a:?} vs {b:?}"),
     }
+}
+
+// ── Injected dyn dispatchers (feature `dyn-generics`)
+
+/// With the `dyn-generics` feature the capability flips on and the facade
+/// generates dyn registries instead of rejecting them; the output carries
+/// the static monomorphs PLUS one synthesized variant-based dispatcher.
+#[test]
+#[cfg(feature = "dyn-generics")]
+fn dyn_generic_fn_emits_a_dispatcher() {
+    use haphe::BindingGenerator;
+
+    static INSTS: [&[TypeDescriptor]; 2] = [
+        &[TypeDescriptor::Primitive(PrimitiveType::I64)],
+        &[TypeDescriptor::String],
+    ];
+    static FNS: [FunctionDescriptor; 1] = [FunctionDescriptor {
+        instantiations: &INSTS,
+        ..generic_module_fn(haphe::Dispatch::Dyn)
+    }];
+    static MODULES: [haphe::ModuleDescriptor; 1] = [dispatch_module(&FNS)];
+    static REGISTRY: TypeRegistry = TypeRegistry::new(&[], &[], &[], &MODULES, &[], &[]);
+
+    assert!(
+        WitGenerator::new("haphe:demo").capabilities().dyn_generics,
+        "capability must report true with the feature compiled in"
+    );
+    let out = haphe::generate(&WitGenerator::new("haphe:demo"), &REGISTRY)
+        .expect("dyn registries generate with the feature on");
+    let text = String::from_utf8_lossy(&out.files[0].content);
+    // The static monomorphs remain (additive).
+    assert!(
+        text.contains("echo-s64: func(value: s64) -> s64;"),
+        "got:\n{text}"
+    );
+    assert!(
+        text.contains("echo-string: func(value: string) -> string;"),
+        "got:\n{text}"
+    );
+    // One shape-deduplicated variant serves both the parameter and the
+    // return; keyword-shaped case names are `%`-escaped in source.
+    assert!(text.contains("variant echo-dyn-value {"), "got:\n{text}");
+    assert!(text.contains("%s64(s64),"), "got:\n{text}");
+    assert!(text.contains("%string(string),"), "got:\n{text}");
+    assert!(
+        text.contains("/// haphe:dyn-dispatcher = echo"),
+        "got:\n{text}"
+    );
+    assert!(
+        text.contains("echo-dyn: func(value: echo-dyn-value) -> echo-dyn-value;"),
+        "got:\n{text}"
+    );
+}
+
+/// A dyn METHOD declares its dispatcher as a resource member, the variant
+/// types at interface level (resource bodies hold only functions).
+#[test]
+#[cfg(feature = "dyn-generics")]
+fn dyn_generic_method_emits_a_resource_dispatcher() {
+    static INSTS: [&[TypeDescriptor]; 2] = [
+        &[TypeDescriptor::Primitive(PrimitiveType::I64)],
+        &[TypeDescriptor::String],
+    ];
+    static METHODS: [FunctionDescriptor; 1] = [FunctionDescriptor {
+        receiver: Some(Receiver::Ref),
+        instantiations: &INSTS,
+        ..generic_module_fn(haphe::Dispatch::Dyn)
+    }];
+    static STRUCTS: [StructDescriptor; 1] = [StructDescriptor {
+        methods: &METHODS,
+        ..plain_struct("test::Holder", "Holder")
+    }];
+    static REGISTRY: TypeRegistry = TypeRegistry::new(&STRUCTS, &[], &[], &[], &[], &[]);
+
+    let out = haphe::generate(&WitGenerator::new("haphe:demo"), &REGISTRY)
+        .expect("dyn method registries generate with the feature on");
+    let text = String::from_utf8_lossy(&out.files[0].content);
+    assert!(
+        text.contains("variant holder-echo-dyn-value {"),
+        "got:\n{text}"
+    );
+    assert!(
+        text.contains("echo-dyn: func(value: holder-echo-dyn-value) -> holder-echo-dyn-value;"),
+        "got:\n{text}"
+    );
+    // The variant is defined before the resource block that uses it.
+    let variant_at = text.find("variant holder-echo-dyn-value").unwrap();
+    let resource_at = text.find("resource holder").unwrap();
+    assert!(variant_at < resource_at, "got:\n{text}");
+}
+
+/// A dyn ENUM method declares its dispatcher as an interface-level companion
+/// taking `this` first.
+#[test]
+#[cfg(feature = "dyn-generics")]
+fn dyn_generic_enum_method_emits_a_companion_dispatcher() {
+    static INSTS: [&[TypeDescriptor]; 2] = [
+        &[TypeDescriptor::Primitive(PrimitiveType::I64)],
+        &[TypeDescriptor::String],
+    ];
+    static METHODS: [FunctionDescriptor; 1] = [FunctionDescriptor {
+        receiver: Some(Receiver::Ref),
+        instantiations: &INSTS,
+        ..generic_module_fn(haphe::Dispatch::Dyn)
+    }];
+    static VARIANTS: [haphe::EnumVariant; 1] = [haphe::EnumVariant {
+        name: "On",
+        doc: None,
+        kind: haphe::VariantKind::Unit,
+        discriminant: None,
+    }];
+    static ENUMS: [haphe::EnumDescriptor; 1] = [haphe::EnumDescriptor {
+        id: TypeId::new("test::Toggle"),
+        name: "Toggle",
+        doc: None,
+        variants: &VARIANTS,
+        methods: &METHODS,
+        trait_impls: &[],
+        thread_safety: ThreadSafety::SEND_SYNC,
+        generic_params: &[],
+        repr: None,
+        is_flags: false,
+    }];
+    static REGISTRY: TypeRegistry = TypeRegistry::new(&[], &ENUMS, &[], &[], &[], &[]);
+
+    let out = haphe::generate(&WitGenerator::new("haphe:demo"), &REGISTRY)
+        .expect("dyn enum method registries generate with the feature on");
+    let text = String::from_utf8_lossy(&out.files[0].content);
+    assert!(
+        text.contains(
+            "toggle-echo-dyn: func(this: toggle, value: toggle-echo-dyn-value) -> toggle-echo-dyn-value;"
+        ),
+        "got:\n{text}"
+    );
 }

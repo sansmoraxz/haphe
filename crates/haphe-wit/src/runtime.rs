@@ -57,6 +57,13 @@ struct Registrations {
         (&'static str, &'static [TypeDescriptor<'static>]),
         AsyncProvidedFn,
     )>,
+    /// `dyn` candidates: one monomorph per declared instantiation, carrying
+    /// the full descriptor for the dispatcher's resolver scan.
+    #[cfg(feature = "dyn-generics")]
+    dyn_fns: Vec<(crate::host::DynKey, ProvidedFn)>,
+    /// Async `dyn` candidates, same keying.
+    #[cfg(feature = "dyn-generics")]
+    dyn_async_fns: Vec<(crate::host::DynKey, AsyncProvidedFn)>,
 }
 
 type ProvidedFn = fn(&[ScriptValue]) -> Result<ScriptValue, ScriptConvertError>;
@@ -73,14 +80,20 @@ struct FnCollector {
         (&'static str, &'static [TypeDescriptor<'static>]),
         AsyncProvidedFn,
     )>,
+    #[cfg(feature = "dyn-generics")]
+    dyn_entries: Vec<(crate::host::DynKey, ProvidedFn)>,
+    #[cfg(feature = "dyn-generics")]
+    dyn_async_entries: Vec<(crate::host::DynKey, AsyncProvidedFn)>,
 }
 
-// `function_dyn`/`function_dyn_async` are deliberately NOT overridden: their
-// core defaults delegate to `function`/`function_async`, so a dyn fn that
-// somehow reached this collector would register its monomorphs statically.
-// That path relies on check-before-bind — `WasmBinder::bind` runs the
-// capability check (`dyn_generics: false`) through the facade, which rejects
-// dyn functions with `DynGenericsUnsupported` before any collection happens.
+// Without `dyn-generics`, `function_dyn`/`function_dyn_async` are NOT
+// overridden: their core defaults delegate to `function`/`function_async`,
+// so a dyn fn that somehow reached this collector would register its
+// monomorphs statically. That path relies on check-before-bind —
+// `WasmBinder::bind` runs the capability check (`dyn_generics: false`)
+// through the facade, which rejects dyn functions with
+// `DynGenericsUnsupported` before any collection happens. With the feature,
+// dyn candidates are collected for the synthesized dispatchers instead.
 impl FnBinder for FnCollector {
     type Error = std::convert::Infallible;
 
@@ -101,6 +114,28 @@ impl FnBinder for FnCollector {
         f: AsyncProvidedFn,
     ) -> Result<(), Self::Error> {
         self.async_entries.push(((name, type_args), f));
+        Ok(())
+    }
+
+    #[cfg(feature = "dyn-generics")]
+    fn function_dyn(
+        &mut self,
+        descriptor: &'static haphe::FunctionDescriptor<'static>,
+        type_args: &'static [TypeDescriptor<'static>],
+        f: ProvidedFn,
+    ) -> Result<(), Self::Error> {
+        self.dyn_entries.push(((descriptor, type_args), f));
+        Ok(())
+    }
+
+    #[cfg(feature = "dyn-generics")]
+    fn function_dyn_async(
+        &mut self,
+        descriptor: &'static haphe::FunctionDescriptor<'static>,
+        type_args: &'static [TypeDescriptor<'static>],
+        f: AsyncProvidedFn,
+    ) -> Result<(), Self::Error> {
+        self.dyn_async_entries.push(((descriptor, type_args), f));
         Ok(())
     }
 }
@@ -314,6 +349,34 @@ impl<T> WasmBinder<T> {
             }
             self.regs.async_fns.push((key, f));
         }
+        #[cfg(feature = "dyn-generics")]
+        for (key, f) in collector.dyn_entries {
+            if self
+                .regs
+                .dyn_fns
+                .iter()
+                .any(|((d, a), _)| d.name == key.0.name && *a == key.1)
+            {
+                return Err(WasmBindError::DuplicateRegistration {
+                    name: key.0.name.to_string(),
+                });
+            }
+            self.regs.dyn_fns.push((key, f));
+        }
+        #[cfg(feature = "dyn-generics")]
+        for (key, f) in collector.dyn_async_entries {
+            if self
+                .regs
+                .dyn_async_fns
+                .iter()
+                .any(|((d, a), _)| d.name == key.0.name && *a == key.1)
+            {
+                return Err(WasmBindError::DuplicateRegistration {
+                    name: key.0.name.to_string(),
+                });
+            }
+            self.regs.dyn_async_fns.push((key, f));
+        }
         Ok(self)
     }
 }
@@ -520,6 +583,16 @@ impl<T: 'static> RuntimeBinder for WasmBinder<T> {
                                 )?,
                             }
                         }
+                        #[cfg(feature = "dyn-generics")]
+                        bind_enum_dyn_companion(
+                            &mut inst,
+                            e.name,
+                            "_",
+                            m,
+                            value.as_ref(),
+                            &mut member_names,
+                            &cx,
+                        )?;
                     }
                 }
             }
@@ -551,6 +624,16 @@ impl<T: 'static> RuntimeBinder for WasmBinder<T> {
                                 )?,
                             }
                         }
+                        #[cfg(feature = "dyn-generics")]
+                        bind_enum_dyn_companion(
+                            &mut inst,
+                            &planned.wit_name,
+                            "-",
+                            m,
+                            value.as_ref(),
+                            &mut member_names,
+                            &cx,
+                        )?;
                     }
                 }
             }
@@ -636,14 +719,67 @@ impl<T: 'static> RuntimeBinder for WasmBinder<T> {
                     let mangled = plan.mangle_fn_instance(func.name, args, None)?;
                     let name = member_names.insert(&mangled)?;
                     if func.is_async {
-                        match self.find_async_fn(func.name, args) {
+                        // A dyn fn registers its monomorph wrappers through
+                        // the dyn channel only; the static monomorph members
+                        // (which remain emitted) serve from the same table.
+                        let found = self.find_async_fn(func.name, args);
+                        #[cfg(feature = "dyn-generics")]
+                        let found = found.or_else(|| self.find_dyn_async_fn(func.name, args));
+                        match found {
                             Some(f) => define_value_fn_async(&mut inst, &name, f, &cx)?,
                             None => stub_func(&mut inst, &name)?,
                         }
                     } else {
-                        match self.find_fn(func.name, args) {
+                        let found = self.find_fn(func.name, args);
+                        #[cfg(feature = "dyn-generics")]
+                        let found = found.or_else(|| self.find_dyn_fn(func.name, args));
+                        match found {
                             Some(f) => define_value_fn(&mut inst, &name, f, &cx)?,
                             None => stub_func(&mut inst, &name)?,
+                        }
+                    }
+                }
+                // The synthesized dispatcher, same name the generator
+                // emits; declared candidates come from the collector's
+                // `function_dyn*` channels.
+                #[cfg(feature = "dyn-generics")]
+                if crate::dyn_gen::is_dyn(func) {
+                    let dname = member_names.insert(&format!("{}-dyn", func.name))?;
+                    if func.is_async {
+                        let mut cands = Vec::new();
+                        let mut desc = None;
+                        for ((d, args), f) in &self.regs.dyn_async_fns {
+                            if d.name == func.name {
+                                desc = Some(*d);
+                                cands.push((DynCand::new(args)?, *f));
+                            }
+                        }
+                        match desc {
+                            Some(desc) => {
+                                define_dyn_value_fn_async(&mut inst, &dname, desc, cands, &cx)?
+                            }
+                            None => stub_func_msg(
+                                &mut inst,
+                                &dname,
+                                "dyn dispatcher has no registered candidates; call `register_fn`",
+                            )?,
+                        }
+                    } else {
+                        let mut cands = Vec::new();
+                        let mut desc = None;
+                        for ((d, args), f) in &self.regs.dyn_fns {
+                            if d.name == func.name {
+                                desc = Some(*d);
+                                cands.push((DynCand::new(args)?, *f));
+                            }
+                        }
+                        match desc {
+                            Some(desc) => define_dyn_value_fn(&mut inst, &dname, desc, cands, &cx)?,
+                            None => stub_func_msg(
+                                &mut inst,
+                                &dname,
+                                "dyn dispatcher has no registered candidates; call `register_fn`",
+                            )?,
                         }
                     }
                 }
@@ -670,6 +806,28 @@ impl<T> WasmBinder<T> {
             .fns
             .iter()
             .find(|((n, a), _)| *n == name && *a == args)
+            .map(|(_, f)| *f)
+    }
+
+    #[cfg(feature = "dyn-generics")]
+    fn find_dyn_fn(&self, name: &str, args: &[TypeDescriptor<'_>]) -> Option<ProvidedFn> {
+        self.regs
+            .dyn_fns
+            .iter()
+            .find(|((d, a), _)| d.name == name && *a == args)
+            .map(|(_, f)| *f)
+    }
+
+    #[cfg(feature = "dyn-generics")]
+    fn find_dyn_async_fn(
+        &self,
+        name: &str,
+        args: &[TypeDescriptor<'_>],
+    ) -> Option<AsyncProvidedFn> {
+        self.regs
+            .dyn_async_fns
+            .iter()
+            .find(|((d, a), _)| d.name == name && *a == args)
             .map(|(_, f)| *f)
     }
 
@@ -1850,6 +2008,318 @@ fn trap(name: &str, detail: &str) -> wasmtime::Error {
     wasmtime::Error::msg(format!("haphe-wit: `{name}`: {detail}"))
 }
 
+// ---------------------------------------------------------------------------
+// dyn-generics: synthesized dispatcher dispatch (feature `dyn-generics`)
+// ---------------------------------------------------------------------------
+
+/// One bind-time-resolved dyn candidate: its case tag (the instantiation's
+/// plan-independent mangled key, which is also the resolved variant case
+/// name) plus its type arguments for the core resolver.
+#[cfg(feature = "dyn-generics")]
+struct DynCand {
+    key: String,
+    type_args: &'static [TypeDescriptor<'static>],
+}
+
+#[cfg(feature = "dyn-generics")]
+impl DynCand {
+    fn new(type_args: &'static [TypeDescriptor<'static>]) -> Result<Self, WitGenError> {
+        Ok(Self {
+            key: crate::dyn_gen::case_key_plain(type_args)?,
+            type_args,
+        })
+    }
+}
+
+/// Unwraps dispatcher arguments: variant-wrapped generic positions (lifted
+/// as single-pair maps) unwrap to their payload, recording the case tag;
+/// pass-through positions stay. All tags must agree — they all name the one
+/// instantiation being selected.
+#[cfg(feature = "dyn-generics")]
+fn unwrap_dyn_args(
+    desc: &haphe::FunctionDescriptor<'_>,
+    args: Vec<ScriptValue>,
+    msg: &str,
+) -> wasmtime::Result<(Option<String>, Vec<ScriptValue>)> {
+    let mut tag: Option<String> = None;
+    let mut values = Vec::with_capacity(args.len());
+    for (param, v) in desc.params.iter().zip(args) {
+        if !crate::dyn_gen::mentions_generic(param.ty) {
+            values.push(v);
+            continue;
+        }
+        let ScriptValue::Map(mut pairs) = v else {
+            return Err(trap(msg, "expected a dispatcher variant argument"));
+        };
+        if pairs.len() != 1 {
+            return Err(trap(msg, "expected a single-case dispatcher variant"));
+        }
+        let (case, payload) = pairs.pop().expect("length checked");
+        match &tag {
+            None => tag = Some(case),
+            Some(t) if *t == case => {}
+            Some(t) => {
+                return Err(trap(
+                    msg,
+                    &format!("mismatched candidate tags `{t}` and `{case}`"),
+                ));
+            }
+        }
+        values.push(payload);
+    }
+    Ok((tag, values))
+}
+
+/// Candidate attempt order: the case tag filters (exact by construction —
+/// the tag names the instantiation), then the SAME shared core resolver a
+/// natively-dynamic backend uses ranks the survivors; a rejected conversion
+/// falls through in declaration order. No survivors is a descriptive trap
+/// listing every declared candidate.
+#[cfg(feature = "dyn-generics")]
+fn dyn_attempt_order<F>(
+    desc: &'static haphe::FunctionDescriptor<'static>,
+    cands: &[(DynCand, F)],
+    tag: Option<&str>,
+    values: &[ScriptValue],
+    msg: &str,
+) -> wasmtime::Result<Vec<usize>> {
+    use haphe::dispatch::{DynCandidate, Resolution, resolve_dyn_candidate};
+
+    let filtered: Vec<usize> = cands
+        .iter()
+        .enumerate()
+        .filter(|(_, (c, _))| tag.is_none_or(|t| t == c.key))
+        .map(|(i, _)| i)
+        .collect();
+    if filtered.is_empty() {
+        let listing: Vec<String> = cands
+            .iter()
+            .map(|(c, _)| format!("{}<{}>", desc.name, c.key))
+            .collect();
+        return Err(trap(
+            msg,
+            &format!(
+                "no candidate matches tag `{}`; declared candidates: {}",
+                tag.unwrap_or("<none>"),
+                listing.join(", ")
+            ),
+        ));
+    }
+    let resolver_cands: Vec<DynCandidate<'_>> = filtered
+        .iter()
+        .map(|&i| DynCandidate {
+            type_args: cands[i].0.type_args,
+            descriptor: desc,
+        })
+        .collect();
+    Ok(match resolve_dyn_candidate(values, &resolver_cands) {
+        Resolution::Ranked(r) => {
+            let winner = filtered[r];
+            let mut order = vec![winner];
+            order.extend(filtered.iter().copied().filter(|&i| i != winner));
+            order
+        }
+        Resolution::TryCallOrder => filtered,
+    })
+}
+
+/// Wraps a dispatcher result back under the winning candidate's case when
+/// the declared return type is generic-typed (the single-pair map lowers
+/// through the variant arm of `script_to_val`).
+#[cfg(feature = "dyn-generics")]
+fn wrap_dyn_result(
+    desc: &haphe::FunctionDescriptor<'_>,
+    key: &str,
+    out: ScriptValue,
+) -> ScriptValue {
+    let ret = crate::types::peel_borrowed(desc.return_type);
+    if crate::dyn_gen::mentions_generic(ret) && !matches!(ret, TypeDescriptor::Unit) {
+        ScriptValue::Map(vec![(key.to_string(), out)])
+    } else {
+        out
+    }
+}
+
+#[cfg(feature = "dyn-generics")]
+fn no_candidate_trap(msg: &str, last: Option<haphe::ScriptConvertError>) -> wasmtime::Error {
+    match last {
+        Some(e) => trap(msg, &format!("no candidate accepted the arguments ({e})")),
+        None => trap(msg, "no candidate accepted the arguments"),
+    }
+}
+
+/// Defines one live free-function dispatcher (`{name}-dyn`).
+#[cfg(feature = "dyn-generics")]
+fn define_dyn_value_fn<T: 'static>(
+    inst: &mut LinkerInstance<'_, T>,
+    name: &str,
+    desc: &'static haphe::FunctionDescriptor<'static>,
+    cands: Vec<(DynCand, ProvidedFn)>,
+    cx: &DispatchCx,
+) -> Result<(), WasmBindError> {
+    let cx = cx.clone();
+    let msg = name.to_string();
+    inst.func_new(name, move |mut store, fty, params, results| {
+        let raw = lift_args(&cx, &mut store, params, 0, &msg)?;
+        let (tag, values) = unwrap_dyn_args(desc, raw, &msg)?;
+        let order = dyn_attempt_order(desc, &cands, tag.as_deref(), &values, &msg)?;
+        let mut last = None;
+        for i in order {
+            match (cands[i].1)(&values) {
+                Ok(out) => {
+                    let out = wrap_dyn_result(desc, &cands[i].0.key, out);
+                    return lower_result(&cx, &mut store, fty.results(), out, results, &msg);
+                }
+                Err(e) => last = Some(e),
+            }
+        }
+        Err(no_candidate_trap(&msg, last))
+    })?;
+    Ok(())
+}
+
+/// Async sibling of [`define_dyn_value_fn`]; futures are driven to
+/// completion on-thread ([`block_on`]), like other async dispatch.
+#[cfg(feature = "dyn-generics")]
+fn define_dyn_value_fn_async<T: 'static>(
+    inst: &mut LinkerInstance<'_, T>,
+    name: &str,
+    desc: &'static haphe::FunctionDescriptor<'static>,
+    cands: Vec<(DynCand, AsyncProvidedFn)>,
+    cx: &DispatchCx,
+) -> Result<(), WasmBindError> {
+    let cx = cx.clone();
+    let msg = name.to_string();
+    inst.func_new(name, move |mut store, fty, params, results| {
+        let raw = lift_args(&cx, &mut store, params, 0, &msg)?;
+        let (tag, values) = unwrap_dyn_args(desc, raw, &msg)?;
+        let order = dyn_attempt_order(desc, &cands, tag.as_deref(), &values, &msg)?;
+        let mut last = None;
+        for i in order {
+            match block_on((cands[i].1)(&values)) {
+                Ok(out) => {
+                    let out = wrap_dyn_result(desc, &cands[i].0.key, out);
+                    return lower_result(&cx, &mut store, fty.results(), out, results, &msg);
+                }
+                Err(e) => last = Some(e),
+            }
+        }
+        Err(no_candidate_trap(&msg, last))
+    })?;
+    Ok(())
+}
+
+/// Defines one live resource-method dispatcher (`[method]{res}.{name}-dyn`).
+///
+/// Receiver acquisition per attempt is borrow-based: a consuming (`self`)
+/// candidate clones at the boundary instead of consuming the table entry,
+/// so the handle stays live and fall-through stays possible — the one
+/// documented divergence from static monomorph semantics.
+#[cfg(feature = "dyn-generics")]
+fn define_dyn_method<T: 'static>(
+    inst: &mut LinkerInstance<'_, T>,
+    linker_name: &str,
+    desc: &'static haphe::FunctionDescriptor<'static>,
+    cands: Vec<(DynCand, usize)>,
+    entry: Arc<ResourceEntry>,
+    cx: &DispatchCx,
+) -> Result<(), WasmBindError> {
+    let cx = cx.clone();
+    let msg = linker_name.to_string();
+    inst.func_new(linker_name, move |mut store, fty, params, results| {
+        let rep = self_rep(&mut store, params, &msg)?;
+        let raw = lift_args(&cx, &mut store, params, 1, &msg)?;
+        let (tag, values) = unwrap_dyn_args(desc, raw, &msg)?;
+        let order = dyn_attempt_order(desc, &cands, tag.as_deref(), &values, &msg)?;
+        let mut last = None;
+        for i in order {
+            let (_, entry_index) = &cands[i];
+            let m = &entry.dyn_methods[*entry_index].1;
+            let attempt = match m {
+                EMethod::Cow(f) => {
+                    let guard = cx.table.lock();
+                    let e = guard
+                        .get(&rep)
+                        .ok_or_else(|| trap(&msg, "stale resource handle"))?;
+                    check_type(&msg, e.type_name, entry.type_name)?;
+                    f(CowAny::Borrowed(&*e.value), &values)
+                }
+                EMethod::Mut(f) => {
+                    let mut guard = cx.table.lock();
+                    let e = guard
+                        .get_mut(&rep)
+                        .ok_or_else(|| trap(&msg, "stale resource handle"))?;
+                    check_type(&msg, e.type_name, entry.type_name)?;
+                    f(&mut *e.value, &values)
+                }
+                EMethod::AsyncCow(f) => {
+                    let guard = cx.table.lock();
+                    let e = guard
+                        .get(&rep)
+                        .ok_or_else(|| trap(&msg, "stale resource handle"))?;
+                    check_type(&msg, e.type_name, entry.type_name)?;
+                    block_on(f(CowAny::Borrowed(&*e.value), &values))
+                }
+                EMethod::AsyncMut(f) => {
+                    let mut guard = cx.table.lock();
+                    let e = guard
+                        .get_mut(&rep)
+                        .ok_or_else(|| trap(&msg, "stale resource handle"))?;
+                    check_type(&msg, e.type_name, entry.type_name)?;
+                    block_on(f(&mut *e.value, &values))
+                }
+            };
+            match attempt {
+                Ok(out) => {
+                    let out = wrap_dyn_result(desc, &cands[i].0.key, out);
+                    return lower_result(&cx, &mut store, fty.results(), out, results, &msg);
+                }
+                Err(e) => last = Some(e),
+            }
+        }
+        Err(no_candidate_trap(&msg, last))
+    })?;
+    Ok(())
+}
+
+/// Defines one live enum-companion dispatcher (`{owner}{sep}{name}-dyn`):
+/// `args[0]` is the lowered enum receiver, the rest are dispatcher
+/// parameters.
+#[cfg(feature = "dyn-generics")]
+fn define_enum_dyn_companion<T: 'static>(
+    inst: &mut LinkerInstance<'_, T>,
+    name: &str,
+    desc: &'static haphe::FunctionDescriptor<'static>,
+    cands: Vec<(DynCand, usize)>,
+    entry: Arc<ValueEntry>,
+    cx: &DispatchCx,
+) -> Result<(), WasmBindError> {
+    let cx = cx.clone();
+    let msg = name.to_string();
+    inst.func_new(name, move |mut store, fty, params, results| {
+        let args = lift_args(&cx, &mut store, params, 0, &msg)?;
+        let mut args = args.into_iter();
+        let this = args
+            .next()
+            .ok_or_else(|| trap(&msg, "companion call is missing its receiver"))?;
+        let (tag, values) = unwrap_dyn_args(desc, args.collect(), &msg)?;
+        let order = dyn_attempt_order(desc, &cands, tag.as_deref(), &values, &msg)?;
+        let mut last = None;
+        for i in order {
+            let m = &entry.dyn_methods[cands[i].1].1;
+            match m(this.clone(), &values) {
+                Ok(out) => {
+                    let out = wrap_dyn_result(desc, &cands[i].0.key, out);
+                    return lower_result(&cx, &mut store, fty.results(), out, results, &msg);
+                }
+                Err(e) => last = Some(e),
+            }
+        }
+        Err(no_candidate_trap(&msg, last))
+    })?;
+    Ok(())
+}
+
 /// Defines a live free-function (or companion-shaped) dispatch.
 fn define_value_fn<T: 'static>(
     inst: &mut LinkerInstance<'_, T>,
@@ -1918,6 +2388,9 @@ fn define_record_projection<T: 'static>(
 enum ValueMethodKey {
     Named(String),
     Generic(usize),
+    /// A static monomorph served from the dyn candidate table.
+    #[cfg(feature = "dyn-generics")]
+    Dyn(usize),
 }
 
 /// Linker names + dispatch keys for one enum method's companion functions:
@@ -1944,14 +2417,66 @@ fn enum_companion_defs(
         let mangled = mangle_generic_name(m.name, args)?;
         let name = member_names.insert(&format!("{owner}{sep}{mangled}"))?;
         let key = value.and_then(|v| {
-            v.generic_methods
+            let key = v
+                .generic_methods
                 .iter()
                 .position(|((n, a), _)| *n == m.name && a[..] == args[..])
-                .map(ValueMethodKey::Generic)
+                .map(ValueMethodKey::Generic);
+            #[cfg(feature = "dyn-generics")]
+            let key = key.or_else(|| {
+                v.dyn_methods
+                    .iter()
+                    .position(|((d, a), _)| d.name == m.name && a[..] == args[..])
+                    .map(ValueMethodKey::Dyn)
+            });
+            key
         });
         out.push((name, key));
     }
     Ok(out)
+}
+
+/// Binds one enum method's dyn dispatcher companion (`{owner}{sep}{name}-dyn`)
+/// — live when the value entry carries candidates, a descriptive stub
+/// otherwise. No-op for non-dyn methods.
+#[cfg(feature = "dyn-generics")]
+fn bind_enum_dyn_companion<T: 'static>(
+    inst: &mut LinkerInstance<'_, T>,
+    owner: &str,
+    sep: &str,
+    m: &haphe::FunctionDescriptor<'_>,
+    value: Option<&Arc<ValueEntry>>,
+    member_names: &mut NameMap,
+    cx: &DispatchCx,
+) -> Result<(), WasmBindError> {
+    if !crate::dyn_gen::is_dyn(m) {
+        return Ok(());
+    }
+    let dname = member_names.insert(&format!("{owner}{sep}{}-dyn", m.name))?;
+    let mut resolved = None;
+    if let Some(v) = value {
+        let mut cands = Vec::new();
+        let mut desc = None;
+        for (i, ((d, args), _)) in v.dyn_methods.iter().enumerate() {
+            if d.name == m.name {
+                desc = Some(*d);
+                cands.push((DynCand::new(args)?, i));
+            }
+        }
+        if let Some(desc) = desc {
+            resolved = Some((desc, cands, v.clone()));
+        }
+    }
+    match resolved {
+        Some((desc, cands, entry)) => {
+            define_enum_dyn_companion(inst, &dname, desc, cands, entry, cx)
+        }
+        None => stub_func_msg(
+            inst,
+            &dname,
+            "enum companion dyn dispatcher has no registered candidates; call `register_enum`",
+        ),
+    }
 }
 
 fn define_enum_companion<T: 'static>(
@@ -1968,6 +2493,8 @@ fn define_enum_companion<T: 'static>(
         let m = match &method {
             ValueMethodKey::Named(n) => entry.methods.get(n.as_str()),
             ValueMethodKey::Generic(i) => entry.generic_methods.get(*i).map(|(_, m)| m),
+            #[cfg(feature = "dyn-generics")]
+            ValueMethodKey::Dyn(i) => entry.dyn_methods.get(*i).map(|(_, m)| m),
         }
         .ok_or_else(|| trap(&msg_name, "enum method has no dispatch channel"))?;
         let (this, rest) = args
@@ -2082,11 +2609,22 @@ fn bind_resource_live<T: 'static>(
                 None if entry.methods.contains_key(m.name) => {
                     Some(MethodKey::Named(m.name.to_string()))
                 }
-                Some(args) => entry
-                    .generic_methods
-                    .iter()
-                    .position(|((n, a), _)| *n == m.name && a[..] == args[..])
-                    .map(MethodKey::Generic),
+                Some(args) => {
+                    let key = entry
+                        .generic_methods
+                        .iter()
+                        .position(|((n, a), _)| *n == m.name && a[..] == args[..])
+                        .map(MethodKey::Generic);
+                    #[cfg(feature = "dyn-generics")]
+                    let key = key.or_else(|| {
+                        entry
+                            .dyn_methods
+                            .iter()
+                            .position(|((d, a), _)| d.name == m.name && a[..] == args[..])
+                            .map(MethodKey::Dyn)
+                    });
+                    key
+                }
                 None => None,
             };
             let Some(key) = key else {
@@ -2107,6 +2645,42 @@ fn bind_resource_live<T: 'static>(
                 &entry,
                 cx,
             )?;
+        }
+        // The synthesized dyn dispatcher member, same name the generator
+        // emits; candidates come from the derive's `method_dyn*` channels.
+        #[cfg(feature = "dyn-generics")]
+        if crate::dyn_gen::is_dyn(m) {
+            let dname = members.insert(&format!("{}-dyn", m.name))?;
+            let prefixed = match m.receiver {
+                Some(Receiver::Ref | Receiver::RefMut) => format!("[method]{res}.{dname}"),
+                Some(Receiver::Owned) | None => format!("[static]{res}.{dname}"),
+            };
+            if m.receiver.is_none() {
+                stub_func_msg(
+                    inst,
+                    &prefixed,
+                    "associated functions without a receiver are not yet bridged",
+                )?;
+            } else {
+                let mut cands = Vec::new();
+                let mut desc = None;
+                for (i, ((d, args), _)) in entry.dyn_methods.iter().enumerate() {
+                    if d.name == m.name {
+                        desc = Some(*d);
+                        cands.push((DynCand::new(args)?, i));
+                    }
+                }
+                match desc {
+                    Some(desc) => {
+                        define_dyn_method(inst, &prefixed, desc, cands, entry.clone(), cx)?
+                    }
+                    None => stub_func_msg(
+                        inst,
+                        &prefixed,
+                        "declared but not bridgeable (its signature types lack value conversions)",
+                    )?,
+                }
+            }
         }
     }
 
@@ -2329,6 +2903,10 @@ fn define_ctor<T: 'static>(
 enum MethodKey {
     Named(String),
     Generic(usize),
+    /// A static monomorph served from the dyn candidate table (a dyn method
+    /// registers its wrappers through `method_dyn*` only).
+    #[cfg(feature = "dyn-generics")]
+    Dyn(usize),
 }
 
 fn define_method<T: 'static>(
@@ -2347,6 +2925,8 @@ fn define_method<T: 'static>(
         let m = match &method {
             MethodKey::Named(name) => entry.methods.get(name.as_str()),
             MethodKey::Generic(i) => entry.generic_methods.get(*i).map(|(_, m)| m),
+            #[cfg(feature = "dyn-generics")]
+            MethodKey::Dyn(i) => entry.dyn_methods.get(*i).map(|(_, m)| m),
         }
         .ok_or_else(|| trap(&msg, "method has no bridge channel"))?;
         let out = match (m, receiver) {
@@ -2722,6 +3302,15 @@ fn bind_resource_stub<T: 'static>(
             let prefixed = match m.receiver {
                 Some(Receiver::Ref | Receiver::RefMut) => format!("[method]{res}.{name}"),
                 Some(Receiver::Owned) | None => format!("[static]{res}.{name}"),
+            };
+            stub_func_msg(inst, &prefixed, unregistered)?;
+        }
+        #[cfg(feature = "dyn-generics")]
+        if crate::dyn_gen::is_dyn(m) {
+            let dname = members.insert(&format!("{}-dyn", m.name))?;
+            let prefixed = match m.receiver {
+                Some(Receiver::Ref | Receiver::RefMut) => format!("[method]{res}.{dname}"),
+                Some(Receiver::Owned) | None => format!("[static]{res}.{dname}"),
             };
             stub_func_msg(inst, &prefixed, unregistered)?;
         }

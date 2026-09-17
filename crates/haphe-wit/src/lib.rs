@@ -18,6 +18,60 @@
 //! foreign exports — no binder or registration machinery, just a store, an
 //! instance, and a package address.
 
+#[cfg(feature = "dyn-generics")]
+mod dyn_gen;
+/// Inert stand-ins without the `dyn-generics` feature: [`dyn_gen::is_dyn`]
+/// is constantly `false`, so every dispatcher path is dead and none of the
+/// emission machinery compiles.
+#[cfg(not(feature = "dyn-generics"))]
+mod dyn_gen {
+    #![allow(dead_code)]
+
+    use crate::WitGenError;
+    use crate::emit::Printer;
+    use crate::model::{Env, Plan};
+    use haphe::FunctionDescriptor;
+
+    pub(crate) fn is_dyn(_f: &FunctionDescriptor<'_>) -> bool {
+        false
+    }
+
+    pub(crate) struct DispatcherSig {
+        pub raw_name: String,
+        pub marker: String,
+    }
+
+    impl DispatcherSig {
+        pub fn param_list(&self) -> String {
+            unreachable!("dyn-generics feature is off")
+        }
+        pub fn arrow(&self) -> String {
+            unreachable!("dyn-generics feature is off")
+        }
+        pub fn keyword(&self) -> &'static str {
+            unreachable!("dyn-generics feature is off")
+        }
+    }
+
+    pub(crate) struct DynCx;
+
+    impl DynCx {
+        pub fn new() -> Self {
+            DynCx
+        }
+
+        pub fn dispatcher(
+            &mut self,
+            _p: &mut Printer,
+            _f: &FunctionDescriptor<'_>,
+            _owner: Option<&str>,
+            _plan: &Plan<'_>,
+            _env: Option<&Env<'_, '_>>,
+        ) -> Result<DispatcherSig, WitGenError> {
+            unreachable!("dyn-generics feature is off")
+        }
+    }
+}
 mod emit;
 #[cfg(feature = "runtime")]
 mod host;
@@ -279,15 +333,15 @@ impl BindingGenerator for WitGenerator {
     }
 
     fn capabilities(&self) -> BackendCapabilities {
-        // `dyn_generics: false` — WIT guests always name a monomorph
-        // statically, so bare dyn dispatch is meaningless here. A future
-        // `dyn-generics` cargo feature may inject a synthesized dispatcher
-        // (see the README's dyn-generics section) and flip this on when
-        // compiled in. The runtime binder inherits this via delegation, so
-        // both capability sites report false.
+        // WIT guests always name a monomorph statically, so bare dyn
+        // dispatch is representable only via the `dyn-generics` feature's
+        // injected variant-based dispatchers — the capability reports true
+        // exactly when that machinery is compiled in (see the README's
+        // dyn-generics section). The runtime binder inherits this via
+        // delegation, so both capability sites agree.
         BackendCapabilities::ALL
             .with_callbacks(false)
-            .with_dyn_generics(false)
+            .with_dyn_generics(cfg!(feature = "dyn-generics"))
             .with_properties(true)
             .with_type_aliases(true)
             .with_required_thread_safety(None)
@@ -379,13 +433,17 @@ impl WitGenerator {
         }
 
         let mut member_names = NameMap::new();
+        let mut dyn_cx = dyn_gen::DynCx::new();
 
         for id in &iface.type_ids {
             match registry.get_type(&haphe::TypeId::new(id)).unwrap() {
                 TypeKind::Struct(s) => {
                     let name = plan.type_name(id).to_string();
                     if plan.is_resource(id) {
-                        emit_resource(p, s, &name, plan, None)?;
+                        // Dispatcher variant types are interface-level, so
+                        // they precede the resource block that uses them.
+                        let dyn_sigs = dyn_method_sigs(&mut dyn_cx, p, s, &name, plan, None)?;
+                        emit_resource(p, s, &name, plan, None, &dyn_sigs)?;
                     } else {
                         emit_record(p, s, &name, plan, None)?;
                     }
@@ -411,7 +469,9 @@ impl WitGenerator {
             {
                 TypeKind::Struct(s) => {
                     if plan.is_resource(inst.erased_id) {
-                        emit_resource(p, s, &inst.wit_name, plan, Some(&env))?;
+                        let dyn_sigs =
+                            dyn_method_sigs(&mut dyn_cx, p, s, &inst.wit_name, plan, Some(&env))?;
+                        emit_resource(p, s, &inst.wit_name, plan, Some(&env), &dyn_sigs)?;
                     } else {
                         emit_record(p, s, &inst.wit_name, plan, Some(&env))?;
                     }
@@ -441,6 +501,12 @@ impl WitGenerator {
                         let fenv = plan.fn_env(m, args, None);
                         emit_function(p, m, Some(&enum_name), &fn_name, plan, Some(&fenv))?;
                     }
+                    if dyn_gen::is_dyn(m) {
+                        let sig = dyn_cx.dispatcher(p, m, Some(&enum_name), plan, None)?;
+                        let fn_name =
+                            member_names.insert(&format!("{}_{}", e.name, sig.raw_name))?;
+                        emit_companion_dispatcher(p, &sig, &fn_name, &enum_name);
+                    }
                 }
             }
         }
@@ -462,6 +528,13 @@ impl WitGenerator {
                             member_names.insert(&format!("{}-{}", inst.wit_name, mangled))?;
                         let fenv = plan.fn_env(m, args, Some(&env));
                         emit_function(p, m, Some(&inst.wit_name), &fn_name, plan, Some(&fenv))?;
+                    }
+                    if dyn_gen::is_dyn(m) {
+                        let sig =
+                            dyn_cx.dispatcher(p, m, Some(&inst.wit_name), plan, Some(&env))?;
+                        let fn_name =
+                            member_names.insert(&format!("{}-{}", inst.wit_name, sig.raw_name))?;
+                        emit_companion_dispatcher(p, &sig, &fn_name, &inst.wit_name);
                     }
                 }
             }
@@ -532,6 +605,21 @@ impl WitGenerator {
                 )));
                 emit_function(p, func, None, &name, plan, Some(&env))?;
             }
+            // A `dyn` declaration additionally synthesizes one dispatcher
+            // (`dyn-generics` feature). Foreign interfaces get monomorphs
+            // only: a dispatcher there would demand a guest-side
+            // implementation that does not exist.
+            if dyn_gen::is_dyn(func) && iface.direction == Direction::Provided {
+                let sig = dyn_cx.dispatcher(p, func, None, plan, base_env.as_ref())?;
+                let name = member_names.insert(&sig.raw_name)?;
+                p.doc(Some(&sig.marker));
+                p.line(&format!(
+                    "{name}: {}({}){};",
+                    sig.keyword(),
+                    sig.param_list(),
+                    sig.arrow()
+                ));
+            }
         }
 
         if self.constants == ConstantMode::Getter {
@@ -544,6 +632,49 @@ impl WitGenerator {
         p.close();
         Ok(())
     }
+}
+
+/// Prints one enum-companion dispatcher line: interface-level, `this` (the
+/// enum value) prepended to the dispatcher's own parameters.
+fn emit_companion_dispatcher(
+    p: &mut Printer,
+    sig: &dyn_gen::DispatcherSig,
+    fn_name: &str,
+    enum_name: &str,
+) {
+    p.doc(Some(&sig.marker));
+    let params = sig.param_list();
+    let sep = if params.is_empty() { "" } else { ", " };
+    p.line(&format!(
+        "{fn_name}: {}(this: {enum_name}{sep}{params}){};",
+        sig.keyword(),
+        sig.arrow()
+    ));
+}
+
+/// Builds the dispatcher signatures for a resource's `dyn` methods, emitting
+/// their variant type definitions at the CURRENT printer position (interface
+/// level — call before opening the resource block). Returns
+/// `(method name, signature)` pairs for [`emit_resource`] to print members
+/// from; empty without the `dyn-generics` feature.
+fn dyn_method_sigs(
+    cx: &mut dyn_gen::DynCx,
+    p: &mut Printer,
+    s: &StructDescriptor<'_>,
+    owner: &str,
+    plan: &Plan<'_>,
+    env: Option<&Env<'_, '_>>,
+) -> Result<Vec<(String, dyn_gen::DispatcherSig)>, WitGenError> {
+    let mut out = Vec::new();
+    for m in s.methods {
+        if dyn_gen::is_dyn(m) {
+            out.push((
+                m.name.to_string(),
+                cx.dispatcher(p, m, Some(owner), plan, env)?,
+            ));
+        }
+    }
+    Ok(out)
 }
 
 fn validate_package_name(package: &str) -> Result<(), WitGenError> {
@@ -593,6 +724,7 @@ fn emit_resource(
     wit_name: &str,
     plan: &Plan<'_>,
     env: Option<&Env<'_, '_>>,
+    dyn_sigs: &[(String, dyn_gen::DispatcherSig)],
 ) -> Result<(), WitGenError> {
     p.doc(s.doc);
     p.open(&format!("resource {wit_name}"));
@@ -650,8 +782,9 @@ fn emit_resource(
         }
         // Generic methods: one member per declared instantiation, under the
         // same deterministic mangled name as generic free functions, with
-        // the type parameters substituted (dispatch-mode neutral — static
-        // and `dyn` declare the same monomorph set).
+        // the type parameters substituted (the monomorph set is
+        // dispatch-mode neutral; `dyn` additionally declares a dispatcher
+        // member under the `dyn-generics` feature).
         for args in m.instantiations {
             let mangled = plan.mangle_fn_instance(m.name, args, env)?;
             let name = members.insert(&mangled)?;
@@ -666,6 +799,27 @@ fn emit_resource(
             )));
             let fenv = plan.fn_env(m, args, env);
             emit_resource_method(p, m, &name, wit_name, plan, Some(&fenv), &context)?;
+        }
+        if dyn_gen::is_dyn(m)
+            && let Some((_, sig)) = dyn_sigs.iter().find(|(n, _)| n == m.name)
+        {
+            let name = members.insert(&sig.raw_name)?;
+            p.doc(Some(&sig.marker));
+            let (params, ret, kw) = (sig.param_list(), sig.arrow(), sig.keyword());
+            match m.receiver {
+                Some(Receiver::Ref | Receiver::RefMut) => {
+                    p.line(&format!("{name}: {kw}({params}){ret};"));
+                }
+                Some(Receiver::Owned) => {
+                    let sep = if params.is_empty() { "" } else { ", " };
+                    p.line(&format!(
+                        "{name}: static {kw}(this: {wit_name}{sep}{params}){ret};"
+                    ));
+                }
+                None => {
+                    p.line(&format!("{name}: static {kw}({params}){ret};"));
+                }
+            }
         }
     }
 
