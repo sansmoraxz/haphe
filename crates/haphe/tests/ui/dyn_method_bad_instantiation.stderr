@@ -1,0 +1,11 @@
+error: this instantiation gives parameter type `std::path::PathBuf`, which cannot cross the bridge
+  --> tests/ui/dyn_method_bad_instantiation.rs:11:19
+   |
+11 |     #[script(dyn, instantiate(std::path::PathBuf))]
+   |                   ^^^^^^^^^^^
+
+error: this instantiation gives return type `std::path::PathBuf`, which cannot cross the bridge
+  --> tests/ui/dyn_method_bad_instantiation.rs:11:19
+   |
+11 |     #[script(dyn, instantiate(std::path::PathBuf))]
+   |                   ^^^^^^^^^^^

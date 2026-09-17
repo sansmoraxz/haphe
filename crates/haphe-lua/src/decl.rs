@@ -283,16 +283,22 @@ fn emit_struct(
 
     // Methods, colon syntax. `self`-consuming methods are exposed the same
     // way at runtime; static methods (no receiver) live on the type table
-    // with the constructors.
+    // with the constructors. Generic methods are dyn-only (one callable
+    // scanning instantiations), stubbed like dyn free functions; static
+    // generic methods have no runtime dispatch, so nothing truthful exists
+    // to describe.
     for m in s.methods {
         if m.receiver.is_some() {
-            emit_function(
-                out,
-                registry,
-                m,
-                &format!("{}:", s.name),
-                &format!("{}::{}", s.name, m.name),
-            )?;
+            let prefix = format!("{}:", s.name);
+            let context = format!("{}::{}", s.name, m.name);
+            if !m.generic_params.is_empty() {
+                if m.dispatch == haphe::Dispatch::Dyn {
+                    emit_dyn_signature(out, registry, m, m.instantiations, &prefix, &context)?;
+                    continue;
+                }
+                return Err(LuaDeclError::GenericFunction { name: context });
+            }
+            emit_function(out, registry, m, &prefix, &context)?;
         }
     }
     Ok(())
@@ -526,13 +532,23 @@ fn emit_module(
                 }
                 for m in s.methods {
                     if m.receiver.is_none() {
-                        emit_function(
-                            out,
-                            registry,
-                            m,
-                            &format!("{path}.{}.", s.name),
-                            &format!("{}::{}", s.name, m.name),
-                        )?;
+                        let prefix = format!("{path}.{}.", s.name);
+                        let context = format!("{}::{}", s.name, m.name);
+                        if !m.generic_params.is_empty() {
+                            if m.dispatch == haphe::Dispatch::Dyn {
+                                emit_dyn_signature(
+                                    out,
+                                    registry,
+                                    m,
+                                    m.instantiations,
+                                    &prefix,
+                                    &context,
+                                )?;
+                                continue;
+                            }
+                            return Err(LuaDeclError::GenericFunction { name: context });
+                        }
+                        emit_function(out, registry, m, &prefix, &context)?;
                     }
                 }
             }
@@ -644,6 +660,8 @@ fn emit_function(
 
 /// Emits a dyn generic function: the first instantiation's substituted
 /// signature, with one `---@overload` line per additional instantiation.
+/// Module functions union registry-level instantiations in; methods carry
+/// theirs on the descriptor alone.
 fn emit_dyn_function(
     out: &mut String,
     registry: &ValidatedRegistry<'_>,
@@ -653,6 +671,18 @@ fn emit_dyn_function(
     context: &str,
 ) -> Result<(), LuaDeclError> {
     let instantiations: Vec<&[TypeDescriptor<'_>]> = module.instantiations_of(f).collect();
+    emit_dyn_signature(out, registry, f, &instantiations, prefix, context)
+}
+
+/// The dyn stub body shared by module functions and methods.
+fn emit_dyn_signature(
+    out: &mut String,
+    registry: &ValidatedRegistry<'_>,
+    f: &FunctionDescriptor<'_>,
+    instantiations: &[&[TypeDescriptor<'_>]],
+    prefix: &str,
+    context: &str,
+) -> Result<(), LuaDeclError> {
     let Some((first, rest)) = instantiations.split_first() else {
         // Unreachable through the macro (dyn requires instantiate), but
         // hand-written descriptors stay loud.
@@ -722,6 +752,9 @@ fn render_subst(
     context: &str,
     subst: Option<&haphe::dispatch::GenericSubst<'_>>,
 ) -> Result<String, LuaDeclError> {
+    // Lua has no borrow semantics: a `Borrowed` value renders as its inner
+    // type, the carried lifetime ignored.
+    let ty = crate::peel_borrowed(ty);
     if let TypeDescriptor::GenericParam(name) = ty
         && let Some(sub) = subst
         && let Some(i) = sub.params.iter().position(|p| p.name == *name)
@@ -754,6 +787,7 @@ fn render_impl(
     ty: &TypeDescriptor<'_>,
     context: &str,
 ) -> Result<String, LuaDeclError> {
+    let ty = crate::peel_borrowed(ty);
     let err = |detail: &str| LuaDeclError::Unrepresentable {
         context: context.to_string(),
         detail: detail.to_string(),

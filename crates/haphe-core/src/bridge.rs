@@ -511,6 +511,95 @@ pub trait TypeBinder<T>: Sized {
         f: for<'a> fn(&'a mut T, &'a [ScriptValue]) -> ScriptCallFuture<'a>,
     ) -> Result<(), Self::Error>;
 
+    /// Register one declared instantiation of a STATICALLY dispatched
+    /// generic method (`&self`, consuming `self`, or receiver-less):
+    /// `type_args` carries that instantiation's concrete type arguments (in
+    /// declaration order, matching an entry of the descriptor's
+    /// [`instantiations`](crate::FunctionDescriptor::instantiations)) and
+    /// `f` is the corresponding monomorphized wrapper. Backends key the
+    /// registration on `(name, type_args)` — typically a mangled per-monomorph
+    /// method name, mirroring their static generic free-function scheme.
+    ///
+    /// The default delegates to [`method`](Self::method) — safe because the
+    /// capability check rejects generic registrations before binding on
+    /// backends without [`generics`](crate::BackendCapabilities::generics);
+    /// a backend that declares the capability MUST override, or same-named
+    /// monomorphs would collide.
+    fn method_generic(
+        &mut self,
+        name: &'static str,
+        type_args: &'static [crate::types::TypeDescriptor<'static>],
+        f: for<'a> fn(ScriptCow<'a, T>, &[ScriptValue]) -> Result<ScriptValue, ScriptConvertError>,
+    ) -> Result<(), Self::Error> {
+        let _ = type_args;
+        self.method(name, f)
+    }
+
+    /// `&mut self` sibling of [`method_generic`](Self::method_generic).
+    fn method_generic_mut(
+        &mut self,
+        name: &'static str,
+        type_args: &'static [crate::types::TypeDescriptor<'static>],
+        f: fn(&mut T, &[ScriptValue]) -> Result<ScriptValue, ScriptConvertError>,
+    ) -> Result<(), Self::Error> {
+        let _ = type_args;
+        self.method_mut(name, f)
+    }
+
+    /// Register one candidate of a `dyn`-dispatched generic method (`&self`,
+    /// consuming `self`, or receiver-less).
+    ///
+    /// Called once per declared instantiation, like
+    /// [`method`](Self::method); the whole descriptor is provided because
+    /// dynamic resolution ranks candidates against the declared parameter
+    /// types (see
+    /// [`resolve_dyn_candidate`](crate::dispatch::resolve_dyn_candidate)).
+    /// The default delegates to `method` — safe because the capability check
+    /// rejects `dyn` methods before binding on backends without
+    /// [`dyn_generics`](crate::BackendCapabilities::dyn_generics).
+    fn method_dyn(
+        &mut self,
+        descriptor: &'static crate::function::FunctionDescriptor<'static>,
+        type_args: &'static [crate::types::TypeDescriptor<'static>],
+        f: for<'a> fn(ScriptCow<'a, T>, &[ScriptValue]) -> Result<ScriptValue, ScriptConvertError>,
+    ) -> Result<(), Self::Error> {
+        let _ = type_args;
+        self.method(descriptor.name, f)
+    }
+
+    /// `&mut self` sibling of [`method_dyn`](Self::method_dyn).
+    fn method_dyn_mut(
+        &mut self,
+        descriptor: &'static crate::function::FunctionDescriptor<'static>,
+        type_args: &'static [crate::types::TypeDescriptor<'static>],
+        f: fn(&mut T, &[ScriptValue]) -> Result<ScriptValue, ScriptConvertError>,
+    ) -> Result<(), Self::Error> {
+        let _ = type_args;
+        self.method_mut(descriptor.name, f)
+    }
+
+    /// Async sibling of [`method_dyn`](Self::method_dyn).
+    fn method_dyn_async(
+        &mut self,
+        descriptor: &'static crate::function::FunctionDescriptor<'static>,
+        type_args: &'static [crate::types::TypeDescriptor<'static>],
+        f: for<'a> fn(ScriptCow<'a, T>, &'a [ScriptValue]) -> ScriptCallFuture<'a>,
+    ) -> Result<(), Self::Error> {
+        let _ = type_args;
+        self.method_async(descriptor.name, f)
+    }
+
+    /// Async `&mut self` sibling of [`method_dyn`](Self::method_dyn).
+    fn method_dyn_async_mut(
+        &mut self,
+        descriptor: &'static crate::function::FunctionDescriptor<'static>,
+        type_args: &'static [crate::types::TypeDescriptor<'static>],
+        f: for<'a> fn(&'a mut T, &'a [ScriptValue]) -> ScriptCallFuture<'a>,
+    ) -> Result<(), Self::Error> {
+        let _ = type_args;
+        self.method_async_mut(descriptor.name, f)
+    }
+
     /// Register an `async` constructor. The returned future may borrow the
     /// argument slice; async-capability gating applies, like
     /// [`method_async`](Self::method_async).

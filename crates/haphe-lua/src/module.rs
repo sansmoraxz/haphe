@@ -95,7 +95,7 @@ fn constant_to_lua(
     constant: &ConstantDescriptor<'_>,
 ) -> Result<Value, LuaBindError> {
     let value = constant.value;
-    let ty = constant.ty;
+    let ty = crate::peel_borrowed(constant.ty);
 
     match ty {
         TypeDescriptor::Primitive(p) => {

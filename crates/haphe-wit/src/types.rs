@@ -3,6 +3,17 @@ use haphe::{Ownership, PrimitiveType, TypeDescriptor};
 use crate::WitGenError;
 use crate::model::{Env, Plan};
 
+/// Values cross the component boundary by copy: a lifetime-carrying
+/// descriptor (`Cow<'a, T>`) lowers as its carried type, and the lifetime
+/// does not exist in WIT. Applied at the entry of every descriptor match so
+/// nested occurrences normalize uniformly.
+pub(crate) fn peel_borrowed<'b, 'a>(mut ty: &'b TypeDescriptor<'a>) -> &'b TypeDescriptor<'a> {
+    while let TypeDescriptor::Borrowed { inner, .. } = ty {
+        ty = inner;
+    }
+    ty
+}
+
 /// Where a type appears; determines resource handle rendering and whether
 /// Unit is allowed.
 #[derive(Clone, Copy)]
@@ -20,7 +31,7 @@ pub(crate) fn render_return(
     env: Option<&Env<'_, '_>>,
     context: &str,
 ) -> Result<Option<String>, WitGenError> {
-    if matches!(ty, TypeDescriptor::Unit) {
+    if matches!(peel_borrowed(ty), TypeDescriptor::Unit) {
         return Ok(None);
     }
     render_type(ty, Pos::Return(ownership), plan, env, context).map(Some)
@@ -33,7 +44,7 @@ pub(crate) fn render_type(
     env: Option<&Env<'_, '_>>,
     context: &str,
 ) -> Result<String, WitGenError> {
-    match ty {
+    match peel_borrowed(ty) {
         TypeDescriptor::Primitive(p) => render_primitive(*p, context),
         TypeDescriptor::String => Ok("string".to_string()),
         TypeDescriptor::Bytes => Ok("list<u8>".to_string()),

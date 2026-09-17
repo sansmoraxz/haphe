@@ -289,7 +289,7 @@ pub fn build_fn_info(
             errors.spanned(
                 span,
                 "`dyn` here needs explicit `instantiate(...)` declarations: the default \
-                 candidate set applies only to single-parameter generic free functions",
+                 candidate set applies only to single-parameter generics",
             );
         }
         quote! { ::haphe::Dispatch::Dyn }

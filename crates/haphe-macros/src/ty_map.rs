@@ -40,7 +40,10 @@ impl VisitMut for ReplaceSelf<'_> {
 }
 
 /// Erases reference lifetimes (`&'a str` → `&str`) so descriptor expressions
-/// emitted into `const` items never mention in-scope lifetimes.
+/// emitted into `const` items never mention in-scope lifetimes. Lifetimes in
+/// path arguments (`Cow<'a, str>`) are NOT erased — those types fold
+/// syntactically into [`TypeDescriptor::Borrowed`], carrying the declared
+/// name.
 struct EraseRefLifetimes;
 
 impl VisitMut for EraseRefLifetimes {
@@ -94,6 +97,31 @@ fn mentions_generic_param(ty: &Type, params: &[String]) -> bool {
     visitor.found
 }
 
+/// Whether `ty` mentions a NAMED signature lifetime in path arguments
+/// (`Cow<'a, str>`). Such a type cannot resolve through the `HapheType`
+/// fallback — a `const` cannot name a signature lifetime — so it folds
+/// syntactically, which also carries the declared name into the descriptor.
+/// Anonymous (`'_`, elided) and `'static` forms resolve through the trait,
+/// which describes lifetime carriers as `Borrowed` with no name.
+fn mentions_named_path_lifetime(ty: &Type) -> bool {
+    struct FindNamed(bool);
+    impl Visit<'_> for FindNamed {
+        fn visit_lifetime(&mut self, lt: &syn::Lifetime) {
+            if lt.ident != "_" && lt.ident != "static" {
+                self.0 = true;
+            }
+        }
+        fn visit_type_reference(&mut self, r: &syn::TypeReference) {
+            // Reference lifetimes are erased before descriptor emission;
+            // only path-argument lifetimes force the fold.
+            self.visit_type(&r.elem);
+        }
+    }
+    let mut visitor = FindNamed(false);
+    visitor.visit_type(ty);
+    visitor.0
+}
+
 /// Rejects `fn` pointer types with reference parameters (or explicit
 /// higher-ranked lifetimes): such types are higher-ranked and no blanket
 /// [`HapheType`] implementation can cover them, which would otherwise surface
@@ -129,7 +157,7 @@ fn reject_higher_ranked_fn_ptrs(ty: &Type) -> syn::Result<()> {
 pub fn descriptor_expr(ty: &Type, ctx: &TyCtx) -> syn::Result<TokenStream> {
     let ty = substitute_self(ty, ctx);
     reject_higher_ranked_fn_ptrs(&ty)?;
-    if !mentions_generic_param(&ty, ctx.generic_params) {
+    if !mentions_generic_param(&ty, ctx.generic_params) && !mentions_named_path_lifetime(&ty) {
         return Ok(quote_spanned! {ty.span()=>
             <#ty as ::haphe::HapheType>::DESCRIPTOR
         });
@@ -139,12 +167,35 @@ pub fn descriptor_expr(ty: &Type, ctx: &TyCtx) -> syn::Result<TokenStream> {
 
 /// Syntactic fold for types that mention a declared generic parameter.
 fn generic_fold(ty: &Type, ctx: &TyCtx) -> syn::Result<TokenStream> {
-    // Anything not mentioning a declared parameter resolves through the trait,
-    // at any nesting depth (e.g. the `i32` in `HashMap<i32, T>`).
-    if !mentions_generic_param(ty, ctx.generic_params) {
+    // Anything not mentioning a declared parameter or a named lifetime
+    // resolves through the trait, at any nesting depth (e.g. the `i32` in
+    // `HashMap<i32, T>`).
+    if !mentions_generic_param(ty, ctx.generic_params) && !mentions_named_path_lifetime(ty) {
         return Ok(quote_spanned! {ty.span()=>
             <#ty as ::haphe::HapheType>::DESCRIPTOR
         });
+    }
+    // Transparent carriers: erased at the boundary. A lifetime-carrying one
+    // folds to `Borrowed`, keeping the declared lifetime name for backends.
+    if let Some((kind, lifetime, inner)) = crate::std_types::carrier_parts(ty) {
+        let inner = generic_fold(inner, ctx)?;
+        return match kind {
+            crate::std_types::CarrierKind::Plain => Ok(inner),
+            crate::std_types::CarrierKind::Lifetime => {
+                // `'_`, elided, and `'static` all describe as anonymous,
+                // matching the `HapheType` fallback used outside folds.
+                let lt = match &lifetime {
+                    Some(lt) if lt.ident != "_" && lt.ident != "static" => {
+                        let name = lt.ident.to_string();
+                        quote! { ::core::option::Option::Some(#name) }
+                    }
+                    _ => quote! { ::core::option::Option::None },
+                };
+                Ok(quote! {
+                    ::haphe::TypeDescriptor::Borrowed { lifetime: #lt, inner: &#inner }
+                })
+            }
+        };
     }
     match ty {
         Type::Path(p) if p.qself.is_none() => {
@@ -179,7 +230,6 @@ fn generic_fold(ty: &Type, ctx: &TyCtx) -> syn::Result<TokenStream> {
                     let inner = generic_fold(inner, ctx)?;
                     Ok(quote! { ::haphe::TypeDescriptor::List(&#inner) })
                 }
-                ("Box", [inner]) => generic_fold(inner, ctx),
                 ("HashMap" | "BTreeMap", [k, v]) => {
                     let k = generic_fold(k, ctx)?;
                     let v = generic_fold(v, ctx)?;

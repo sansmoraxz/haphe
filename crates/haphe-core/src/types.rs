@@ -93,6 +93,17 @@ pub enum TypeDescriptor<'a> {
         /// Concrete type arguments, in declaration order.
         args: &'a [TypeDescriptor<'a>],
     },
+    /// A value carried behind a lifetime (`Cow<'a, T>`; plain references in
+    /// a future tranche). The lifetime is carried as declared — `Some` for a
+    /// named signature lifetime, `None` for an anonymous or elided one — and
+    /// each backend decides what to do with it (a runtime without borrow
+    /// semantics treats the value as `inner`, cloning at the boundary).
+    Borrowed {
+        /// The declared lifetime name (without the `'`), when named.
+        lifetime: Option<&'a str>,
+        /// The carried type.
+        inner: &'a TypeDescriptor<'a>,
+    },
     /// The unit type `()`.
     Unit,
     /// A stream of values; `Unit` payload means a bare signal stream.
@@ -106,6 +117,34 @@ pub enum TypeDescriptor<'a> {
     /// Only valid inside a [`StructDescriptor`] or [`EnumDescriptor`] that
     /// declares a [`GenericParam`] with a matching name.
     GenericParam(&'a str),
+}
+
+macro_rules! primitive_shorthands {
+    ($($name:ident => $variant:ident),* $(,)?) => {
+        /// Shorthand constants for the primitive descriptors, so descriptor
+        /// literals read `TypeDescriptor::I64` instead of
+        /// `TypeDescriptor::Primitive(PrimitiveType::I64)`.
+        impl TypeDescriptor<'static> {
+            $(pub const $name: Self = Self::Primitive(PrimitiveType::$variant);)*
+        }
+    };
+}
+
+primitive_shorthands! {
+    BOOL => Bool,
+    I8 => I8,
+    I16 => I16,
+    I32 => I32,
+    I64 => I64,
+    I128 => I128,
+    U8 => U8,
+    U16 => U16,
+    U32 => U32,
+    U64 => U64,
+    U128 => U128,
+    F32 => F32,
+    F64 => F64,
+    CHAR => Char,
 }
 
 impl TypeDescriptor<'_> {
@@ -122,6 +161,8 @@ impl TypeDescriptor<'_> {
             | (T::List(a), T::List(b))
             | (T::Stream(a), T::Stream(b))
             | (T::Future(a), T::Future(b)) => a.const_eq(b),
+            // Lifetime names don't change the script-visible type.
+            (T::Borrowed { inner: a, .. }, T::Borrowed { inner: b, .. }) => a.const_eq(b),
             (T::Array(a, n), T::Array(b, m)) => *n == *m && a.const_eq(b),
             (T::Map(ka, va), T::Map(kb, vb)) | (T::Result(ka, va), T::Result(kb, vb)) => {
                 ka.const_eq(kb) && va.const_eq(vb)

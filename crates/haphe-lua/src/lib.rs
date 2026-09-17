@@ -243,6 +243,18 @@ pub fn bind_enum_type<
     binder.register(lua, type_table)
 }
 
+/// Strips lifetime-carrying descriptors: Lua has no borrow semantics, so a
+/// [`TypeDescriptor::Borrowed`] value is its inner type, cloned at the
+/// boundary — the carried lifetime is ignored.
+pub(crate) fn peel_borrowed<'a>(
+    ty: &'a haphe::TypeDescriptor<'a>,
+) -> &'a haphe::TypeDescriptor<'a> {
+    match ty {
+        haphe::TypeDescriptor::Borrowed { inner, .. } => peel_borrowed(inner),
+        other => other,
+    }
+}
+
 /// Whether `//` should fall back to the type's `Div` registration: only for
 /// integer-typed `Div` declarations (integer-primitive rhs, and an output
 /// that is not some other primitive shape), and never when an explicit
@@ -253,7 +265,7 @@ pub(crate) fn declared_idiv_fallback(trait_impls: &[haphe::TraitImpl<'_>]) -> bo
     use haphe::{PrimitiveType, TraitImpl, TypeDescriptor};
     let is_int = |td: &TypeDescriptor<'_>| {
         matches!(
-            td,
+            peel_borrowed(td),
             TypeDescriptor::Primitive(
                 PrimitiveType::I8
                     | PrimitiveType::I16
@@ -276,7 +288,9 @@ pub(crate) fn declared_idiv_fallback(trait_impls: &[haphe::TraitImpl<'_>]) -> bo
         matches!(
             ti,
             TraitImpl::Div { rhs, output }
-                if is_int(rhs) && (is_int(output) || !matches!(output, TypeDescriptor::Primitive(_)))
+                if is_int(rhs)
+                    && (is_int(output)
+                        || !matches!(peel_borrowed(output), TypeDescriptor::Primitive(_)))
         )
     })
 }
@@ -287,7 +301,7 @@ fn declared_iter_pairing(trait_impls: &[haphe::TraitImpl<'_>]) -> binder::IterPa
     use haphe::{TraitImpl, TypeDescriptor};
     for ti in trait_impls {
         let item = match ti {
-            TraitImpl::IntoIterator { item } | TraitImpl::Iterator { item } => item,
+            TraitImpl::IntoIterator { item } | TraitImpl::Iterator { item } => peel_borrowed(item),
             _ => continue,
         };
         return if matches!(item, TypeDescriptor::Tuple(elems) if elems.len() == 2) {

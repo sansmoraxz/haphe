@@ -155,6 +155,13 @@ fn greet(name: String) -> String {
     format!("hello, {name}!")
 }
 
+/// Uppercases text, borrowing when it can. The `Borrowed` descriptor lowers
+/// as its inner type: WIT values cross by copy, so the lifetime vanishes.
+#[script]
+fn shout<'a>(text: std::borrow::Cow<'a, str>) -> std::borrow::Cow<'a, str> {
+    std::borrow::Cow::Owned(text.to_uppercase())
+}
+
 /// Midpoint of two points.
 #[script]
 fn midpoint(a: &Point, b: &Point) -> Point {
@@ -236,7 +243,7 @@ haphe::registry! {
                 modules: [
                     mod utils {
                         doc: "Utility helpers",
-                        functions: [greet],
+                        functions: [greet, shout],
                     },
                 ],
             },
@@ -332,6 +339,11 @@ fn free_functions() {
     );
     assert!(
         wit.contains("greet: func(name: string) -> string;"),
+        "got:\n{wit}"
+    );
+    // `Cow<'a, str>` lowers as `string`: the lifetime is text-neutral.
+    assert!(
+        wit.contains("shout: func(text: string) -> string;"),
         "got:\n{wit}"
     );
     assert!(

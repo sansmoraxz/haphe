@@ -5,6 +5,9 @@ error[E0277]: the trait bound `ScriptValue: From<Point>` is not satisfied
    |          ^^^^^^ the trait `From<Point>` is not implemented for `ScriptValue`
    |
    = help: `ScriptValue` implements trait `From<T>`:
+             From<&Path>
+             From<&[T]>
+             From<&str>
              From<()>
              From<(A, B)>
              From<(A, B, C)>
@@ -18,9 +21,36 @@ error[E0277]: the trait bound `ScriptValue: From<Point>` is not satisfied
              From<(A, B, C, D, E, F, G, H, I, J, K)>
              From<(A, B, C, D, E, F, G, H, I, J, K, L)>
              From<(A,)>
+             From<Arc<T>>
+             From<BTreeMap<std::string::String, V>>
+             From<BTreeSet<T>>
+             From<Box<T>>
+             From<Cow<'_, T>>
+             From<Duration>
              From<HashMap<std::string::String, V>>
+             From<HashSet<T>>
+             From<IpAddr>
+             From<Ipv4Addr>
+             From<Ipv6Addr>
+             From<NonZero<i16>>
+             From<NonZero<i32>>
+             From<NonZero<i64>>
+             From<NonZero<i8>>
+             From<NonZero<isize>>
+             From<NonZero<u16>>
+             From<NonZero<u32>>
+             From<NonZero<u64>>
+             From<NonZero<u8>>
+             From<NonZero<usize>>
+             From<PathBuf>
+             From<Rc<T>>
+             From<SocketAddrV4>
+             From<SocketAddrV6>
+             From<SystemTime>
              From<Vec<T>>
+             From<VecDeque<T>>
              From<Wrapped>
+             From<[T; N]>
              From<bool>
              From<char>
              From<f32>
@@ -29,12 +59,15 @@ error[E0277]: the trait bound `ScriptValue: From<Point>` is not satisfied
              From<i32>
              From<i64>
              From<i8>
+             From<isize>
+             From<std::net::SocketAddr>
              From<std::option::Option<T>>
              From<std::string::String>
              From<u16>
              From<u32>
              From<u64>
              From<u8>
+             From<usize>
    = note: this error originates in the derive macro `Script` (in Nightly builds, run with -Z macro-backtrace for more info)
 
 error[E0277]: the trait bound `Point: FromScript` is not satisfied

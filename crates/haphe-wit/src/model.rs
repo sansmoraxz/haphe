@@ -389,7 +389,7 @@ impl<'a> Plan<'a> {
             context: "generic instantiation argument".to_string(),
             detail: detail.to_string(),
         };
-        Ok(match ty {
+        Ok(match crate::types::peel_borrowed(ty) {
             TypeDescriptor::Primitive(p) => match p {
                 PrimitiveType::Bool => "bool".into(),
                 PrimitiveType::I8 => "s8".into(),
@@ -593,7 +593,7 @@ impl<'a> Plan<'a> {
         env: Option<&Env<'_, 'a>>,
         refs: &mut BTreeSet<(usize, String)>,
     ) -> Result<(), WitGenError> {
-        match ty {
+        match crate::types::peel_borrowed(ty) {
             TypeDescriptor::Ref(id) => {
                 // Bare refs to generic types are either self-references
                 // (same interface, no `use` needed) or render-time errors.
@@ -652,7 +652,7 @@ pub(crate) fn mangle_plain_type(ty: &TypeDescriptor<'_>) -> Result<String, WitGe
         context: "generic instantiation argument".to_string(),
         detail: detail.to_string(),
     };
-    Ok(match ty {
+    Ok(match crate::types::peel_borrowed(ty) {
         TypeDescriptor::Primitive(p) => match p {
             PrimitiveType::Bool => "bool".into(),
             PrimitiveType::I8 => "s8".into(),
@@ -825,7 +825,7 @@ pub(crate) struct Projected<'a> {
 
 /// Whether a trait operand descriptor denotes the type itself.
 fn is_self_ty(ty: &TypeDescriptor<'_>, self_id: &str) -> bool {
-    match ty {
+    match crate::types::peel_borrowed(ty) {
         TypeDescriptor::Ref(id) => id.as_str() == self_id,
         TypeDescriptor::Instance { id, .. } => id.as_str() == self_id,
         _ => false,

@@ -291,6 +291,14 @@ pub(crate) struct LuaTypeBinder<T: 'static> {
     async_methods: Vec<(&'static str, AsyncCowFn<T>)>,
     #[cfg(all(feature = "async", not(feature = "send")))]
     async_mut_methods: Vec<(&'static str, AsyncMutFn<T>)>,
+    #[cfg(feature = "generics")]
+    dyn_methods: Vec<(&'static str, Vec<DynFn<CowMethodFn<T>>>)>,
+    #[cfg(feature = "generics")]
+    dyn_mut_methods: Vec<(&'static str, Vec<DynFn<ScriptMethodMut<T>>>)>,
+    #[cfg(all(feature = "generics", feature = "async", not(feature = "send")))]
+    dyn_async_methods: Vec<(&'static str, Vec<DynFn<AsyncCowFn<T>>>)>,
+    #[cfg(all(feature = "generics", feature = "async", not(feature = "send")))]
+    dyn_async_mut_methods: Vec<(&'static str, Vec<DynFn<AsyncMutFn<T>>>)>,
     pairing: IterPairing,
     idiv_fallback: bool,
 }
@@ -326,6 +334,14 @@ impl<T: 'static + Clone + mlua::MaybeSend + mlua::MaybeSync> LuaTypeBinder<T> {
             async_methods: Vec::new(),
             #[cfg(all(feature = "async", not(feature = "send")))]
             async_mut_methods: Vec::new(),
+            #[cfg(feature = "generics")]
+            dyn_methods: Vec::new(),
+            #[cfg(feature = "generics")]
+            dyn_mut_methods: Vec::new(),
+            #[cfg(all(feature = "generics", feature = "async", not(feature = "send")))]
+            dyn_async_methods: Vec::new(),
+            #[cfg(all(feature = "generics", feature = "async", not(feature = "send")))]
+            dyn_async_mut_methods: Vec::new(),
             pairing: IterPairing::default(),
             idiv_fallback: false,
         }
@@ -352,6 +368,18 @@ impl<T: 'static + Clone + mlua::MaybeSend + mlua::MaybeSync> LuaTypeBinder<T> {
         // iterable types, `hash` for `Hash`, `debug` for `Debug`); a
         // user-declared method with one of those names would silently
         // shadow it.
+        #[allow(unused_mut)]
+        let mut dyn_method_names: Vec<&'static str> = Vec::new();
+        #[cfg(feature = "generics")]
+        {
+            dyn_method_names.extend(self.dyn_methods.iter().map(|(n, _)| *n));
+            dyn_method_names.extend(self.dyn_mut_methods.iter().map(|(n, _)| *n));
+        }
+        #[cfg(all(feature = "generics", feature = "async", not(feature = "send")))]
+        {
+            dyn_method_names.extend(self.dyn_async_methods.iter().map(|(n, _)| *n));
+            dyn_method_names.extend(self.dyn_async_mut_methods.iter().map(|(n, _)| *n));
+        }
         for (reserved, taken) in [
             ("iter", self.iter.is_some()),
             ("hash", self.hash.is_some()),
@@ -363,6 +391,7 @@ impl<T: 'static + Clone + mlua::MaybeSend + mlua::MaybeSync> LuaTypeBinder<T> {
                     .iter()
                     .map(|m| m.name)
                     .chain(self.mut_methods.iter().map(|m| m.name))
+                    .chain(dyn_method_names.iter().copied())
                     .any(|name| name == reserved)
             {
                 return Err(LuaBindError::ReservedMethod { name: reserved });
@@ -545,6 +574,130 @@ impl<T: 'static + Clone + mlua::MaybeSend + mlua::MaybeSync> LuaTypeBinder<T> {
                         f(&mut *this, &sv_args).map_err(|e| mlua::Error::runtime(e.to_string()))?;
                     script_to_lua(lua, result)
                 });
+            }
+
+            // Dyn generic methods: ONE Lua method per name scans its
+            // monomorph candidates at call time — core's shared resolver
+            // ranks, a rejected conversion falls through in declaration
+            // order (same machinery as dyn free functions). Candidate
+            // tables are built here, once.
+            #[cfg(feature = "generics")]
+            for (name, candidates) in &self.dyn_methods {
+                let name = *name;
+                let candidates = candidates.clone();
+                let scan = dyn_scan_table(&candidates);
+                let signatures = dyn_signatures(&candidates);
+                reg.add_function(name, move |lua, args: mlua::MultiValue| {
+                    let mut v = args.into_vec();
+                    if v.is_empty() {
+                        return Err(mlua::Error::runtime(format!(
+                            "{name} takes a receiver (use `:`)"
+                        )));
+                    }
+                    let ud: mlua::AnyUserData = mlua::FromLua::from_lua(v.remove(0), lua)?;
+                    let this = ud.borrow::<T>()?;
+                    let sv_args: Vec<ScriptValue> =
+                        v.iter().map(lua_to_script).collect::<mlua::Result<_>>()?;
+                    let mut last_err = None;
+                    for i in dyn_call_order(&sv_args, &scan) {
+                        match (candidates[i].wrapper)(ScriptCow::Borrowed(&this), &sv_args) {
+                            Ok(out) => return script_to_lua(lua, out),
+                            Err(e) => last_err = Some(e),
+                        }
+                    }
+                    Err(dyn_no_match_error(name, &signatures, last_err))
+                });
+            }
+            #[cfg(feature = "generics")]
+            for (name, candidates) in &self.dyn_mut_methods {
+                let name = *name;
+                let candidates = candidates.clone();
+                let scan = dyn_scan_table(&candidates);
+                let signatures = dyn_signatures(&candidates);
+                reg.add_function(name, move |lua, args: mlua::MultiValue| {
+                    let mut v = args.into_vec();
+                    if v.is_empty() {
+                        return Err(mlua::Error::runtime(format!(
+                            "{name} takes a receiver (use `:`)"
+                        )));
+                    }
+                    let ud: mlua::AnyUserData = mlua::FromLua::from_lua(v.remove(0), lua)?;
+                    let mut this = ud.borrow_mut::<T>()?;
+                    let sv_args: Vec<ScriptValue> =
+                        v.iter().map(lua_to_script).collect::<mlua::Result<_>>()?;
+                    let mut last_err = None;
+                    for i in dyn_call_order(&sv_args, &scan) {
+                        match (candidates[i].wrapper)(&mut this, &sv_args) {
+                            Ok(out) => return script_to_lua(lua, out),
+                            Err(e) => last_err = Some(e),
+                        }
+                    }
+                    Err(dyn_no_match_error(name, &signatures, last_err))
+                });
+            }
+            // Async dyn methods: the async block owns the guard; the picked
+            // wrapper's future borrows it — same acquisition policy as
+            // plain async methods.
+            #[cfg(all(feature = "generics", feature = "async", not(feature = "send")))]
+            for (name, candidates) in &self.dyn_async_methods {
+                let name = *name;
+                let candidates = std::sync::Arc::new(candidates.clone());
+                let scan = std::sync::Arc::new(dyn_scan_table(&candidates));
+                let signatures = dyn_signatures(&candidates);
+                reg.add_async_method(
+                    name,
+                    move |lua, this: mlua::UserDataRef<T>, args: mlua::MultiValue| {
+                        let sv_args: mlua::Result<Vec<ScriptValue>> =
+                            args.into_vec().iter().map(lua_to_script).collect();
+                        let candidates = candidates.clone();
+                        let scan = scan.clone();
+                        let signatures = signatures.clone();
+                        async move {
+                            let sv_args = sv_args?;
+                            let mut last_err = None;
+                            for i in dyn_call_order(&sv_args, &scan) {
+                                match (candidates[i].wrapper)(ScriptCow::Borrowed(&this), &sv_args)
+                                    .await
+                                {
+                                    Ok(out) => return script_to_lua(&lua, out),
+                                    Err(e) => last_err = Some(e),
+                                }
+                            }
+                            Err(dyn_no_match_error(name, &signatures, last_err))
+                        }
+                    },
+                );
+            }
+            // Async `&mut self` dyn methods: the mutable guard is held
+            // across awaits, so the picked wrapper mutates in place.
+            #[cfg(all(feature = "generics", feature = "async", not(feature = "send")))]
+            for (name, candidates) in &self.dyn_async_mut_methods {
+                let name = *name;
+                let candidates = std::sync::Arc::new(candidates.clone());
+                let scan = std::sync::Arc::new(dyn_scan_table(&candidates));
+                let signatures = dyn_signatures(&candidates);
+                reg.add_async_method_mut(
+                    name,
+                    move |lua, this: mlua::UserDataRefMut<T>, args: mlua::MultiValue| {
+                        let sv_args: mlua::Result<Vec<ScriptValue>> =
+                            args.into_vec().iter().map(lua_to_script).collect();
+                        let candidates = candidates.clone();
+                        let scan = scan.clone();
+                        let signatures = signatures.clone();
+                        async move {
+                            let mut this = this;
+                            let sv_args = sv_args?;
+                            let mut last_err = None;
+                            for i in dyn_call_order(&sv_args, &scan) {
+                                match (candidates[i].wrapper)(&mut this, &sv_args).await {
+                                    Ok(out) => return script_to_lua(&lua, out),
+                                    Err(e) => last_err = Some(e),
+                                }
+                            }
+                            Err(dyn_no_match_error(name, &signatures, last_err))
+                        }
+                    },
+                );
             }
 
             // Metamethods.
@@ -1207,6 +1360,152 @@ impl<T: 'static + Clone + mlua::MaybeSend + mlua::MaybeSync> TypeBinder<T> for L
             Ok(())
         }
     }
+
+    fn method_dyn(
+        &mut self,
+        descriptor: &'static haphe::FunctionDescriptor<'static>,
+        type_args: &'static [haphe::TypeDescriptor<'static>],
+        f: CowMethodFn<T>,
+    ) -> Result<(), Self::Error> {
+        #[cfg(not(feature = "generics"))]
+        {
+            let _ = (type_args, f);
+            Err(LuaBindError::UnsupportedDynFunction {
+                name: descriptor.name,
+                reason: "enable this backend's `generics` feature",
+            })
+        }
+        #[cfg(feature = "generics")]
+        {
+            push_dyn_candidate(
+                &mut self.dyn_methods,
+                DynFn {
+                    descriptor,
+                    type_args,
+                    wrapper: f,
+                },
+            );
+            Ok(())
+        }
+    }
+
+    fn method_dyn_mut(
+        &mut self,
+        descriptor: &'static haphe::FunctionDescriptor<'static>,
+        type_args: &'static [haphe::TypeDescriptor<'static>],
+        f: ScriptMethodMut<T>,
+    ) -> Result<(), Self::Error> {
+        #[cfg(not(feature = "generics"))]
+        {
+            let _ = (type_args, f);
+            Err(LuaBindError::UnsupportedDynFunction {
+                name: descriptor.name,
+                reason: "enable this backend's `generics` feature",
+            })
+        }
+        #[cfg(feature = "generics")]
+        {
+            push_dyn_candidate(
+                &mut self.dyn_mut_methods,
+                DynFn {
+                    descriptor,
+                    type_args,
+                    wrapper: f,
+                },
+            );
+            Ok(())
+        }
+    }
+
+    fn method_dyn_async(
+        &mut self,
+        descriptor: &'static haphe::FunctionDescriptor<'static>,
+        type_args: &'static [haphe::TypeDescriptor<'static>],
+        f: AsyncCowFn<T>,
+    ) -> Result<(), Self::Error> {
+        #[cfg(not(feature = "generics"))]
+        {
+            let _ = (type_args, f);
+            Err(LuaBindError::UnsupportedDynFunction {
+                name: descriptor.name,
+                reason: "enable this backend's `generics` feature",
+            })
+        }
+        #[cfg(all(feature = "generics", not(feature = "async")))]
+        {
+            let _ = (type_args, f);
+            Err(LuaBindError::UnsupportedDynFunction {
+                name: descriptor.name,
+                reason: "enable this backend's `async` feature",
+            })
+        }
+        #[cfg(all(feature = "generics", feature = "async", feature = "send"))]
+        {
+            let _ = (type_args, f);
+            Err(LuaBindError::UnsupportedDynFunction {
+                name: descriptor.name,
+                reason: "the `send` feature demands `Send` futures, and async method \
+                         futures are deliberately not Send",
+            })
+        }
+        #[cfg(all(feature = "generics", feature = "async", not(feature = "send")))]
+        {
+            push_dyn_candidate(
+                &mut self.dyn_async_methods,
+                DynFn {
+                    descriptor,
+                    type_args,
+                    wrapper: f,
+                },
+            );
+            Ok(())
+        }
+    }
+
+    fn method_dyn_async_mut(
+        &mut self,
+        descriptor: &'static haphe::FunctionDescriptor<'static>,
+        type_args: &'static [haphe::TypeDescriptor<'static>],
+        f: AsyncMutFn<T>,
+    ) -> Result<(), Self::Error> {
+        #[cfg(not(feature = "generics"))]
+        {
+            let _ = (type_args, f);
+            Err(LuaBindError::UnsupportedDynFunction {
+                name: descriptor.name,
+                reason: "enable this backend's `generics` feature",
+            })
+        }
+        #[cfg(all(feature = "generics", not(feature = "async")))]
+        {
+            let _ = (type_args, f);
+            Err(LuaBindError::UnsupportedDynFunction {
+                name: descriptor.name,
+                reason: "enable this backend's `async` feature",
+            })
+        }
+        #[cfg(all(feature = "generics", feature = "async", feature = "send"))]
+        {
+            let _ = (type_args, f);
+            Err(LuaBindError::UnsupportedDynFunction {
+                name: descriptor.name,
+                reason: "the `send` feature demands `Send` futures, and async method \
+                         futures are deliberately not Send",
+            })
+        }
+        #[cfg(all(feature = "generics", feature = "async", not(feature = "send")))]
+        {
+            push_dyn_candidate(
+                &mut self.dyn_async_mut_methods,
+                DynFn {
+                    descriptor,
+                    type_args,
+                    wrapper: f,
+                },
+            );
+            Ok(())
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1217,12 +1516,80 @@ type ScriptFnPtr = fn(&[ScriptValue]) -> Result<ScriptValue, haphe::ScriptConver
 #[cfg(all(feature = "async", not(feature = "send")))]
 type AsyncFnPtr = for<'a> fn(&'a [ScriptValue]) -> haphe::ScriptCallFuture<'a>;
 
-/// One compiled monomorph of a `dyn`-dispatched generic function.
+/// One compiled monomorph of a `dyn`-dispatched generic function or method.
 #[cfg(feature = "generics")]
+#[derive(Clone, Copy)]
 struct DynFn<F> {
     descriptor: &'static haphe::FunctionDescriptor<'static>,
     type_args: &'static [haphe::TypeDescriptor<'static>],
     wrapper: F,
+}
+
+/// Appends one dyn candidate to its name's list (declaration order kept).
+#[cfg(feature = "generics")]
+fn push_dyn_candidate<F>(lists: &mut Vec<(&'static str, Vec<DynFn<F>>)>, entry: DynFn<F>) {
+    let name = entry.descriptor.name;
+    match lists.iter_mut().find(|(n, _)| *n == name) {
+        Some((_, list)) => list.push(entry),
+        None => lists.push((name, vec![entry])),
+    }
+}
+
+/// The scan table core's resolver ranks over, built once at bind time.
+#[cfg(feature = "generics")]
+fn dyn_scan_table<F>(candidates: &[DynFn<F>]) -> Vec<haphe::dispatch::DynCandidate<'static>> {
+    candidates
+        .iter()
+        .map(|c| haphe::dispatch::DynCandidate {
+            type_args: c.type_args,
+            descriptor: c.descriptor,
+        })
+        .collect()
+}
+
+/// Rendered candidate signatures for no-match diagnostics.
+#[cfg(feature = "generics")]
+fn dyn_signatures<F>(candidates: &[DynFn<F>]) -> String {
+    candidates
+        .iter()
+        .map(|c| render_candidate(c.descriptor, c.type_args))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Candidate visit order: the resolver's ranked pick first (when it has
+/// one), then the remaining candidates in declaration order — the ranked
+/// pick's `FromScript` stays authoritative, so a rejected conversion falls
+/// through.
+#[cfg(feature = "generics")]
+fn dyn_call_order(
+    args: &[ScriptValue],
+    scan: &[haphe::dispatch::DynCandidate<'static>],
+) -> impl Iterator<Item = usize> + 'static {
+    let ranked = match haphe::dispatch::resolve_dyn_candidate(args, scan) {
+        haphe::dispatch::Resolution::Ranked(i) => Some(i),
+        haphe::dispatch::Resolution::TryCallOrder => None,
+    };
+    let len = scan.len();
+    ranked
+        .into_iter()
+        .chain((0..len).filter(move |j| Some(*j) != ranked))
+}
+
+/// The error every candidate's rejection ends in: names each candidate
+/// signature and the last conversion failure.
+#[cfg(feature = "generics")]
+fn dyn_no_match_error(
+    name: &str,
+    signatures: &str,
+    last_err: Option<haphe::ScriptConvertError>,
+) -> mlua::Error {
+    mlua::Error::runtime(format!(
+        "no dyn candidate of `{name}` accepts these arguments (candidates: {signatures}){}",
+        last_err
+            .map(|e| format!("; last error: {e}"))
+            .unwrap_or_default()
+    ))
 }
 
 /// Renders a candidate signature for no-match diagnostics.
@@ -1236,7 +1603,7 @@ fn render_candidate(
         subst: &haphe::dispatch::GenericSubst<'_>,
     ) -> String {
         use haphe::TypeDescriptor as T;
-        match ty {
+        match crate::peel_borrowed(ty) {
             T::GenericParam(name) => subst
                 .params
                 .iter()
@@ -1319,69 +1686,30 @@ impl LuaFnBinder {
         // conversion.
         #[cfg(feature = "generics")]
         for (name, candidates) in self.dyn_functions {
-            let scan: Vec<haphe::dispatch::DynCandidate<'static>> = candidates
-                .iter()
-                .map(|c| haphe::dispatch::DynCandidate {
-                    type_args: c.type_args,
-                    descriptor: c.descriptor,
-                })
-                .collect();
-            let signatures: Vec<String> = candidates
-                .iter()
-                .map(|c| render_candidate(c.descriptor, c.type_args))
-                .collect();
-            let signatures = signatures.join(", ");
+            let scan = dyn_scan_table(&candidates);
+            let signatures = dyn_signatures(&candidates);
             let lua_fn = lua.create_function(move |lua, args: mlua::MultiValue| {
                 let script_args: Vec<ScriptValue> = args
                     .into_vec()
                     .iter()
                     .map(lua_to_script)
                     .collect::<mlua::Result<_>>()?;
-                let ranked = match haphe::dispatch::resolve_dyn_candidate(&script_args, &scan) {
-                    haphe::dispatch::Resolution::Ranked(i) => Some(i),
-                    haphe::dispatch::Resolution::TryCallOrder => None,
-                };
                 let mut last_err = None;
-                if let Some(i) = ranked {
+                for i in dyn_call_order(&script_args, &scan) {
                     match (candidates[i].wrapper)(&script_args) {
                         Ok(out) => return script_to_lua(lua, out),
                         Err(e) => last_err = Some(e),
                     }
                 }
-                for (j, candidate) in candidates.iter().enumerate() {
-                    if Some(j) == ranked {
-                        continue;
-                    }
-                    match (candidate.wrapper)(&script_args) {
-                        Ok(out) => return script_to_lua(lua, out),
-                        Err(e) => last_err = Some(e),
-                    }
-                }
-                Err(mlua::Error::runtime(format!(
-                    "no dyn candidate of `{name}` accepts these arguments                      (candidates: {signatures}){}",
-                    last_err
-                        .map(|e| format!("; last error: {e}"))
-                        .unwrap_or_default()
-                )))
+                Err(dyn_no_match_error(name, &signatures, last_err))
             })?;
             table.set(name, lua_fn)?;
         }
         #[cfg(all(feature = "generics", feature = "async", not(feature = "send")))]
         for (name, candidates) in self.dyn_async_functions {
-            let scan: Vec<haphe::dispatch::DynCandidate<'static>> = candidates
-                .iter()
-                .map(|c| haphe::dispatch::DynCandidate {
-                    type_args: c.type_args,
-                    descriptor: c.descriptor,
-                })
-                .collect();
-            let signatures: Vec<String> = candidates
-                .iter()
-                .map(|c| render_candidate(c.descriptor, c.type_args))
-                .collect();
-            let signatures = signatures.join(", ");
+            let scan = std::sync::Arc::new(dyn_scan_table(&candidates));
+            let signatures = dyn_signatures(&candidates);
             let candidates = std::sync::Arc::new(candidates);
-            let scan = std::sync::Arc::new(scan);
             let lua_fn = lua.create_async_function(move |lua, args: mlua::MultiValue| {
                 let sv_args: mlua::Result<Vec<ScriptValue>> =
                     args.into_vec().iter().map(lua_to_script).collect();
@@ -1390,33 +1718,14 @@ impl LuaFnBinder {
                 let signatures = signatures.clone();
                 async move {
                     let script_args = sv_args?;
-                    let ranked =
-                        match haphe::dispatch::resolve_dyn_candidate(&script_args, &scan) {
-                            haphe::dispatch::Resolution::Ranked(i) => Some(i),
-                            haphe::dispatch::Resolution::TryCallOrder => None,
-                        };
                     let mut last_err = None;
-                    if let Some(i) = ranked {
+                    for i in dyn_call_order(&script_args, &scan) {
                         match (candidates[i].wrapper)(&script_args).await {
                             Ok(out) => return script_to_lua(&lua, out),
                             Err(e) => last_err = Some(e),
                         }
                     }
-                    for (j, candidate) in candidates.iter().enumerate() {
-                        if Some(j) == ranked {
-                            continue;
-                        }
-                        match (candidate.wrapper)(&script_args).await {
-                            Ok(out) => return script_to_lua(&lua, out),
-                            Err(e) => last_err = Some(e),
-                        }
-                    }
-                    Err(mlua::Error::runtime(format!(
-                        "no dyn candidate of `{name}` accepts these arguments                          (candidates: {signatures}){}",
-                        last_err
-                            .map(|e| format!("; last error: {e}"))
-                            .unwrap_or_default()
-                    )))
+                    Err(dyn_no_match_error(name, &signatures, last_err))
                 }
             })?;
             table.set(name, lua_fn)?;
@@ -1509,19 +1818,14 @@ impl FnBinder for LuaFnBinder {
         }
         #[cfg(feature = "generics")]
         {
-            let entry = DynFn {
-                descriptor,
-                type_args,
-                wrapper: f,
-            };
-            match self
-                .dyn_functions
-                .iter_mut()
-                .find(|(n, _)| *n == descriptor.name)
-            {
-                Some((_, list)) => list.push(entry),
-                None => self.dyn_functions.push((descriptor.name, vec![entry])),
-            }
+            push_dyn_candidate(
+                &mut self.dyn_functions,
+                DynFn {
+                    descriptor,
+                    type_args,
+                    wrapper: f,
+                },
+            );
             Ok(())
         }
     }
@@ -1559,21 +1863,14 @@ impl FnBinder for LuaFnBinder {
         }
         #[cfg(all(feature = "generics", feature = "async", not(feature = "send")))]
         {
-            let entry = DynFn {
-                descriptor,
-                type_args,
-                wrapper: f,
-            };
-            match self
-                .dyn_async_functions
-                .iter_mut()
-                .find(|(n, _)| *n == descriptor.name)
-            {
-                Some((_, list)) => list.push(entry),
-                None => self
-                    .dyn_async_functions
-                    .push((descriptor.name, vec![entry])),
-            }
+            push_dyn_candidate(
+                &mut self.dyn_async_functions,
+                DynFn {
+                    descriptor,
+                    type_args,
+                    wrapper: f,
+                },
+            );
             Ok(())
         }
     }

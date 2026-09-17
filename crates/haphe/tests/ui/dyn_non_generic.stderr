@@ -4,7 +4,7 @@ error: `dyn` requires generic parameters
 3 | #[script(dyn)]
   |          ^^^
 
-error: `dyn` here needs explicit `instantiate(...)` declarations: the default candidate set applies only to single-parameter generic free functions
+error: `dyn` here needs explicit `instantiate(...)` declarations: the default candidate set applies only to single-parameter generics
  --> tests/ui/dyn_non_generic.rs:3:10
   |
 3 | #[script(dyn)]

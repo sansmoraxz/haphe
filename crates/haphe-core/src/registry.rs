@@ -815,6 +815,7 @@ where
         | TypeDescriptor::Stream(inner)
         | TypeDescriptor::Future(inner) => walk_type_refs(inner, visitor),
         TypeDescriptor::Array(inner, _) => walk_type_refs(inner, visitor),
+        TypeDescriptor::Borrowed { inner, .. } => walk_type_refs(inner, visitor),
         TypeDescriptor::Map(k, v) | TypeDescriptor::Result(k, v) => {
             walk_type_refs(k, visitor);
             walk_type_refs(v, visitor);
@@ -857,6 +858,7 @@ where
         | TypeDescriptor::Stream(inner)
         | TypeDescriptor::Future(inner) => walk_generic_params(inner, visitor),
         TypeDescriptor::Array(inner, _) => walk_generic_params(inner, visitor),
+        TypeDescriptor::Borrowed { inner, .. } => walk_generic_params(inner, visitor),
         TypeDescriptor::Map(k, v) | TypeDescriptor::Result(k, v) => {
             walk_generic_params(k, visitor);
             walk_generic_params(v, visitor);

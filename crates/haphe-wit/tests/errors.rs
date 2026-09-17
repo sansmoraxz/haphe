@@ -758,6 +758,79 @@ fn both_call_traits_rejected_in_projection() {
     );
 }
 
+// ── Borrowed (lifetime-carrying) descriptors
+
+const fn plain_string_fn(
+    params: &'static [haphe::ParamDescriptor<'static>],
+    ty: &'static TypeDescriptor<'static>,
+) -> FunctionDescriptor<'static> {
+    FunctionDescriptor {
+        name: "shout",
+        doc: None,
+        receiver: None,
+        generic_params: &[],
+        instantiations: &[],
+        dispatch: haphe::Dispatch::Static,
+        params,
+        return_type: ty,
+        return_ownership: Ownership::Owned,
+        is_async: false,
+        error_kind: None,
+    }
+}
+
+/// WIT values cross by copy: a `Borrowed` descriptor (`Cow<'a, str>`) lowers
+/// as its carried type and the lifetime never reaches the text — output is
+/// byte-identical to the plain twin, nested occurrences included.
+#[test]
+fn borrowed_lowers_as_its_inner_type() {
+    use haphe::BindingGenerator;
+
+    static BORROWED: TypeDescriptor = TypeDescriptor::Borrowed {
+        lifetime: Some("a"),
+        inner: &TypeDescriptor::List(&TypeDescriptor::Borrowed {
+            lifetime: None,
+            inner: &TypeDescriptor::String,
+        }),
+    };
+    static PLAIN: TypeDescriptor = TypeDescriptor::List(&TypeDescriptor::String);
+    static BORROWED_PARAMS: [haphe::ParamDescriptor; 1] = [haphe::ParamDescriptor {
+        name: "text",
+        ty: &BORROWED,
+        ownership: Ownership::Owned,
+    }];
+    static PLAIN_PARAMS: [haphe::ParamDescriptor; 1] = [haphe::ParamDescriptor {
+        name: "text",
+        ty: &PLAIN,
+        ownership: Ownership::Owned,
+    }];
+    static BORROWED_FNS: [FunctionDescriptor; 1] = [plain_string_fn(&BORROWED_PARAMS, &BORROWED)];
+    static PLAIN_FNS: [FunctionDescriptor; 1] = [plain_string_fn(&PLAIN_PARAMS, &PLAIN)];
+    static BORROWED_MODULES: [haphe::ModuleDescriptor; 1] = [dispatch_module(&BORROWED_FNS)];
+    static PLAIN_MODULES: [haphe::ModuleDescriptor; 1] = [dispatch_module(&PLAIN_FNS)];
+    static BORROWED_REGISTRY: TypeRegistry =
+        TypeRegistry::new(&[], &[], &[], &BORROWED_MODULES, &[], &[]);
+    static PLAIN_REGISTRY: TypeRegistry =
+        TypeRegistry::new(&[], &[], &[], &PLAIN_MODULES, &[], &[]);
+
+    let generator = WitGenerator::new("haphe:demo");
+    let borrowed_out = generator
+        .generate(&BORROWED_REGISTRY.validate().unwrap())
+        .expect("borrowed twin generates");
+    let plain_out = generator
+        .generate(&PLAIN_REGISTRY.validate().unwrap())
+        .expect("plain twin generates");
+    assert_eq!(
+        borrowed_out.files[0].content, plain_out.files[0].content,
+        "the lifetime must not affect emitted WIT"
+    );
+    let text = String::from_utf8_lossy(&borrowed_out.files[0].content);
+    assert!(
+        text.contains("shout: func(text: list<string>) -> list<string>;"),
+        "got:\n{text}"
+    );
+}
+
 // ── Dyn-dispatched generics
 
 const fn generic_module_fn(dispatch: haphe::Dispatch) -> FunctionDescriptor<'static> {
@@ -848,4 +921,120 @@ fn wit_text_is_dispatch_mode_neutral() {
         static_out.files[0].content, dyn_out.files[0].content,
         "dispatch mode must not affect emitted WIT"
     );
+}
+
+// ── Dyn-dispatched generic methods
+
+/// `dyn` generic methods on structs are rejected by the capability check,
+/// like free functions: WIT guests always name a monomorph statically.
+#[test]
+fn dyn_generic_struct_method_rejected_by_capabilities() {
+    static METHODS: [FunctionDescriptor; 1] = [FunctionDescriptor {
+        receiver: Some(Receiver::Ref),
+        ..generic_module_fn(haphe::Dispatch::Dyn)
+    }];
+    static STRUCTS: [StructDescriptor; 1] = [StructDescriptor {
+        methods: &METHODS,
+        ..plain_struct("test::Holder", "Holder")
+    }];
+    static REGISTRY: TypeRegistry = TypeRegistry::new(&STRUCTS, &[], &[], &[], &[], &[]);
+
+    match haphe::generate(&WitGenerator::new("haphe:demo"), &REGISTRY) {
+        Err(GenerateError::Incompatible(errors)) => {
+            assert!(
+                errors.iter().any(|e| matches!(
+                    e,
+                    haphe::CompatibilityError::DynGenericsUnsupported { function: "echo" }
+                )),
+                "expected DynGenericsUnsupported, got: {errors:?}"
+            );
+        }
+        other => panic!("expected Incompatible, got: {other:?}"),
+    }
+}
+
+/// `dyn` generic methods on enums are rejected the same way.
+#[test]
+fn dyn_generic_enum_method_rejected_by_capabilities() {
+    static METHODS: [FunctionDescriptor; 1] = [FunctionDescriptor {
+        receiver: Some(Receiver::Ref),
+        ..generic_module_fn(haphe::Dispatch::Dyn)
+    }];
+    static VARIANTS: [haphe::EnumVariant; 1] = [haphe::EnumVariant {
+        name: "On",
+        doc: None,
+        kind: haphe::VariantKind::Unit,
+        discriminant: None,
+    }];
+    static ENUMS: [haphe::EnumDescriptor; 1] = [haphe::EnumDescriptor {
+        id: TypeId::new("test::Toggle"),
+        name: "Toggle",
+        doc: None,
+        variants: &VARIANTS,
+        methods: &METHODS,
+        trait_impls: &[],
+        thread_safety: ThreadSafety::SEND_SYNC,
+        generic_params: &[],
+        repr: None,
+        is_flags: false,
+    }];
+    static REGISTRY: TypeRegistry = TypeRegistry::new(&[], &ENUMS, &[], &[], &[], &[]);
+
+    match haphe::generate(&WitGenerator::new("haphe:demo"), &REGISTRY) {
+        Err(GenerateError::Incompatible(errors)) => {
+            assert!(
+                errors.iter().any(|e| matches!(
+                    e,
+                    haphe::CompatibilityError::DynGenericsUnsupported { function: "echo" }
+                )),
+                "expected DynGenericsUnsupported, got: {errors:?}"
+            );
+        }
+        other => panic!("expected Incompatible, got: {other:?}"),
+    }
+}
+
+/// Dispatch-mode neutrality holds for methods too: static-vs-dyn twins of a
+/// generic struct method produce the same generation outcome byte for byte
+/// (direct call bypasses the facade's capability check).
+#[test]
+#[cfg(feature = "generics")]
+fn wit_method_text_is_dispatch_mode_neutral() {
+    use haphe::BindingGenerator;
+
+    static STATIC_METHODS: [FunctionDescriptor; 1] = [FunctionDescriptor {
+        receiver: Some(Receiver::Ref),
+        ..generic_module_fn(haphe::Dispatch::Static)
+    }];
+    static DYN_METHODS: [FunctionDescriptor; 1] = [FunctionDescriptor {
+        receiver: Some(Receiver::Ref),
+        ..generic_module_fn(haphe::Dispatch::Dyn)
+    }];
+    static STATIC_STRUCTS: [StructDescriptor; 1] = [StructDescriptor {
+        methods: &STATIC_METHODS,
+        ..plain_struct("test::Holder", "Holder")
+    }];
+    static DYN_STRUCTS: [StructDescriptor; 1] = [StructDescriptor {
+        methods: &DYN_METHODS,
+        ..plain_struct("test::Holder", "Holder")
+    }];
+    static STATIC_REGISTRY: TypeRegistry =
+        TypeRegistry::new(&STATIC_STRUCTS, &[], &[], &[], &[], &[]);
+    static DYN_REGISTRY: TypeRegistry = TypeRegistry::new(&DYN_STRUCTS, &[], &[], &[], &[], &[]);
+
+    let generator = WitGenerator::new("haphe:demo");
+    let static_out = generator.generate(&STATIC_REGISTRY.validate().unwrap());
+    let dyn_out = generator.generate(&DYN_REGISTRY.validate().unwrap());
+    match (static_out, dyn_out) {
+        (Ok(a), Ok(b)) => assert_eq!(
+            a.files[0].content, b.files[0].content,
+            "dispatch mode must not affect emitted WIT"
+        ),
+        (Err(a), Err(b)) => assert_eq!(
+            format!("{a:?}"),
+            format!("{b:?}"),
+            "dispatch mode must not affect the generation outcome"
+        ),
+        (a, b) => panic!("outcomes diverged by dispatch mode: {a:?} vs {b:?}"),
+    }
 }

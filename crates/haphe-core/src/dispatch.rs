@@ -67,6 +67,11 @@ pub fn value_matches_descriptor(
         };
     }
 
+    // The lifetime never changes what value shape matches.
+    if let T::Borrowed { inner, .. } = desc {
+        return value_matches_descriptor(value, inner, subst);
+    }
+
     match (value, desc) {
         (ScriptValue::Unit, T::Unit) => Exact,
         (ScriptValue::Bool(_), T::Primitive(P::Bool)) => Exact,

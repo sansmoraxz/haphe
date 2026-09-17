@@ -2678,7 +2678,7 @@ fn constant_to_val(c: &ConstantDescriptor<'_>) -> Result<Val, WasmBindError> {
         detail: detail.to_string(),
     };
     let v = c.value;
-    match c.ty {
+    match crate::types::peel_borrowed(c.ty) {
         TypeDescriptor::String => Ok(Val::String(v.to_string())),
         TypeDescriptor::Primitive(p) => match p {
             PrimitiveType::Bool => match v {

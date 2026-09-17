@@ -170,8 +170,20 @@ impl BackendCapabilities {
             check_fns_async(s.id, s.methods, self.async_fns, &mut errors);
             check_fns_async(s.id, s.constructors, self.async_fns, &mut errors);
             check_trait_impls_async(s.id, s.trait_impls, self.async_fns, &mut errors);
-            check_fns_generics(s.id, s.methods, self.generics, &mut errors);
-            check_fns_generics(s.id, s.constructors, self.generics, &mut errors);
+            check_fns_generics(
+                s.id,
+                s.methods,
+                self.generics,
+                self.dyn_generics,
+                &mut errors,
+            );
+            check_fns_generics(
+                s.id,
+                s.constructors,
+                self.generics,
+                self.dyn_generics,
+                &mut errors,
+            );
             if !self.callbacks {
                 check_fns_callbacks(s.id, s.methods, &mut errors);
                 check_fns_callbacks(s.id, s.constructors, &mut errors);
@@ -256,7 +268,13 @@ impl BackendCapabilities {
         for e in registry.enums() {
             check_fns_async(e.id, e.methods, self.async_fns, &mut errors);
             check_trait_impls_async(e.id, e.trait_impls, self.async_fns, &mut errors);
-            check_fns_generics(e.id, e.methods, self.generics, &mut errors);
+            check_fns_generics(
+                e.id,
+                e.methods,
+                self.generics,
+                self.dyn_generics,
+                &mut errors,
+            );
             if !self.callbacks {
                 check_fns_callbacks(e.id, e.methods, &mut errors);
             }
@@ -328,7 +346,13 @@ impl BackendCapabilities {
                     errors.push(CompatibilityError::UninstantiatedGeneric { type_id: fi.id });
                 }
             }
-            check_fns_generics(fi.id, fi.functions, self.generics, &mut errors);
+            check_fns_generics(
+                fi.id,
+                fi.functions,
+                self.generics,
+                self.dyn_generics,
+                &mut errors,
+            );
             if let Some(required) = self.required_thread_safety
                 && !meets_thread_safety(&fi.thread_safety, &required)
             {
@@ -489,13 +513,17 @@ fn check_trait_impls_async<'a>(
 
 fn check_fns_generics<'a>(
     type_id: TypeId<'a>,
-    fns: &[crate::function::FunctionDescriptor<'a>],
+    fns: &'a [crate::function::FunctionDescriptor<'a>],
     supports_generics: bool,
+    dyn_generics: bool,
     errors: &mut Vec<CompatibilityError<'a>>,
 ) {
     for f in fns {
         if f.generic_params.is_empty() {
             continue;
+        }
+        if matches!(f.dispatch, crate::function::Dispatch::Dyn) && !dyn_generics {
+            errors.push(CompatibilityError::DynGenericsUnsupported { function: f.name });
         }
         if !supports_generics {
             errors.push(CompatibilityError::UnsupportedGenerics { type_id });
@@ -561,6 +589,7 @@ fn contains_callback(ty: &TypeDescriptor<'_>) -> bool {
         | TypeDescriptor::Stream(inner)
         | TypeDescriptor::Future(inner) => contains_callback(inner),
         TypeDescriptor::Array(inner, _) => contains_callback(inner),
+        TypeDescriptor::Borrowed { inner, .. } => contains_callback(inner),
         TypeDescriptor::Map(k, v) | TypeDescriptor::Result(k, v) => {
             contains_callback(k) || contains_callback(v)
         }
@@ -616,6 +645,7 @@ fn contains_future(ty: &TypeDescriptor<'_>) -> bool {
         TypeDescriptor::Stream(inner) => contains_future(inner),
         TypeDescriptor::Option(inner) | TypeDescriptor::List(inner) => contains_future(inner),
         TypeDescriptor::Array(inner, _) => contains_future(inner),
+        TypeDescriptor::Borrowed { inner, .. } => contains_future(inner),
         TypeDescriptor::Map(k, v) | TypeDescriptor::Result(k, v) => {
             contains_future(k) || contains_future(v)
         }
@@ -640,6 +670,7 @@ fn contains_stream(ty: &TypeDescriptor<'_>) -> bool {
         TypeDescriptor::Future(inner) => contains_stream(inner),
         TypeDescriptor::Option(inner) | TypeDescriptor::List(inner) => contains_stream(inner),
         TypeDescriptor::Array(inner, _) => contains_stream(inner),
+        TypeDescriptor::Borrowed { inner, .. } => contains_stream(inner),
         TypeDescriptor::Map(k, v) | TypeDescriptor::Result(k, v) => {
             contains_stream(k) || contains_stream(v)
         }

@@ -20,6 +20,10 @@ pub mod __verify;
 pub mod backend;
 #[cfg(feature = "bitflags")]
 mod bitflags_support;
+#[cfg(feature = "chrono")]
+mod chrono_support;
+#[cfg(feature = "jiff")]
+mod jiff_support;
 /// Re-export of the [`bitflags`](https://docs.rs/bitflags) crate for
 /// [`script_bitflags!`] expansions.
 #[cfg(feature = "bitflags")]
@@ -36,6 +40,7 @@ pub mod module;
 pub mod ops;
 pub mod registry;
 pub mod script;
+mod std_types;
 #[cfg(any(feature = "streams", feature = "futures"))]
 pub mod stream;
 /// Re-export of the [`futures-core`](https://docs.rs/futures-core) crate for

@@ -73,6 +73,30 @@ pub struct FnArgs {
     pub dyn_dispatch: Option<Span>,
 }
 
+impl FnArgs {
+    /// Bare `dyn` on a single-parameter generic auto-instantiates the default
+    /// bridgeable candidate set (documented order — it is also the dispatch
+    /// tiebreak order). Explicit `instantiate(...)` overrides it entirely;
+    /// multi-parameter generics must declare explicitly (no Cartesian
+    /// default).
+    pub fn inject_bare_dyn_defaults(&mut self, type_param_count: usize) {
+        if let Some(span) = self.dyn_dispatch
+            && self.instantiate.is_empty()
+            && type_param_count == 1
+        {
+            for ty in [
+                syn::parse_quote!(i64),
+                syn::parse_quote!(f64),
+                syn::parse_quote!(bool),
+                syn::parse_quote!(String),
+                syn::parse_quote!(char),
+            ] {
+                self.instantiate.push((vec![ty], span));
+            }
+        }
+    }
+}
+
 /// Arguments accepted on function parameters.
 #[derive(Default)]
 pub struct ParamArgs {

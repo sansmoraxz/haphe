@@ -18,6 +18,10 @@ bitflags = ["haphe-core/bitflags"]
 streams = ["haphe-core/streams"]
 # First-class `haphe::Future<T>` value type.
 futures = ["haphe-core/futures"]
+# Bridge conversions for `chrono` timestamp types.
+chrono = ["haphe-core/chrono"]
+# Bridge conversions for `jiff` timestamp types.
+jiff = ["haphe-core/jiff"]
 
 [dev-dependencies]
 trybuild = "1"

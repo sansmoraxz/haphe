@@ -12,7 +12,13 @@ bitflags = ["dep:bitflags"]
 streams = ["dep:futures-core"]
 # First-class `Future<T>` value type (dependency-free).
 futures = []
+# Bridge conversions for `chrono` timestamp types.
+chrono = ["dep:chrono"]
+# Bridge conversions for `jiff` timestamp types.
+jiff = ["dep:jiff"]
 
 [dependencies]
 bitflags = { version = "2", optional = true }
 futures-core = { version = "0.3", optional = true, default-features = false }
+chrono = { version = "0.4", optional = true, default-features = false }
+jiff = { version = "0.2", optional = true, default-features = false }

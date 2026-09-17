@@ -107,6 +107,7 @@ pub fn expand(mut item: ItemImpl) -> TokenStream {
     let mut bind_methods: Vec<crate::bind::BindMethod> = Vec::new();
     let mut async_methods: Vec<crate::bind::BindMethod> = Vec::new();
     let mut dispatch_methods: Vec<crate::bind::BindMethod> = Vec::new();
+    let mut dyn_methods: Vec<crate::bind::DynBindMethod> = Vec::new();
     let mut bind_constructors: Vec<crate::bind::BindMethod> = Vec::new();
     let mut async_constructors: Vec<crate::bind::BindMethod> = Vec::new();
 
@@ -114,26 +115,60 @@ pub fn expand(mut item: ItemImpl) -> TokenStream {
         let ImplItem::Fn(func) = impl_item else {
             continue;
         };
-        let fn_args = parse_fn_args(&func.attrs, &mut errors, "an impl-block function");
-        if let Some(span) = fn_args.dyn_dispatch {
-            errors.spanned(
-                span,
-                "`dyn` dispatch is not supported on impl-block functions yet; \
-                 it applies to generic free functions",
-            );
-        }
+        let mut fn_args = parse_fn_args(&func.attrs, &mut errors, "an impl-block function");
         strip_script_attrs(&mut func.attrs);
-        if let Some((_, span)) = fn_args.instantiate.first() {
-            errors.spanned(
-                *span,
-                "`instantiate` is not supported on impl-block functions",
-            );
-        }
         if fn_args.skip.is_some() {
             strip_param_script_attrs(&mut func.sig);
             continue;
         }
-        let Some(info) = build_fn_info(&mut func.sig, &fn_args, &func.attrs, &ctx, &mut errors)
+        // A function's own generic parameters are supported on plain methods
+        // only, and only in `dyn` dispatch mode — there is no per-method
+        // static monomorph channel. Bare `dyn` on a single-parameter generic
+        // gets the default candidate set, like free functions.
+        let fn_type_params: Vec<syn::Ident> = func
+            .sig
+            .generics
+            .type_params()
+            .map(|tp| tp.ident.clone())
+            .collect();
+        let has_fn_generics = !fn_type_params.is_empty();
+        if has_fn_generics {
+            let span = func.sig.generics.span();
+            if fn_args.constructor.is_some() || fn_args.getter.is_some() || fn_args.setter.is_some()
+            {
+                errors.spanned(
+                    span,
+                    "generic parameters are not supported on constructors or property accessors",
+                );
+                strip_param_script_attrs(&mut func.sig);
+                continue;
+            }
+            if has_type_params {
+                errors.spanned(
+                    span,
+                    "generic impl-block functions on generic self types are not supported yet",
+                );
+                strip_param_script_attrs(&mut func.sig);
+                continue;
+            }
+            if fn_args.dyn_dispatch.is_none() {
+                errors.spanned(
+                    span,
+                    "generic impl-block functions require `dyn` dispatch: add `dyn` to \
+                     `#[script(...)]` (with `instantiate(...)` for multi-parameter generics)",
+                );
+                strip_param_script_attrs(&mut func.sig);
+                continue;
+            }
+            fn_args.inject_bare_dyn_defaults(fn_type_params.len());
+        }
+        let fn_generic_names: Vec<String> = fn_type_params.iter().map(|i| i.to_string()).collect();
+        let fn_ctx = TyCtx {
+            generic_params: &fn_generic_names,
+            self_ty: Some(&self_ty),
+        };
+        let info_ctx = if has_fn_generics { &fn_ctx } else { &ctx };
+        let Some(info) = build_fn_info(&mut func.sig, &fn_args, &func.attrs, info_ctx, &mut errors)
         else {
             continue;
         };
@@ -290,7 +325,64 @@ pub fn expand(mut item: ItemImpl) -> TokenStream {
             // Bridge: register non-async, non-cfg-gated methods with
             // bridge-compatible signatures. Generic impls bypass the
             // compatibility check — bounds are enforced at monomorphization.
-            if cfgs.is_empty() {
+            if has_fn_generics {
+                // `dyn` methods: each declared instantiation must produce a
+                // bridgeable signature — an unbindable candidate is a
+                // compile error, never a silent drop.
+                let method = extract_bind_method(func, &info);
+                let render = |t: &Type| {
+                    quote::quote!(#t)
+                        .to_string()
+                        .replace(" :: ", "::")
+                        .replace("< ", "<")
+                        .replace(" >", ">")
+                };
+                for (types, span) in &fn_args.instantiate {
+                    let subst: std::collections::HashMap<String, Type> = fn_generic_names
+                        .iter()
+                        .cloned()
+                        .zip(types.iter().cloned())
+                        .collect();
+                    for (_, ty) in &method.params {
+                        let t = crate::bind::strip_ref(&crate::bind::substitute_type_params(
+                            ty, &subst,
+                        ));
+                        if !crate::bind::is_bridge_value_type(&t) {
+                            errors.spanned(
+                                *span,
+                                format!(
+                                    "this instantiation gives parameter type `{}`, which \
+                                     cannot cross the bridge",
+                                    render(&t)
+                                ),
+                            );
+                        }
+                    }
+                    if let Some(ret) = &method.return_ty {
+                        let t = crate::bind::substitute_type_params(ret, &subst);
+                        if matches!(t, Type::Reference(_)) || !crate::bind::is_bridge_value_type(&t)
+                        {
+                            errors.spanned(
+                                *span,
+                                format!(
+                                    "this instantiation gives return type `{}`, which \
+                                     cannot cross the bridge",
+                                    render(&t)
+                                ),
+                            );
+                        }
+                    }
+                }
+                if cfgs.is_empty() {
+                    dyn_methods.push(crate::bind::DynBindMethod {
+                        method,
+                        type_params: fn_type_params.clone(),
+                        instantiations: fn_args.instantiate.clone(),
+                        is_async: info.is_async,
+                        descriptor: info.descriptor.clone(),
+                    });
+                }
+            } else if cfgs.is_empty() {
                 if info.is_async {
                     // Async methods bridge through the ScriptCow receiver
                     // path (borrowed guard or backend-acquired value);
@@ -435,6 +527,7 @@ pub fn expand(mut item: ItemImpl) -> TokenStream {
             methods: &bind_methods,
             async_methods: &async_methods,
             dispatch_methods: &dispatch_methods,
+            dyn_methods: &dyn_methods,
             constructors: &bind_constructors,
             async_constructors: &async_constructors,
             property_regs: &property_regs,

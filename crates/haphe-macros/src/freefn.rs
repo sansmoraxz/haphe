@@ -18,25 +18,7 @@ pub fn expand(mut item: ItemFn) -> TokenStream {
     let mut fn_args = parse_fn_args(&item.attrs, &mut errors, "a free function");
     strip_script_attrs(&mut item.attrs);
 
-    // Bare `dyn` on a single-parameter generic auto-instantiates the default
-    // bridgeable candidate set (documented order — it is also the dispatch
-    // tiebreak order). Explicit `instantiate(...)` overrides it entirely;
-    // multi-parameter generics must declare explicitly (no Cartesian
-    // default).
-    if let Some(span) = fn_args.dyn_dispatch
-        && fn_args.instantiate.is_empty()
-        && item.sig.generics.type_params().count() == 1
-    {
-        for ty in [
-            syn::parse_quote!(i64),
-            syn::parse_quote!(f64),
-            syn::parse_quote!(bool),
-            syn::parse_quote!(String),
-            syn::parse_quote!(char),
-        ] {
-            fn_args.instantiate.push((vec![ty], span));
-        }
-    }
+    fn_args.inject_bare_dyn_defaults(item.sig.generics.type_params().count());
 
     for (flag, span) in [
         ("skip", fn_args.skip),
@@ -105,21 +87,9 @@ pub fn expand(mut item: ItemFn) -> TokenStream {
             let Pat::Ident(pi) = pat_ty.pat.as_ref() else {
                 return None;
             };
-            // Strip outer references for the tuple type (bridge receives owned values).
-            // &str → String (str is unsized).
-            let ty = match pat_ty.ty.as_ref() {
-                Type::Reference(r) => {
-                    if let Type::Path(p) = r.elem.as_ref()
-                        && p.path.is_ident("str")
-                    {
-                        syn::parse_quote!(String)
-                    } else {
-                        (*r.elem).clone()
-                    }
-                }
-                other => other.clone(),
-            };
-            Some((pi.ident.clone(), ty))
+            // Strip outer references (bridge receives owned values, &str →
+            // String) and anonymize signature lifetimes for embedding.
+            Some((pi.ident.clone(), crate::bind::strip_ref(&pat_ty.ty)))
         })
         .collect();
 
@@ -414,26 +384,7 @@ pub fn expand(mut item: ItemFn) -> TokenStream {
     }
 }
 
-/// Replaces bare type-parameter paths (`T`, `Vec<T>`) with concrete types.
-fn substitute_type_params(ty: &Type, subst: &std::collections::HashMap<String, Type>) -> Type {
-    struct Replace<'a>(&'a std::collections::HashMap<String, Type>);
-    impl syn::visit_mut::VisitMut for Replace<'_> {
-        fn visit_type_mut(&mut self, ty: &mut Type) {
-            if let Type::Path(p) = ty
-                && p.qself.is_none()
-                && let Some(ident) = p.path.get_ident()
-                && let Some(concrete) = self.0.get(&ident.to_string())
-            {
-                *ty = concrete.clone();
-                return;
-            }
-            syn::visit_mut::visit_type_mut(self, ty);
-        }
-    }
-    let mut ty = ty.clone();
-    syn::visit_mut::VisitMut::visit_type_mut(&mut Replace(subst), &mut ty);
-    ty
-}
+use crate::bind::substitute_type_params;
 
 /// A free-fn registration decided by compile-time trait-presence dispatch
 /// (autoref specialization): registers when every stripped param implements

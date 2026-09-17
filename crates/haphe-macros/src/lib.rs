@@ -8,6 +8,7 @@ mod foreign;
 mod freefn;
 mod imp;
 mod registry;
+mod std_types;
 mod verify;
 
 /// Derive macro generating scripting descriptors for a struct or enum.
@@ -162,6 +163,27 @@ pub fn derive_script(input: TokenStream) -> TokenStream {
 ///
 /// #[script(dyn)]
 /// fn mirror<T: haphe::FromScript + haphe::IntoScript>(value: T) -> T { value }
+/// ```
+///
+/// The same applies to generic methods in `#[script] impl` blocks (on
+/// non-generic self types): they are `dyn`-only — there is no per-method
+/// static monomorph channel — and register one candidate per instantiation
+/// through the receiver-shaped `method_dyn*` binder channels.
+///
+/// ```
+/// use haphe::{Script, script};
+///
+/// #[derive(Script, Clone)]
+/// #[script(methods)]
+/// struct Holder {
+///     total: i64,
+/// }
+///
+/// #[script]
+/// impl Holder {
+///     #[script(dyn)]
+///     fn mirror<T>(&self, value: T) -> T { value }
+/// }
 /// ```
 ///
 /// # Foreign traits
