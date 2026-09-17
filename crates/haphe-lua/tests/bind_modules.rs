@@ -47,6 +47,7 @@ static ADD_FN: FunctionDescriptor<'static> = FunctionDescriptor {
     receiver: None,
     generic_params: &[],
     instantiations: &[],
+    dispatch: haphe::Dispatch::Static,
     params: &[
         ParamDescriptor {
             name: "a",

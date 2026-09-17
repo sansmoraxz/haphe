@@ -1,0 +1,17 @@
+error: getters must take `&self`
+  --> tests/ui/async_getter_setter_shape.rs:13:14
+   |
+13 |     #[script(getter)]
+   |              ^^^^^^
+
+error: getters cannot take parameters besides `&self`
+  --> tests/ui/async_getter_setter_shape.rs:18:14
+   |
+18 |     #[script(getter)]
+   |              ^^^^^^
+
+error: setters must take `&mut self`
+  --> tests/ui/async_getter_setter_shape.rs:24:14
+   |
+24 |     #[script(setter)]
+   |              ^^^^^^

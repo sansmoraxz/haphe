@@ -60,6 +60,7 @@ fn module_stream_fn_rejected_without_capability() {
         receiver: None,
         generic_params: &[],
         instantiations: &[],
+        dispatch: haphe_core::Dispatch::Static,
         params: &[ParamDescriptor {
             name: "topic",
             ty: &TypeDescriptor::String,

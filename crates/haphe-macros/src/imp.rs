@@ -15,6 +15,9 @@ use crate::ty_map::TyCtx;
 struct Getter {
     doc: Option<String>,
     descriptor_ty: TokenStream,
+    ident: syn::Ident,
+    is_async: bool,
+    ret_ty: Type,
 }
 
 struct Setter {
@@ -22,6 +25,8 @@ struct Setter {
     param_ty: Type,
     descriptor_ty: TokenStream,
     span: proc_macro2::Span,
+    ident: syn::Ident,
+    is_async: bool,
 }
 
 /// A descriptor entry gated by the function's `#[cfg(...)]` attributes, so
@@ -103,12 +108,20 @@ pub fn expand(mut item: ItemImpl) -> TokenStream {
     let mut async_methods: Vec<crate::bind::BindMethod> = Vec::new();
     let mut dispatch_methods: Vec<crate::bind::BindMethod> = Vec::new();
     let mut bind_constructors: Vec<crate::bind::BindMethod> = Vec::new();
+    let mut async_constructors: Vec<crate::bind::BindMethod> = Vec::new();
 
     for impl_item in &mut item.items {
         let ImplItem::Fn(func) = impl_item else {
             continue;
         };
         let fn_args = parse_fn_args(&func.attrs, &mut errors, "an impl-block function");
+        if let Some(span) = fn_args.dyn_dispatch {
+            errors.spanned(
+                span,
+                "`dyn` dispatch is not supported on impl-block functions yet; \
+                 it applies to generic free functions",
+            );
+        }
         strip_script_attrs(&mut func.attrs);
         if let Some((_, span)) = fn_args.instantiate.first() {
             errors.spanned(
@@ -172,18 +185,18 @@ pub fn expand(mut item: ItemImpl) -> TokenStream {
                     false
                 }
             });
-            if !info.is_async && cfgs.is_empty() && !is_fallible {
-                bind_constructors.push(extract_bind_method(func, &info));
+            if cfgs.is_empty() && !is_fallible {
+                if info.is_async {
+                    async_constructors.push(extract_bind_method(func, &info));
+                } else {
+                    bind_constructors.push(extract_bind_method(func, &info));
+                }
             }
             constructors.push(Entry {
                 cfgs,
                 descriptor: info.descriptor,
             });
         } else if let Some(span) = fn_args.getter {
-            if info.is_async {
-                errors.spanned(span, "getters cannot be `async`");
-                continue;
-            }
             if info.receiver != ReceiverShape::Ref {
                 errors.spanned(span, "getters must take `&self`");
                 continue;
@@ -209,6 +222,9 @@ pub fn expand(mut item: ItemImpl) -> TokenStream {
                     Getter {
                         doc: info.doc,
                         descriptor_ty,
+                        ident: func.sig.ident.clone(),
+                        is_async: info.is_async,
+                        ret_ty,
                     },
                 )
                 .is_some()
@@ -219,10 +235,6 @@ pub fn expand(mut item: ItemImpl) -> TokenStream {
                 );
             }
         } else if let Some((rename, span)) = &fn_args.setter {
-            if info.is_async {
-                errors.spanned(*span, "setters cannot be `async`");
-                continue;
-            }
             if info.receiver != ReceiverShape::RefMut {
                 errors.spanned(*span, "setters must take `&mut self`");
                 continue;
@@ -263,6 +275,8 @@ pub fn expand(mut item: ItemImpl) -> TokenStream {
                         param_ty,
                         descriptor_ty,
                         span: *span,
+                        ident: func.sig.ident.clone(),
+                        is_async: info.is_async,
                     },
                 )
                 .is_some()
@@ -307,9 +321,30 @@ pub fn expand(mut item: ItemImpl) -> TokenStream {
     // types must describe the same script type (checked structurally, so an
     // `&str` getter pairs with a `String` setter).
     let mut properties = Vec::new();
+    let mut property_regs: Vec<TokenStream> = Vec::new();
+    let mut has_async_props = false;
     for (name, getter) in &getters {
         let setter = setters.remove(name);
         let readonly = setter.is_none();
+        // Properties bind only when their script types pass the bridge
+        // whitelist (mirroring methods); others stay descriptor-only.
+        let bindable = crate::bind::is_bridge_compatible_type(&getter.ret_ty)
+            && setter
+                .as_ref()
+                .is_none_or(|st| crate::bind::is_bridge_compatible_type(&st.param_ty));
+        if bindable {
+            has_async_props |= getter.is_async || setter.as_ref().is_some_and(|st| st.is_async);
+            property_regs.push(crate::bind::gen_property_registration(
+                &self_ty,
+                name,
+                getter.ident.clone(),
+                getter.is_async,
+                &getter.ret_ty,
+                setter
+                    .as_ref()
+                    .map(|st| (st.ident.clone(), st.is_async, st.param_ty.clone())),
+            ));
+        }
         if let Some(setter) = &setter {
             let (get_desc, set_desc) = (&getter.descriptor_ty, &setter.descriptor_ty);
             let message =
@@ -394,15 +429,17 @@ pub fn expand(mut item: ItemImpl) -> TokenStream {
     let bind_codegen = if let Type::Path(p) = &self_ty
         && let Some(seg) = p.path.segments.last()
     {
-        crate::bind::gen_impl_bind_methods(
-            &seg.ident,
-            &self_ty,
-            &bind_methods,
-            &async_methods,
-            &dispatch_methods,
-            &bind_constructors,
-            &item.generics,
-        )
+        crate::bind::gen_impl_bind_methods(crate::bind::BindImplInput {
+            ident: &seg.ident,
+            self_ty: &self_ty,
+            methods: &bind_methods,
+            async_methods: &async_methods,
+            dispatch_methods: &dispatch_methods,
+            constructors: &bind_constructors,
+            async_constructors: &async_constructors,
+            property_regs: &property_regs,
+            generics: &item.generics,
+        })
     } else {
         TokenStream::new()
     };
@@ -419,7 +456,8 @@ pub fn expand(mut item: ItemImpl) -> TokenStream {
             const CONSTRUCTORS: &'static [::haphe::FunctionDescriptor<'static>] = &[#(#constructors),*];
             const PROPERTIES: &'static [::haphe::PropertyDescriptor<'static>] = &[#(#properties),*];
             const HAS_ASYNC: bool = ::haphe::any_async(Self::METHODS)
-                || ::haphe::any_async(Self::CONSTRUCTORS);
+                || ::haphe::any_async(Self::CONSTRUCTORS)
+                || #has_async_props;
         }
         #reverse_probe
         #(#probes)*

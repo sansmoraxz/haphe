@@ -48,6 +48,7 @@ static EXPECTED_ADD: FunctionDescriptor<'static> = FunctionDescriptor {
     receiver: Some(Receiver::Ref),
     generic_params: &[],
     instantiations: &[],
+    dispatch: haphe::Dispatch::Static,
     params: &[
         ParamDescriptor {
             name: "a",

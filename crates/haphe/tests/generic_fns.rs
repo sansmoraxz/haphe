@@ -162,6 +162,15 @@ impl FnBinder for Collect {
         self.0.push((name, type_args, f));
         Ok(())
     }
+
+    fn function_async(
+        &mut self,
+        _: &'static str,
+        _: &'static [TypeDescriptor<'static>],
+        _: for<'a> fn(&'a [ScriptValue]) -> haphe::ScriptCallFuture<'a>,
+    ) -> Result<(), Self::Error> {
+        Ok(())
+    }
 }
 
 #[test]

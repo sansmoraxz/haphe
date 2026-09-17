@@ -62,6 +62,7 @@ fn borrowed_resource_return_rejected() {
         receiver: Some(Receiver::Ref),
         generic_params: &[],
         instantiations: &[],
+        dispatch: haphe::Dispatch::Static,
         params: &[],
         return_type: &POINT_REF,
         return_ownership: Ownership::Ref,
@@ -151,6 +152,7 @@ fn async_constructor_becomes_static_func() {
             receiver: None,
             generic_params: &[],
             instantiations: &[],
+            dispatch: haphe::Dispatch::Static,
             params: &[],
             return_type: &UNIT,
             return_ownership: Ownership::Owned,
@@ -163,6 +165,7 @@ fn async_constructor_becomes_static_func() {
             receiver: None,
             generic_params: &[],
             instantiations: &[],
+            dispatch: haphe::Dispatch::Static,
             params: &[],
             return_type: &UNIT,
             return_ownership: Ownership::Owned,
@@ -335,6 +338,7 @@ fn cyclic_interface_use_rejected() {
             receiver: Some(Receiver::Ref),
             generic_params: &[],
             instantiations: &[],
+            dispatch: haphe::Dispatch::Static,
             params: &[],
             return_type: param_ty,
             return_ownership: Ownership::Owned,
@@ -535,6 +539,7 @@ const fn foreign_fn(
         receiver: Some(Receiver::Ref),
         generic_params,
         instantiations,
+        dispatch: haphe::Dispatch::Static,
         params: &[],
         return_type,
         return_ownership: Ownership::Owned,
@@ -684,6 +689,7 @@ fn projection_name_collision_with_user_method() {
         receiver: Some(Receiver::Ref),
         generic_params: &[],
         instantiations: &[],
+        dispatch: haphe::Dispatch::Static,
         params: &[],
         return_type: &F64,
         return_ownership: Ownership::Owned,
@@ -730,6 +736,7 @@ fn both_call_traits_rejected_in_projection() {
         receiver: None,
         generic_params: &[],
         instantiations: &[],
+        dispatch: haphe::Dispatch::Static,
         params: &[],
         return_type: &UNIT,
         return_ownership: Ownership::Owned,
@@ -748,5 +755,97 @@ fn both_call_traits_rejected_in_projection() {
         matches!(err, WitGenError::UnrepresentableType { ref detail, .. }
             if detail.contains("both `Call` and `AsyncCall`")),
         "got: {err:?}"
+    );
+}
+
+// ── Dyn-dispatched generics
+
+const fn generic_module_fn(dispatch: haphe::Dispatch) -> FunctionDescriptor<'static> {
+    FunctionDescriptor {
+        name: "echo",
+        doc: None,
+        receiver: None,
+        generic_params: &[haphe::GenericParam {
+            name: "T",
+            bounds: &[],
+            default: None,
+        }],
+        instantiations: &[&[TypeDescriptor::Primitive(PrimitiveType::I64)]],
+        dispatch,
+        params: &[haphe::ParamDescriptor {
+            name: "value",
+            ty: &TypeDescriptor::GenericParam("T"),
+            ownership: Ownership::Owned,
+        }],
+        return_type: &TypeDescriptor::GenericParam("T"),
+        return_ownership: Ownership::Owned,
+        is_async: false,
+        error_kind: None,
+    }
+}
+
+const fn dispatch_module(
+    functions: &'static [FunctionDescriptor<'static>],
+) -> haphe::ModuleDescriptor<'static> {
+    haphe::ModuleDescriptor {
+        name: "util",
+        doc: None,
+        functions,
+        type_ids: &[],
+        submodules: &[],
+        constants: &[],
+        function_instantiations: &[],
+    }
+}
+
+/// WIT guests always name a monomorph statically, so bare dyn dispatch is
+/// rejected by the capability check.
+#[test]
+fn dyn_generic_fn_rejected_by_capabilities() {
+    static FNS: [FunctionDescriptor; 1] = [generic_module_fn(haphe::Dispatch::Dyn)];
+    static MODULES: [haphe::ModuleDescriptor; 1] = [dispatch_module(&FNS)];
+    static REGISTRY: TypeRegistry = TypeRegistry::new(&[], &[], &[], &MODULES, &[], &[]);
+
+    match haphe::generate(&WitGenerator::new("haphe:demo"), &REGISTRY) {
+        Err(GenerateError::Incompatible(errors)) => {
+            assert!(
+                errors.iter().any(|e| matches!(
+                    e,
+                    haphe::CompatibilityError::DynGenericsUnsupported { function: "echo" }
+                )),
+                "expected DynGenericsUnsupported, got: {errors:?}"
+            );
+        }
+        other => panic!("expected Incompatible, got: {other:?}"),
+    }
+}
+
+/// WIT text depends only on the monomorph set, never on the dispatch mode:
+/// a dyn twin (built by hand and generated directly, bypassing the facade's
+/// capability check) emits byte-identical output to its static sibling.
+/// Generic emission requires the `generics` extension feature.
+#[test]
+#[cfg(feature = "generics")]
+fn wit_text_is_dispatch_mode_neutral() {
+    use haphe::BindingGenerator;
+
+    static STATIC_FNS: [FunctionDescriptor; 1] = [generic_module_fn(haphe::Dispatch::Static)];
+    static DYN_FNS: [FunctionDescriptor; 1] = [generic_module_fn(haphe::Dispatch::Dyn)];
+    static STATIC_MODULES: [haphe::ModuleDescriptor; 1] = [dispatch_module(&STATIC_FNS)];
+    static DYN_MODULES: [haphe::ModuleDescriptor; 1] = [dispatch_module(&DYN_FNS)];
+    static STATIC_REGISTRY: TypeRegistry =
+        TypeRegistry::new(&[], &[], &[], &STATIC_MODULES, &[], &[]);
+    static DYN_REGISTRY: TypeRegistry = TypeRegistry::new(&[], &[], &[], &DYN_MODULES, &[], &[]);
+
+    let generator = WitGenerator::new("haphe:demo");
+    let static_out = generator
+        .generate(&STATIC_REGISTRY.validate().unwrap())
+        .expect("static twin generates");
+    let dyn_out = generator
+        .generate(&DYN_REGISTRY.validate().unwrap())
+        .expect("dyn twin generates (direct call bypasses the capability check)");
+    assert_eq!(
+        static_out.files[0].content, dyn_out.files[0].content,
+        "dispatch mode must not affect emitted WIT"
     );
 }

@@ -7,6 +7,7 @@
 
 use proc_macro2::{Span, TokenStream};
 use quote::quote;
+use syn::ext::IdentExt;
 use syn::spanned::Spanned;
 use syn::{Attribute, Ident, LitStr, Type};
 
@@ -67,6 +68,9 @@ pub struct FnArgs {
     /// Repeatable `instantiate(T, ...)` declarations for generic functions:
     /// one entry per declared instantiation, listing its type arguments.
     pub instantiate: Vec<(Vec<Type>, Span)>,
+    /// `dyn` — dynamic dispatch: the backend scans the declared
+    /// instantiations at call time instead of keying on named monomorphs.
+    pub dyn_dispatch: Option<Span>,
 }
 
 /// Arguments accepted on function parameters.
@@ -198,6 +202,10 @@ fn parse_script_attrs(
         if !attr.path().is_ident("script") {
             continue;
         }
+        // `dyn` is a Rust keyword and would fail nested-meta path parsing;
+        // rewrite bare `dyn` idents to `r#dyn` up front so every site parses
+        // it uniformly (handlers compare unrawed).
+        let attr = keywordize_dyn(attr);
         let result = attr.parse_nested_meta(|meta| {
             let Some(key) = meta.path.get_ident().cloned() else {
                 return Err(syn::Error::new(
@@ -216,6 +224,30 @@ fn parse_script_attrs(
         }
     }
     parse_errors
+}
+
+/// Rewrites top-level bare `dyn` ident tokens inside `#[script(...)]` to
+/// `r#dyn` so path-based nested-meta parsing accepts them.
+fn keywordize_dyn(attr: &Attribute) -> Attribute {
+    let syn::Meta::List(list) = &attr.meta else {
+        return attr.clone();
+    };
+    let tokens: TokenStream = list
+        .tokens
+        .clone()
+        .into_iter()
+        .map(|tt| match &tt {
+            proc_macro2::TokenTree::Ident(ident) if ident == "dyn" => {
+                proc_macro2::TokenTree::Ident(proc_macro2::Ident::new_raw("dyn", ident.span()))
+            }
+            _ => tt,
+        })
+        .collect();
+    let mut list = list.clone();
+    list.tokens = tokens;
+    let mut attr = attr.clone();
+    attr.meta = syn::Meta::List(list);
+    attr
 }
 
 macro_rules! set_once {
@@ -415,6 +447,7 @@ pub fn parse_fn_args(attrs: &[Attribute], errors: &mut Errors, site: &str) -> Fn
         "setter",
         "error_kind",
         "instantiate",
+        "dyn",
     ];
     let mut args = FnArgs::default();
     let parse_errors = parse_script_attrs(
@@ -440,6 +473,8 @@ pub fn parse_fn_args(attrs: &[Attribute], errors: &mut Errors, site: &str) -> Fn
             } else if key == "error_kind" {
                 let value: LitStr = meta.value()?.parse()?;
                 set_once!(errors, args.error_kind, &key, value);
+            } else if key.unraw() == "dyn" {
+                set_once!(errors, args.dyn_dispatch, &key, key.span());
             } else if key == "instantiate" {
                 let content;
                 syn::parenthesized!(content in meta.input);

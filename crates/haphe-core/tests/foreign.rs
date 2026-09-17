@@ -21,6 +21,7 @@ const fn method(
         receiver: Some(Receiver::Ref),
         generic_params: &[],
         instantiations: &[],
+        dispatch: haphe_core::Dispatch::Static,
         params,
         return_type,
         return_ownership: Ownership::Owned,
@@ -315,6 +316,7 @@ const fn generic_fn(
     FunctionDescriptor {
         name,
         doc: None,
+        dispatch: haphe_core::Dispatch::Static,
         receiver: Some(Receiver::Ref),
         generic_params,
         instantiations,

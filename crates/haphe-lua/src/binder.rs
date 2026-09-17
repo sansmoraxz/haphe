@@ -204,6 +204,10 @@ type AsyncMutFn<T> = for<'a> fn(&'a mut T, &'a [ScriptValue]) -> ScriptCallFutur
 type ScriptMethodMut<T> =
     fn(&mut T, &[ScriptValue]) -> Result<ScriptValue, haphe::ScriptConvertError>;
 type ScriptCtorFn<T> = fn(&[ScriptValue]) -> Result<T, haphe::ScriptConvertError>;
+type PropGetFn<T> = fn(&T) -> ScriptValue;
+type PropSetFn<T> = fn(&mut T, ScriptValue) -> Result<(), haphe::ScriptConvertError>;
+#[cfg(all(feature = "async", not(feature = "send")))]
+type AsyncCtorFn<T> = for<'a> fn(&'a [ScriptValue]) -> haphe::ScriptCtorFuture<'a, T>;
 type ScriptArithSelf<T> = fn(T, T) -> T;
 type ScriptArithScalar<T> = fn(T, &[ScriptValue]) -> Result<T, haphe::ScriptConvertError>;
 type ScriptNewIndex<T> = fn(&mut T, &[ScriptValue]) -> Result<(), haphe::ScriptConvertError>;
@@ -279,6 +283,10 @@ pub(crate) struct LuaTypeBinder<T: 'static> {
     newindex: Option<ScriptNewIndex<T>>,
     call: Option<ScriptMethodRef<T>>,
     call_async: Option<AsyncCowFn<T>>,
+    prop_gets: Vec<(&'static str, PropGetFn<T>)>,
+    prop_sets: Vec<(&'static str, PropSetFn<T>)>,
+    #[cfg(all(feature = "async", not(feature = "send")))]
+    async_ctors: Vec<(&'static str, AsyncCtorFn<T>)>,
     #[cfg(all(feature = "async", not(feature = "send")))]
     async_methods: Vec<(&'static str, AsyncCowFn<T>)>,
     #[cfg(all(feature = "async", not(feature = "send")))]
@@ -310,6 +318,10 @@ impl<T: 'static + Clone + mlua::MaybeSend + mlua::MaybeSync> LuaTypeBinder<T> {
             newindex: None,
             call: None,
             call_async: None,
+            prop_gets: Vec::new(),
+            prop_sets: Vec::new(),
+            #[cfg(all(feature = "async", not(feature = "send")))]
+            async_ctors: Vec::new(),
             #[cfg(all(feature = "async", not(feature = "send")))]
             async_methods: Vec::new(),
             #[cfg(all(feature = "async", not(feature = "send")))]
@@ -358,10 +370,25 @@ impl<T: 'static + Clone + mlua::MaybeSend + mlua::MaybeSync> LuaTypeBinder<T> {
         }
         // Constructors land on the type table by name; a duplicate (e.g. a
         // user constructor named `default` next to the implicit one from
-        // `traits(Default)`) would silently overwrite.
-        for (i, ctor) in self.constructors.iter().enumerate() {
-            if self.constructors[..i].iter().any(|c| c.name == ctor.name) {
-                return Err(LuaBindError::DuplicateConstructor { name: ctor.name });
+        // `traits(Default)`) would silently overwrite. Sync and async
+        // constructors share the namespace.
+        {
+            let mut seen: Vec<&'static str> = Vec::new();
+            let names = self.constructors.iter().map(|c| c.name);
+            #[cfg(all(feature = "async", not(feature = "send")))]
+            let names = names.chain(self.async_ctors.iter().map(|(n, _)| *n));
+            for name in names {
+                if seen.contains(&name) {
+                    return Err(LuaBindError::DuplicateConstructor { name });
+                }
+                seen.push(name);
+            }
+        }
+        // Computed properties share the field namespace; mlua would let the
+        // later registration silently shadow the earlier one.
+        for (name, _) in &self.prop_gets {
+            if self.fields.iter().any(|f| f.name == *name) {
+                return Err(LuaBindError::DuplicateField { name });
             }
         }
         // Lua has exactly one `__call` metamethod: a type declaring both
@@ -383,6 +410,24 @@ impl<T: 'static + Clone + mlua::MaybeSend + mlua::MaybeSync> LuaTypeBinder<T> {
             })?;
             type_table.set(ctor.name, lua_fn)?;
         }
+        // Async constructors: same surface, awaited body.
+        #[cfg(all(feature = "async", not(feature = "send")))]
+        for (name, f) in &self.async_ctors {
+            let f = *f;
+            let lua_fn =
+                lua.create_async_function(move |lua, args: mlua::MultiValue| async move {
+                    let sv_args: Vec<ScriptValue> = args
+                        .into_vec()
+                        .iter()
+                        .map(lua_to_script)
+                        .collect::<mlua::Result<_>>()?;
+                    let value = f(&sv_args)
+                        .await
+                        .map_err(|e| mlua::Error::runtime(e.to_string()))?;
+                    lua.create_any_userdata(value)
+                })?;
+            type_table.set(*name, lua_fn)?;
+        }
 
         // UserData registration.
         lua.register_userdata_type::<T>(move |reg| {
@@ -398,6 +443,25 @@ impl<T: 'static + Clone + mlua::MaybeSend + mlua::MaybeSync> LuaTypeBinder<T> {
                         setter(&mut *ud.borrow_mut::<T>()?, val, lua)
                     });
                 }
+            }
+
+            // Computed properties: the natural Lua surface is a field
+            // (`obj.level` reads, `obj.level = v` writes), same as plain
+            // fields but through the property fn pointers.
+            for (name, get) in &self.prop_gets {
+                let get = *get;
+                reg.add_field_function_get(*name, move |lua, ud| {
+                    script_to_lua(lua, get(&*ud.borrow::<T>()?))
+                });
+            }
+            for (name, set) in &self.prop_sets {
+                let set = *set;
+                reg.add_field_function_set(*name, move |lua, ud, val| {
+                    let sv = lua_to_script(&val)?;
+                    let _ = lua;
+                    set(&mut *ud.borrow_mut::<T>()?, sv)
+                        .map_err(|e| mlua::Error::runtime(e.to_string()))
+                });
             }
 
             // Methods (&self).
@@ -906,6 +970,73 @@ impl<T: 'static + Clone + mlua::MaybeSend + mlua::MaybeSync> TypeBinder<T> for L
         Ok(())
     }
 
+    fn constructor_async(
+        &mut self,
+        name: &'static str,
+        f: for<'a> fn(&'a [ScriptValue]) -> haphe::ScriptCtorFuture<'a, T>,
+    ) -> Result<(), Self::Error> {
+        #[cfg(not(feature = "async"))]
+        {
+            let _ = f;
+            Err(LuaBindError::UnsupportedAsyncFunction {
+                name,
+                reason: "enable this backend's `async` feature",
+            })
+        }
+        #[cfg(all(feature = "async", feature = "send"))]
+        {
+            let _ = f;
+            Err(LuaBindError::UnsupportedAsyncFunction {
+                name,
+                reason: "the `send` feature demands `Send` futures, and async constructor \
+                         futures are deliberately not Send",
+            })
+        }
+        #[cfg(all(feature = "async", not(feature = "send")))]
+        {
+            self.async_ctors.push((name, f));
+            Ok(())
+        }
+    }
+
+    fn property_get(
+        &mut self,
+        name: &'static str,
+        f: fn(&T) -> ScriptValue,
+    ) -> Result<(), Self::Error> {
+        self.prop_gets.push((name, f));
+        Ok(())
+    }
+
+    fn property_set(
+        &mut self,
+        name: &'static str,
+        f: fn(&mut T, ScriptValue) -> Result<(), haphe::ScriptConvertError>,
+    ) -> Result<(), Self::Error> {
+        self.prop_sets.push((name, f));
+        Ok(())
+    }
+
+    // mlua 0.12 exposes no async field accessors (`UserDataFields` is
+    // sync-only), so async computed properties cannot surface as `obj.x`
+    // in Lua. Rejected descriptively rather than inventing method
+    // spellings; declare an async METHOD for awaited access.
+    fn property_get_async(
+        &mut self,
+        name: &'static str,
+        _f: for<'a> fn(ScriptCow<'a, T>) -> ScriptCallFuture<'a>,
+    ) -> Result<(), Self::Error> {
+        Err(LuaBindError::UnsupportedAsyncProperty { name })
+    }
+
+    fn property_set_async(
+        &mut self,
+        name: &'static str,
+        _f: for<'a> fn(&'a mut T, ScriptValue) -> ScriptCallFuture<'a>,
+    ) -> Result<(), Self::Error> {
+        Err(LuaBindError::UnsupportedAsyncProperty { name })
+    }
+
     fn meta_tostring(&mut self, f: fn(&T) -> String) -> Result<(), Self::Error> {
         self.tostring = Some(f);
         Ok(())
@@ -1083,16 +1214,86 @@ impl<T: 'static + Clone + mlua::MaybeSend + mlua::MaybeSync> TypeBinder<T> for L
 // ---------------------------------------------------------------------------
 
 type ScriptFnPtr = fn(&[ScriptValue]) -> Result<ScriptValue, haphe::ScriptConvertError>;
+#[cfg(all(feature = "async", not(feature = "send")))]
+type AsyncFnPtr = for<'a> fn(&'a [ScriptValue]) -> haphe::ScriptCallFuture<'a>;
+
+/// One compiled monomorph of a `dyn`-dispatched generic function.
+#[cfg(feature = "generics")]
+struct DynFn<F> {
+    descriptor: &'static haphe::FunctionDescriptor<'static>,
+    type_args: &'static [haphe::TypeDescriptor<'static>],
+    wrapper: F,
+}
+
+/// Renders a candidate signature for no-match diagnostics.
+#[cfg(feature = "generics")]
+fn render_candidate(
+    descriptor: &haphe::FunctionDescriptor<'_>,
+    type_args: &[haphe::TypeDescriptor<'_>],
+) -> String {
+    fn render_ty(
+        ty: &haphe::TypeDescriptor<'_>,
+        subst: &haphe::dispatch::GenericSubst<'_>,
+    ) -> String {
+        use haphe::TypeDescriptor as T;
+        match ty {
+            T::GenericParam(name) => subst
+                .params
+                .iter()
+                .position(|p| p.name == *name)
+                .and_then(|i| subst.args.get(i))
+                .map(|resolved| render_ty(resolved, subst))
+                .unwrap_or_else(|| name.to_string()),
+            T::Primitive(p) => format!("{p:?}").to_lowercase(),
+            T::String => "string".into(),
+            T::Bytes => "bytes".into(),
+            T::Unit => "nil".into(),
+            T::Option(inner) => format!("{}?", render_ty(inner, subst)),
+            T::List(inner) | T::Array(inner, _) => format!("{}[]", render_ty(inner, subst)),
+            T::Map(k, v) => format!("table<{}, {}>", render_ty(k, subst), render_ty(v, subst)),
+            T::Ref(id) => id.as_str().rsplit("::").next().unwrap_or("?").to_string(),
+            other => format!("{other:?}"),
+        }
+    }
+    let subst = haphe::dispatch::GenericSubst {
+        params: descriptor.generic_params,
+        args: type_args,
+    };
+    let args: Vec<String> = type_args.iter().map(|a| render_ty(a, &subst)).collect();
+    let params: Vec<String> = descriptor
+        .params
+        .iter()
+        .map(|p| format!("{}: {}", p.name, render_ty(p.ty, &subst)))
+        .collect();
+    format!(
+        "{}<{}>({})",
+        descriptor.name,
+        args.join(", "),
+        params.join(", ")
+    )
+}
 
 /// Collects free function registrations and applies them to a Lua table.
 pub(crate) struct LuaFnBinder {
     functions: Vec<(&'static str, ScriptFnPtr)>,
+    #[cfg(all(feature = "async", not(feature = "send")))]
+    async_functions: Vec<(&'static str, AsyncFnPtr)>,
+    #[cfg(feature = "generics")]
+    dyn_functions: Vec<(&'static str, Vec<DynFn<ScriptFnPtr>>)>,
+    #[cfg(all(feature = "generics", feature = "async", not(feature = "send")))]
+    dyn_async_functions: Vec<(&'static str, Vec<DynFn<AsyncFnPtr>>)>,
 }
 
 impl LuaFnBinder {
     pub fn new() -> Self {
         Self {
             functions: Vec::new(),
+            #[cfg(all(feature = "async", not(feature = "send")))]
+            async_functions: Vec::new(),
+            #[cfg(feature = "generics")]
+            dyn_functions: Vec::new(),
+            #[cfg(all(feature = "generics", feature = "async", not(feature = "send")))]
+            dyn_async_functions: Vec::new(),
         }
     }
 
@@ -1107,6 +1308,133 @@ impl LuaFnBinder {
                     .collect::<mlua::Result<_>>()?;
                 let result = f(&script_args).map_err(|e| mlua::Error::runtime(e.to_string()))?;
                 script_to_lua(lua, result)
+            })?;
+            table.set(name, lua_fn)?;
+        }
+        // Dyn generic functions: one Lua callable per name scans the
+        // registered monomorph candidates at call time (core's shared
+        // resolver), falling through in declaration order when the ranked
+        // pick's conversions reject the values. Candidate tables are built
+        // here, once — nothing allocates per call beyond the existing arg
+        // conversion.
+        #[cfg(feature = "generics")]
+        for (name, candidates) in self.dyn_functions {
+            let scan: Vec<haphe::dispatch::DynCandidate<'static>> = candidates
+                .iter()
+                .map(|c| haphe::dispatch::DynCandidate {
+                    type_args: c.type_args,
+                    descriptor: c.descriptor,
+                })
+                .collect();
+            let signatures: Vec<String> = candidates
+                .iter()
+                .map(|c| render_candidate(c.descriptor, c.type_args))
+                .collect();
+            let signatures = signatures.join(", ");
+            let lua_fn = lua.create_function(move |lua, args: mlua::MultiValue| {
+                let script_args: Vec<ScriptValue> = args
+                    .into_vec()
+                    .iter()
+                    .map(lua_to_script)
+                    .collect::<mlua::Result<_>>()?;
+                let ranked = match haphe::dispatch::resolve_dyn_candidate(&script_args, &scan) {
+                    haphe::dispatch::Resolution::Ranked(i) => Some(i),
+                    haphe::dispatch::Resolution::TryCallOrder => None,
+                };
+                let mut last_err = None;
+                if let Some(i) = ranked {
+                    match (candidates[i].wrapper)(&script_args) {
+                        Ok(out) => return script_to_lua(lua, out),
+                        Err(e) => last_err = Some(e),
+                    }
+                }
+                for (j, candidate) in candidates.iter().enumerate() {
+                    if Some(j) == ranked {
+                        continue;
+                    }
+                    match (candidate.wrapper)(&script_args) {
+                        Ok(out) => return script_to_lua(lua, out),
+                        Err(e) => last_err = Some(e),
+                    }
+                }
+                Err(mlua::Error::runtime(format!(
+                    "no dyn candidate of `{name}` accepts these arguments                      (candidates: {signatures}){}",
+                    last_err
+                        .map(|e| format!("; last error: {e}"))
+                        .unwrap_or_default()
+                )))
+            })?;
+            table.set(name, lua_fn)?;
+        }
+        #[cfg(all(feature = "generics", feature = "async", not(feature = "send")))]
+        for (name, candidates) in self.dyn_async_functions {
+            let scan: Vec<haphe::dispatch::DynCandidate<'static>> = candidates
+                .iter()
+                .map(|c| haphe::dispatch::DynCandidate {
+                    type_args: c.type_args,
+                    descriptor: c.descriptor,
+                })
+                .collect();
+            let signatures: Vec<String> = candidates
+                .iter()
+                .map(|c| render_candidate(c.descriptor, c.type_args))
+                .collect();
+            let signatures = signatures.join(", ");
+            let candidates = std::sync::Arc::new(candidates);
+            let scan = std::sync::Arc::new(scan);
+            let lua_fn = lua.create_async_function(move |lua, args: mlua::MultiValue| {
+                let sv_args: mlua::Result<Vec<ScriptValue>> =
+                    args.into_vec().iter().map(lua_to_script).collect();
+                let candidates = candidates.clone();
+                let scan = scan.clone();
+                let signatures = signatures.clone();
+                async move {
+                    let script_args = sv_args?;
+                    let ranked =
+                        match haphe::dispatch::resolve_dyn_candidate(&script_args, &scan) {
+                            haphe::dispatch::Resolution::Ranked(i) => Some(i),
+                            haphe::dispatch::Resolution::TryCallOrder => None,
+                        };
+                    let mut last_err = None;
+                    if let Some(i) = ranked {
+                        match (candidates[i].wrapper)(&script_args).await {
+                            Ok(out) => return script_to_lua(&lua, out),
+                            Err(e) => last_err = Some(e),
+                        }
+                    }
+                    for (j, candidate) in candidates.iter().enumerate() {
+                        if Some(j) == ranked {
+                            continue;
+                        }
+                        match (candidate.wrapper)(&script_args).await {
+                            Ok(out) => return script_to_lua(&lua, out),
+                            Err(e) => last_err = Some(e),
+                        }
+                    }
+                    Err(mlua::Error::runtime(format!(
+                        "no dyn candidate of `{name}` accepts these arguments                          (candidates: {signatures}){}",
+                        last_err
+                            .map(|e| format!("; last error: {e}"))
+                            .unwrap_or_default()
+                    )))
+                }
+            })?;
+            table.set(name, lua_fn)?;
+        }
+        // Async free functions: the async block owns the converted argument
+        // vec; the wrapper's future borrows it across awaits.
+        #[cfg(all(feature = "async", not(feature = "send")))]
+        for (name, f) in self.async_functions {
+            let lua_fn = lua.create_async_function(move |lua, args: mlua::MultiValue| {
+                let sv_args: mlua::Result<Vec<ScriptValue>> =
+                    args.into_vec().iter().map(lua_to_script).collect();
+                async move {
+                    let sv_args = sv_args?;
+                    let out = f(&sv_args)
+                        .await
+                        .map_err(|e| mlua::Error::runtime(e.to_string()))?;
+                    script_to_lua(&lua, out)
+                }
             })?;
             table.set(name, lua_fn)?;
         }
@@ -1130,5 +1458,123 @@ impl FnBinder for LuaFnBinder {
         }
         self.functions.push((name, f));
         Ok(())
+    }
+
+    fn function_async(
+        &mut self,
+        name: &'static str,
+        type_args: &'static [haphe::TypeDescriptor<'static>],
+        f: for<'a> fn(&'a [ScriptValue]) -> haphe::ScriptCallFuture<'a>,
+    ) -> Result<(), Self::Error> {
+        if !type_args.is_empty() {
+            return Err(LuaBindError::GenericFunction { name });
+        }
+        #[cfg(not(feature = "async"))]
+        {
+            let _ = f;
+            Err(LuaBindError::UnsupportedAsyncFunction {
+                name,
+                reason: "enable this backend's `async` feature",
+            })
+        }
+        #[cfg(all(feature = "async", feature = "send"))]
+        {
+            let _ = f;
+            Err(LuaBindError::UnsupportedAsyncFunction {
+                name,
+                reason: "the `send` feature demands `Send` futures, and async function \
+                         futures are deliberately not Send",
+            })
+        }
+        #[cfg(all(feature = "async", not(feature = "send")))]
+        {
+            self.async_functions.push((name, f));
+            Ok(())
+        }
+    }
+
+    fn function_dyn(
+        &mut self,
+        descriptor: &'static haphe::FunctionDescriptor<'static>,
+        type_args: &'static [haphe::TypeDescriptor<'static>],
+        f: fn(&[ScriptValue]) -> Result<ScriptValue, haphe::ScriptConvertError>,
+    ) -> Result<(), Self::Error> {
+        #[cfg(not(feature = "generics"))]
+        {
+            let _ = (type_args, f);
+            Err(LuaBindError::UnsupportedDynFunction {
+                name: descriptor.name,
+                reason: "enable this backend's `generics` feature",
+            })
+        }
+        #[cfg(feature = "generics")]
+        {
+            let entry = DynFn {
+                descriptor,
+                type_args,
+                wrapper: f,
+            };
+            match self
+                .dyn_functions
+                .iter_mut()
+                .find(|(n, _)| *n == descriptor.name)
+            {
+                Some((_, list)) => list.push(entry),
+                None => self.dyn_functions.push((descriptor.name, vec![entry])),
+            }
+            Ok(())
+        }
+    }
+
+    fn function_dyn_async(
+        &mut self,
+        descriptor: &'static haphe::FunctionDescriptor<'static>,
+        type_args: &'static [haphe::TypeDescriptor<'static>],
+        f: for<'a> fn(&'a [ScriptValue]) -> haphe::ScriptCallFuture<'a>,
+    ) -> Result<(), Self::Error> {
+        #[cfg(not(feature = "generics"))]
+        {
+            let _ = (type_args, f);
+            Err(LuaBindError::UnsupportedDynFunction {
+                name: descriptor.name,
+                reason: "enable this backend's `generics` feature",
+            })
+        }
+        #[cfg(all(feature = "generics", not(feature = "async")))]
+        {
+            let _ = (type_args, f);
+            Err(LuaBindError::UnsupportedDynFunction {
+                name: descriptor.name,
+                reason: "enable this backend's `async` feature",
+            })
+        }
+        #[cfg(all(feature = "generics", feature = "async", feature = "send"))]
+        {
+            let _ = (type_args, f);
+            Err(LuaBindError::UnsupportedDynFunction {
+                name: descriptor.name,
+                reason: "the `send` feature demands `Send` futures, and async function \
+                         futures are deliberately not Send",
+            })
+        }
+        #[cfg(all(feature = "generics", feature = "async", not(feature = "send")))]
+        {
+            let entry = DynFn {
+                descriptor,
+                type_args,
+                wrapper: f,
+            };
+            match self
+                .dyn_async_functions
+                .iter_mut()
+                .find(|(n, _)| *n == descriptor.name)
+            {
+                Some((_, list)) => list.push(entry),
+                None => self
+                    .dyn_async_functions
+                    .push((descriptor.name, vec![entry])),
+            }
+            Ok(())
+        }
     }
 }

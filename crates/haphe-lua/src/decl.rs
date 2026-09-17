@@ -545,10 +545,24 @@ fn emit_module(
     }
 
     for function in module.functions {
-        // Registry-level instantiations don't lift this rejection: the Lua
-        // runtime cannot dispatch monomorphs by name, so stubs describing
-        // them would advertise callables that trap.
         if !function.generic_params.is_empty() {
+            // Dyn-dispatched generics ARE callable by bare name: one stub
+            // with the first instantiation's signature plus an `@overload`
+            // per additional instantiation. STATIC generics stay rejected —
+            // the Lua runtime cannot dispatch monomorphs by name, so stubs
+            // describing them would advertise callables that trap
+            // (registry-level instantiations don't lift that).
+            if function.dispatch == haphe::Dispatch::Dyn {
+                emit_dyn_function(
+                    out,
+                    registry,
+                    module,
+                    function,
+                    &format!("{path}."),
+                    &format!("{path}.{}", function.name),
+                )?;
+                continue;
+            }
             return Err(LuaDeclError::GenericFunction {
                 name: function.name.to_string(),
             });
@@ -628,6 +642,68 @@ fn emit_function(
     Ok(())
 }
 
+/// Emits a dyn generic function: the first instantiation's substituted
+/// signature, with one `---@overload` line per additional instantiation.
+fn emit_dyn_function(
+    out: &mut String,
+    registry: &ValidatedRegistry<'_>,
+    module: &haphe::ModuleDescriptor<'_>,
+    f: &FunctionDescriptor<'_>,
+    prefix: &str,
+    context: &str,
+) -> Result<(), LuaDeclError> {
+    let instantiations: Vec<&[TypeDescriptor<'_>]> = module.instantiations_of(f).collect();
+    let Some((first, rest)) = instantiations.split_first() else {
+        // Unreachable through the macro (dyn requires instantiate), but
+        // hand-written descriptors stay loud.
+        return Err(LuaDeclError::GenericFunction {
+            name: f.name.to_string(),
+        });
+    };
+    emit_doc(out, f.doc);
+    for args in rest {
+        let subst = haphe::dispatch::GenericSubst {
+            params: f.generic_params,
+            args,
+        };
+        let mut parts = Vec::new();
+        for p in f.params {
+            let ty = render_subst(registry, p.ty, context, Some(&subst))?;
+            parts.push(format!("{}: {ty}", p.name));
+        }
+        let ret = match f.return_type {
+            TypeDescriptor::Unit => String::new(),
+            ty => format!(": {}", render_subst(registry, ty, context, Some(&subst))?),
+        };
+        let _ = writeln!(out, "---@overload fun({}){ret}", parts.join(", "));
+    }
+    let subst = haphe::dispatch::GenericSubst {
+        params: f.generic_params,
+        args: first,
+    };
+    let mut names = Vec::new();
+    for p in f.params {
+        let ty = render_subst(registry, p.ty, context, Some(&subst))?;
+        let _ = writeln!(out, "---@param {} {ty}", p.name);
+        names.push(p.name);
+    }
+    match f.return_type {
+        TypeDescriptor::Unit => {}
+        ty => {
+            let ret = render_subst(registry, ty, context, Some(&subst))?;
+            let _ = writeln!(out, "---@return {ret}");
+        }
+    }
+    let _ = writeln!(
+        out,
+        "function {prefix}{}({}) end
+",
+        f.name,
+        names.join(", ")
+    );
+    Ok(())
+}
+
 /// Renders a descriptor as a LuaLS type, resolving `Ref`/`Instance` through
 /// the registry.
 fn render_type(
@@ -635,7 +711,42 @@ fn render_type(
     ty: &TypeDescriptor<'_>,
     context: &str,
 ) -> Result<String, LuaDeclError> {
-    render_impl(registry, ty, context)
+    render_subst(registry, ty, context, None)
+}
+
+/// Like [`render_type`], resolving `GenericParam` references through a dyn
+/// candidate's concrete type arguments.
+fn render_subst(
+    registry: &ValidatedRegistry<'_>,
+    ty: &TypeDescriptor<'_>,
+    context: &str,
+    subst: Option<&haphe::dispatch::GenericSubst<'_>>,
+) -> Result<String, LuaDeclError> {
+    if let TypeDescriptor::GenericParam(name) = ty
+        && let Some(sub) = subst
+        && let Some(i) = sub.params.iter().position(|p| p.name == *name)
+        && let Some(resolved) = sub.args.get(i)
+    {
+        return render_subst(registry, resolved, context, subst);
+    }
+    // Composite types containing GenericParam leaves resolve them the same
+    // way; plain rendering keeps `any` for unresolved parameters.
+    match ty {
+        TypeDescriptor::Option(inner) => Ok(format!(
+            "{}?",
+            render_subst(registry, inner, context, subst)?
+        )),
+        TypeDescriptor::List(inner) | TypeDescriptor::Array(inner, _) => Ok(format!(
+            "{}[]",
+            render_subst(registry, inner, context, subst)?
+        )),
+        TypeDescriptor::Map(k, v) => Ok(format!(
+            "table<{}, {}>",
+            render_subst(registry, k, context, subst)?,
+            render_subst(registry, v, context, subst)?
+        )),
+        _ => render_impl(registry, ty, context),
+    }
 }
 
 fn render_impl(

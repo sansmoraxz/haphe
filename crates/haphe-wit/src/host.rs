@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex, Weak};
 
 use haphe::{
     FromScript, IntoScript, OpaqueUserData, ScriptCallFuture, ScriptConvertError, ScriptCow,
-    ScriptIter, ScriptValue, TypeBinder, TypeDescriptor,
+    ScriptCtorFuture, ScriptIter, ScriptValue, TypeBinder, TypeDescriptor,
 };
 use wasmtime::component::ResourceAny;
 
@@ -80,6 +80,27 @@ impl HostTable {
 /// the handle (reuse errors descriptively); dropping the wrapper queues the
 /// handle on the owning caller's deferred-drop queue (drained on the next
 /// dispatch, or via the caller's explicit flush).
+/// `ScriptValue::UserData` payload for a HOST-owned resource: a rep in the
+/// binder's [`HostTable`]. Lowering into a guest call lazily mints ONE
+/// `own` handle over the rep (wasmtime borrows it in-call for borrow
+/// positions, so the payload stays reusable); an `own` position TRANSFERS
+/// the handle to the guest, whose eventual drop runs the registered
+/// destructor — reuse after transfer errors descriptively. If the payload
+/// is dropped un-transferred after minting, the handle (and table entry)
+/// lives until store teardown. Mint with `WasmBinder::host_resource`.
+pub struct HostResource {
+    pub(crate) state: std::sync::Mutex<HostResState>,
+}
+
+pub(crate) enum HostResState {
+    /// Table rep not yet minted into a store handle.
+    Unminted(u32),
+    /// A live `own` handle, reusable for borrow positions.
+    Minted(wasmtime::component::ResourceAny),
+    /// Ownership handed to the guest.
+    Transferred,
+}
+
 pub struct GuestResource {
     pub(crate) handle: Mutex<Option<ResourceAny>>,
     pub(crate) drops: Weak<Mutex<Vec<ResourceAny>>>,
@@ -111,6 +132,11 @@ type MutFn<U> = fn(&mut U, &[Sv]) -> Result<Sv, Sce>;
 type AsyncCowFn<U> = for<'a> fn(ScriptCow<'a, U>, &'a [Sv]) -> ScriptCallFuture<'a>;
 type AsyncMutFn<U> = for<'a> fn(&'a mut U, &'a [Sv]) -> ScriptCallFuture<'a>;
 type CtorFn<U> = fn(&[Sv]) -> Result<U, Sce>;
+type AsyncCtorFn<U> = for<'a> fn(&'a [Sv]) -> ScriptCtorFuture<'a, U>;
+type PropGetFn<U> = fn(&U) -> Sv;
+type PropSetFn<U> = fn(&mut U, Sv) -> Result<(), Sce>;
+type AsyncPropGetFn<U> = for<'a> fn(ScriptCow<'a, U>) -> ScriptCallFuture<'a>;
+type AsyncPropSetFn<U> = for<'a> fn(&'a mut U, Sv) -> ScriptCallFuture<'a>;
 type ScalarFn<U> = fn(U, &[Sv]) -> Result<U, Sce>;
 type IndexFn<U> = fn(&U, &[Sv]) -> Result<Sv, Sce>;
 type NewIndexFn<U> = fn(&mut U, &[Sv]) -> Result<(), Sce>;
@@ -122,6 +148,11 @@ type BinSelfEntry<U> = (&'static str, fn(U, U) -> U);
 pub(crate) struct RawTable<U> {
     pub fields: Vec<FieldEntry<U>>,
     pub ctors: Vec<(&'static str, CtorFn<U>)>,
+    pub ctors_async: Vec<(&'static str, AsyncCtorFn<U>)>,
+    pub props_get: Vec<(&'static str, PropGetFn<U>)>,
+    pub props_set: Vec<(&'static str, PropSetFn<U>)>,
+    pub props_get_async: Vec<(&'static str, AsyncPropGetFn<U>)>,
+    pub props_set_async: Vec<(&'static str, AsyncPropSetFn<U>)>,
     pub methods_cow: Vec<(&'static str, CowFn<U>)>,
     pub methods_mut: Vec<(&'static str, MutFn<U>)>,
     pub methods_async: Vec<(&'static str, AsyncCowFn<U>)>,
@@ -150,6 +181,11 @@ impl<U> Default for RawTable<U> {
         Self {
             fields: Vec::new(),
             ctors: Vec::new(),
+            ctors_async: Vec::new(),
+            props_get: Vec::new(),
+            props_set: Vec::new(),
+            props_get_async: Vec::new(),
+            props_set_async: Vec::new(),
             methods_cow: Vec::new(),
             methods_mut: Vec::new(),
             methods_async: Vec::new(),
@@ -218,6 +254,43 @@ impl<U: 'static> TypeBinder<U> for RawTable<U> {
 
     fn constructor(&mut self, name: &'static str, f: CtorFn<U>) -> Result<(), Infallible> {
         self.ctors.push((name, f));
+        Ok(())
+    }
+
+    fn constructor_async(
+        &mut self,
+        name: &'static str,
+        f: AsyncCtorFn<U>,
+    ) -> Result<(), Infallible> {
+        self.ctors_async.push((name, f));
+        Ok(())
+    }
+
+    fn property_get(&mut self, name: &'static str, f: PropGetFn<U>) -> Result<(), Infallible> {
+        self.props_get.push((name, f));
+        Ok(())
+    }
+
+    fn property_set(&mut self, name: &'static str, f: PropSetFn<U>) -> Result<(), Infallible> {
+        self.props_set.push((name, f));
+        Ok(())
+    }
+
+    fn property_get_async(
+        &mut self,
+        name: &'static str,
+        f: AsyncPropGetFn<U>,
+    ) -> Result<(), Infallible> {
+        self.props_get_async.push((name, f));
+        Ok(())
+    }
+
+    fn property_set_async(
+        &mut self,
+        name: &'static str,
+        f: AsyncPropSetFn<U>,
+    ) -> Result<(), Infallible> {
+        self.props_set_async.push((name, f));
         Ok(())
     }
 
@@ -337,6 +410,22 @@ type EScalar = Box<dyn Fn(AnyBox, &[Sv]) -> Result<AnyBox, Sce> + Send + Sync>;
 type EIndex = Box<dyn Fn(&(dyn Any + Send), &[Sv]) -> Result<Sv, Sce> + Send + Sync>;
 type ENewIndex = Box<dyn Fn(&mut (dyn Any + Send), &[Sv]) -> Result<(), Sce> + Send + Sync>;
 
+type EAsyncGet = Box<dyn for<'a> Fn(CowAny<'a>) -> ScriptCallFuture<'a> + Send + Sync>;
+type EAsyncSet =
+    Box<dyn for<'a> Fn(&'a mut (dyn Any + Send), Sv) -> ScriptCallFuture<'a> + Send + Sync>;
+type EAsyncCtorFut<'a> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<AnyBox, Sce>> + 'a>>;
+type EAsyncCtor = Box<dyn for<'a> Fn(&'a [Sv]) -> EAsyncCtorFut<'a> + Send + Sync>;
+
+/// Erased computed-property accessors: any mix of sync and async halves.
+#[derive(Default)]
+pub(crate) struct EProp {
+    pub get: Option<EGet>,
+    pub set: Option<ESet>,
+    pub get_async: Option<EAsyncGet>,
+    pub set_async: Option<EAsyncSet>,
+}
+
 pub(crate) enum EMethod {
     Cow(ECow),
     Mut(EMut),
@@ -377,7 +466,9 @@ fn default_metas() -> EMetas {
 pub(crate) struct ResourceEntry {
     pub type_name: &'static str,
     pub fields: HashMap<&'static str, EField>,
+    pub props: HashMap<&'static str, EProp>,
     pub ctors: HashMap<&'static str, ECtor>,
+    pub ctors_async: HashMap<&'static str, EAsyncCtor>,
     pub methods: HashMap<&'static str, EMethod>,
     pub metas: EMetas,
     /// Clones the live value into a fresh [`AnyBox`].
@@ -438,6 +529,32 @@ where
     let mut ctors: HashMap<&'static str, ECtor> = HashMap::new();
     for (name, f) in raw.ctors {
         ctors.insert(name, Box::new(move |args| Ok(Box::new(f(args)?) as AnyBox)));
+    }
+
+    let mut ctors_async: HashMap<&'static str, EAsyncCtor> = HashMap::new();
+    for (name, f) in raw.ctors_async {
+        ctors_async.insert(
+            name,
+            Box::new(move |args| {
+                Box::pin(async move { Ok(Box::new(f(args).await?) as AnyBox) }) as EAsyncCtorFut<'_>
+            }),
+        );
+    }
+
+    let mut props: HashMap<&'static str, EProp> = HashMap::new();
+    for (name, f) in raw.props_get {
+        props.entry(name).or_default().get = Some(Box::new(move |any| Ok(f(expect_u::<U>(any)))));
+    }
+    for (name, f) in raw.props_set {
+        props.entry(name).or_default().set =
+            Some(Box::new(move |any, v| f(expect_u_mut::<U>(any), v)));
+    }
+    for (name, f) in raw.props_get_async {
+        props.entry(name).or_default().get_async = Some(Box::new(move |recv| f(cow_of::<U>(recv))));
+    }
+    for (name, f) in raw.props_set_async {
+        props.entry(name).or_default().set_async =
+            Some(Box::new(move |any, v| f(expect_u_mut::<U>(any), v)));
     }
 
     let mut methods: HashMap<&'static str, EMethod> = HashMap::new();
@@ -529,7 +646,9 @@ where
     ResourceEntry {
         type_name,
         fields,
+        props,
         ctors,
+        ctors_async,
         methods,
         metas,
         clone_any: Box::new(|any| Box::new(expect_u::<U>(any).clone()) as AnyBox),
@@ -572,6 +691,11 @@ fn from_sv<U: FromScript>(v: &Sv) -> Result<U, Sce> {
 /// Erases a collected [`RawTable`] into a [`ValueEntry`]. The receiver is
 /// rebuilt from its lowered `ScriptValue` per call; mutating projections
 /// return the updated value.
+///
+/// Property and constructor channels (sync or async) are ignored here by
+/// construction: a struct with any of them classifies as a RESOURCE, and
+/// enums reject constructors/properties at derive time — so a value-erased
+/// type can never carry them.
 pub(crate) fn erase_value<U>(raw: RawTable<U>) -> ValueEntry
 where
     U: FromScript + IntoScript + Clone + Send + 'static,

@@ -70,6 +70,7 @@ static EXPECTED_METHODS: &[FunctionDescriptor<'static>] = &[
         receiver: Some(Receiver::Ref),
         generic_params: &[],
         instantiations: &[],
+        dispatch: haphe::Dispatch::Static,
         params: &[ParamDescriptor {
             name: "other",
             ty: &POINT_REF,
@@ -86,6 +87,7 @@ static EXPECTED_METHODS: &[FunctionDescriptor<'static>] = &[
         receiver: Some(Receiver::Owned),
         generic_params: &[],
         instantiations: &[],
+        dispatch: haphe::Dispatch::Static,
         params: &[ParamDescriptor {
             name: "factor",
             ty: &F64,
@@ -102,6 +104,7 @@ static EXPECTED_METHODS: &[FunctionDescriptor<'static>] = &[
         receiver: Some(Receiver::Ref),
         generic_params: &[],
         instantiations: &[],
+        dispatch: haphe::Dispatch::Static,
         params: &[],
         return_type: &TypeDescriptor::Result(&TypeDescriptor::String, &TypeDescriptor::String),
         return_ownership: Ownership::Owned,
@@ -116,6 +119,7 @@ static EXPECTED_CONSTRUCTORS: &[FunctionDescriptor<'static>] = &[FunctionDescrip
     receiver: None,
     generic_params: &[],
     instantiations: &[],
+    dispatch: haphe::Dispatch::Static,
     params: &[
         ParamDescriptor {
             name: "x",

@@ -143,6 +143,27 @@ pub fn derive_script(input: TokenStream) -> TokenStream {
 /// Whether a backend accepts generic functions is governed by its generics
 /// capability.
 ///
+/// ## Dynamic dispatch
+///
+/// Adding `dyn` switches the generic to dynamic dispatch: the backend scans
+/// the declared instantiations at call time and picks the candidate whose
+/// type arguments match the incoming values (exact matches first, then
+/// coercible, declaration order breaking ties; a rejected conversion falls
+/// through to the remaining candidates). On a single-parameter generic,
+/// bare `dyn` auto-instantiates the default bridgeable candidate set — in
+/// dispatch-priority order: `i64`, `f64`, `bool`, `String`, `char` — and
+/// the function's bounds must hold for all of them; declare explicit
+/// `instantiate(...)` to narrow or extend (it fully replaces the default).
+/// Multi-parameter generics always declare explicitly. Availability is
+/// governed by the backend's `dyn_generics` capability.
+///
+/// ```
+/// use haphe::script;
+///
+/// #[script(dyn)]
+/// fn mirror<T: haphe::FromScript + haphe::IntoScript>(value: T) -> T { value }
+/// ```
+///
 /// # Foreign traits
 ///
 /// `#[script(foreign)]` on a trait declares functions Rust calls *out* to,

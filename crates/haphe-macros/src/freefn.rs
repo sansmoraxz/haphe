@@ -15,8 +15,28 @@ use crate::ty_map::TyCtx;
 
 pub fn expand(mut item: ItemFn) -> TokenStream {
     let mut errors = Errors::default();
-    let fn_args = parse_fn_args(&item.attrs, &mut errors, "a free function");
+    let mut fn_args = parse_fn_args(&item.attrs, &mut errors, "a free function");
     strip_script_attrs(&mut item.attrs);
+
+    // Bare `dyn` on a single-parameter generic auto-instantiates the default
+    // bridgeable candidate set (documented order — it is also the dispatch
+    // tiebreak order). Explicit `instantiate(...)` overrides it entirely;
+    // multi-parameter generics must declare explicitly (no Cartesian
+    // default).
+    if let Some(span) = fn_args.dyn_dispatch
+        && fn_args.instantiate.is_empty()
+        && item.sig.generics.type_params().count() == 1
+    {
+        for ty in [
+            syn::parse_quote!(i64),
+            syn::parse_quote!(f64),
+            syn::parse_quote!(bool),
+            syn::parse_quote!(String),
+            syn::parse_quote!(char),
+        ] {
+            fn_args.instantiate.push((vec![ty], span));
+        }
+    }
 
     for (flag, span) in [
         ("skip", fn_args.skip),
@@ -179,13 +199,51 @@ pub fn expand(mut item: ItemFn) -> TokenStream {
         }
     };
 
+    let make_async_wrapper = |subst: &std::collections::HashMap<String, Type>| -> TokenStream {
+        let conversions: Vec<TokenStream> = param_info
+            .iter()
+            .enumerate()
+            .map(|(i, (name, ty))| {
+                let ty = substitute_type_params(ty, subst);
+                quote! {
+                    let #name = <#ty as ::haphe::FromScript>::from_script(
+                        __args.get(#i).cloned().unwrap_or(::haphe::ScriptValue::Unit)
+                    )?;
+                }
+            })
+            .collect();
+        let turbofish = if subst.is_empty() {
+            TokenStream::new()
+        } else {
+            let args: Vec<&Type> = type_params
+                .iter()
+                .map(|p| subst.get(&p.to_string()).expect("all params substituted"))
+                .collect();
+            quote! { ::<#(#args),*> }
+        };
+        let return_conversion = if info.return_ty.is_some() {
+            quote! { ::haphe::IntoScript::into_script(#fn_ident #turbofish (#(#call_args),*).await) }
+        } else {
+            quote! { { #fn_ident #turbofish (#(#call_args),*).await; ::haphe::ScriptValue::Unit } }
+        };
+        quote! {
+            (|__args: &[::haphe::ScriptValue]| -> ::haphe::ScriptCallFuture<'_> {
+                ::std::boxed::Box::pin(async move {
+                    #(#conversions)*
+                    ::core::result::Result::Ok(#return_conversion)
+                })
+            }) as for<'a> fn(&'a [::haphe::ScriptValue]) -> ::haphe::ScriptCallFuture<'a>
+        }
+    };
+
     let compatible = |subst: &std::collections::HashMap<String, Type>| -> bool {
-        param_info.iter().all(|(_, ty)| {
-            crate::bind::is_bridge_compatible_type(&substitute_type_params(ty, subst))
-        }) && info.return_ty.as_ref().is_none_or(|t| {
-            let t = substitute_type_params(t, subst);
-            !matches!(t, Type::Reference(_)) && crate::bind::is_bridge_compatible_type(&t)
-        })
+        param_info
+            .iter()
+            .all(|(_, ty)| crate::bind::is_bridge_value_type(&substitute_type_params(ty, subst)))
+            && info.return_ty.as_ref().is_none_or(|t| {
+                let t = substitute_type_params(t, subst);
+                !matches!(t, Type::Reference(_)) && crate::bind::is_bridge_value_type(&t)
+            })
     };
 
     let empty_subst = std::collections::HashMap::new();
@@ -201,7 +259,10 @@ pub fn expand(mut item: ItemFn) -> TokenStream {
                     .collect()
             })
             .collect();
-        let can = !info.is_async
+        let is_dyn = fn_args.dyn_dispatch.is_some();
+        // Async generics bind only in dyn mode (static async generics have
+        // no async monomorph channel yet).
+        let can = (!info.is_async || is_dyn)
             && cfgs.is_empty()
             && !substs.is_empty()
             && substs.iter().all(&compatible);
@@ -210,13 +271,34 @@ pub fn expand(mut item: ItemFn) -> TokenStream {
             .iter()
             .zip(&substs)
             .map(|((types, span), subst)| {
-                let wrapper = make_wrapper(subst);
-                quote_spanned! {*span=>
-                    __binder.function(
-                        #exposed_name,
-                        &[#( <#types as ::haphe::HapheType>::DESCRIPTOR ),*],
-                        #wrapper,
-                    )?;
+                let type_args = quote! { &[#( <#types as ::haphe::HapheType>::DESCRIPTOR ),*] };
+                if is_dyn && info.is_async {
+                    let wrapper = make_async_wrapper(subst);
+                    quote_spanned! {*span=>
+                        __binder.function_dyn_async(
+                            &<#ident as ::haphe::ScriptFunction>::DESCRIPTOR,
+                            #type_args,
+                            #wrapper,
+                        )?;
+                    }
+                } else if is_dyn {
+                    let wrapper = make_wrapper(subst);
+                    quote_spanned! {*span=>
+                        __binder.function_dyn(
+                            &<#ident as ::haphe::ScriptFunction>::DESCRIPTOR,
+                            #type_args,
+                            #wrapper,
+                        )?;
+                    }
+                } else {
+                    let wrapper = make_wrapper(subst);
+                    quote_spanned! {*span=>
+                        __binder.function(
+                            #exposed_name,
+                            #type_args,
+                            #wrapper,
+                        )?;
+                    }
                 }
             })
             .collect();
@@ -235,8 +317,39 @@ pub fn expand(mut item: ItemFn) -> TokenStream {
                     && (crate::bind::is_bridge_compatible_type(t)
                         || crate::bind::is_dispatchable_path(t))
             });
-        let can = !info.is_async && cfgs.is_empty() && (whitelisted || dispatch_eligible);
-        let body = if whitelisted {
+        let can = cfgs.is_empty() && (whitelisted || (!info.is_async && dispatch_eligible));
+        let body = if info.is_async && whitelisted {
+            // Async free functions register through the async channel; the
+            // boxed future borrows the argument slice.
+            let conversions: Vec<TokenStream> = param_info
+                .iter()
+                .enumerate()
+                .map(|(i, (name, ty))| {
+                    quote! {
+                        let #name = <#ty as ::haphe::FromScript>::from_script(
+                            __args.get(#i).cloned().unwrap_or(::haphe::ScriptValue::Unit)
+                        )?;
+                    }
+                })
+                .collect();
+            let return_conversion = if info.return_ty.is_some() {
+                quote! { ::haphe::IntoScript::into_script(#fn_ident(#(#call_args),*).await) }
+            } else {
+                quote! { { #fn_ident(#(#call_args),*).await; ::haphe::ScriptValue::Unit } }
+            };
+            quote! {
+                __binder.function_async(
+                    #exposed_name,
+                    &[],
+                    (|__args: &[::haphe::ScriptValue]| -> ::haphe::ScriptCallFuture<'_> {
+                        ::std::boxed::Box::pin(async move {
+                            #(#conversions)*
+                            ::core::result::Result::Ok(#return_conversion)
+                        })
+                    }) as for<'a> fn(&'a [::haphe::ScriptValue]) -> ::haphe::ScriptCallFuture<'a>,
+                )
+            }
+        } else if whitelisted {
             let wrapper = make_wrapper(&empty_subst);
             quote! { __binder.function(#exposed_name, &[], #wrapper) }
         } else {

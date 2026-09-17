@@ -31,8 +31,9 @@ mod types;
 pub use host::GuestResource;
 #[cfg(feature = "runtime")]
 pub use runtime::{
-    WasmBindError, WasmBinder, foreign_caller, foreign_caller_async, foreign_caller_in,
-    foreign_handle, foreign_handle_async, foreign_handle_in,
+    WasmBindError, WasmBinder, foreign_caller, foreign_caller_async, foreign_caller_async_in,
+    foreign_caller_in, foreign_handle, foreign_handle_async, foreign_handle_async_in,
+    foreign_handle_in,
 };
 
 use std::fmt;
@@ -278,8 +279,15 @@ impl BindingGenerator for WitGenerator {
     }
 
     fn capabilities(&self) -> BackendCapabilities {
+        // `dyn_generics: false` — WIT guests always name a monomorph
+        // statically, so bare dyn dispatch is meaningless here. A future
+        // `dyn-generics` cargo feature may inject a synthesized dispatcher
+        // (see the README's dyn-generics section) and flip this on when
+        // compiled in. The runtime binder inherits this via delegation, so
+        // both capability sites report false.
         BackendCapabilities::ALL
             .with_callbacks(false)
+            .with_dyn_generics(false)
             .with_properties(true)
             .with_type_aliases(true)
             .with_required_thread_safety(None)

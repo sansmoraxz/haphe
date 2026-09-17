@@ -176,17 +176,36 @@ pub fn gen_derive_bind(
 /// Generates the `__BindMethods` trait impl for the type.
 /// Called from `#[script] impl` — the derive emitted the trait definition
 /// and the `impl ScriptBind` that calls it.
-pub fn gen_impl_bind_methods(
-    ident: &Ident,
-    self_ty: &Type,
-    methods: &[BindMethod],
-    async_methods: &[BindMethod],
-    dispatch_methods: &[BindMethod],
-    constructors: &[BindMethod],
-    generics: &Generics,
-) -> TokenStream {
+/// Everything `gen_impl_bind_methods` renders into `__bind_methods`.
+pub struct BindImplInput<'a> {
+    pub ident: &'a Ident,
+    pub self_ty: &'a Type,
+    pub methods: &'a [BindMethod],
+    pub async_methods: &'a [BindMethod],
+    pub dispatch_methods: &'a [BindMethod],
+    pub constructors: &'a [BindMethod],
+    pub async_constructors: &'a [BindMethod],
+    pub property_regs: &'a [TokenStream],
+    pub generics: &'a Generics,
+}
+
+pub fn gen_impl_bind_methods(input: BindImplInput<'_>) -> TokenStream {
+    let BindImplInput {
+        ident,
+        self_ty,
+        methods,
+        async_methods,
+        dispatch_methods,
+        constructors,
+        async_constructors,
+        property_regs,
+        generics,
+    } = input;
     let mod_ident = hidden_mod_ident(ident);
     let method_regs = methods.iter().map(|m| gen_method_registration(self_ty, m));
+    let async_ctor_regs = async_constructors
+        .iter()
+        .map(|c| gen_async_constructor_registration(self_ty, c));
     let async_regs = async_methods
         .iter()
         .map(|m| gen_async_method_registration(self_ty, m));
@@ -214,6 +233,8 @@ pub fn gen_impl_bind_methods(
                 __b: &mut __B,
             ) -> ::core::result::Result<(), __B::Error> {
                 #(#ctor_regs)*
+                #(#async_ctor_regs)*
+                #(#property_regs)*
                 #(#method_regs)*
                 #(#async_regs)*
                 #(#dispatch_regs)*
@@ -293,6 +314,46 @@ fn needs_bridge_dispatch(ty: &Type, generic_params: &[String]) -> bool {
     }
     // Fields must be owned; references never dispatch.
     !is_reference(ty) && is_dispatchable_path(ty)
+}
+
+/// A type whose VALUES cross the bridge: a bridge primitive, or a standard
+/// container (`Vec`, `Option`, `HashMap<String, _>`, tuples) of such types —
+/// mirroring the blanket `FromScript`/`IntoScript` impls. Used to gate free
+/// function wrapper emission (methods keep the narrower primitive whitelist
+/// plus trait-presence dispatch).
+pub fn is_bridge_value_type(ty: &Type) -> bool {
+    if is_bridge_compatible_type(ty) {
+        return true;
+    }
+    match ty {
+        Type::Tuple(tuple) => tuple.elems.iter().all(is_bridge_value_type),
+        Type::Path(p) => {
+            let Some(last) = p.path.segments.last() else {
+                return false;
+            };
+            let syn::PathArguments::AngleBracketed(args) = &last.arguments else {
+                return false;
+            };
+            let type_args: Vec<&Type> = args
+                .args
+                .iter()
+                .filter_map(|a| match a {
+                    syn::GenericArgument::Type(t) => Some(t),
+                    _ => None,
+                })
+                .collect();
+            match last.ident.to_string().as_str() {
+                "Vec" | "Option" => type_args.len() == 1 && is_bridge_value_type(type_args[0]),
+                "HashMap" => {
+                    type_args.len() == 2
+                        && matches!(type_args[0], Type::Path(k) if k.path.is_ident("String"))
+                        && is_bridge_value_type(type_args[1])
+                }
+                _ => false,
+            }
+        }
+        _ => false,
+    }
 }
 
 /// An owned bare single-ident path type (or one behind a single reference)
@@ -963,6 +1024,111 @@ fn gen_async_method_registration(self_ty: &Type, method: &BindMethod) -> TokenSt
                     ::core::result::Result::Ok(#result_expr)
                 })
             }) as for<'a> fn(::haphe::ScriptCow<'a, #self_ty>, &'a [::haphe::ScriptValue]) -> ::haphe::ScriptCallFuture<'a>,
+        )?;
+    }
+}
+
+/// Registration for a computed property: sync accessors go through
+/// `property_get`/`property_set`; async ones through the ScriptCow /
+/// borrowed-mutable future channels (`property_get_async` /
+/// `property_set_async`), mirroring the async-method receiver rules.
+pub fn gen_property_registration(
+    self_ty: &Type,
+    name: &str,
+    get_ident: Ident,
+    get_async: bool,
+    get_ret: &Type,
+    setter: Option<(Ident, bool, Type)>,
+) -> TokenStream {
+    // Reference-returning getters (`&str`, `&f64`) convert through ToOwned.
+    let get_value = if is_reference(get_ret) {
+        quote! { ::std::borrow::ToOwned::to_owned(__t.#get_ident()) }
+    } else {
+        quote! { __t.#get_ident() }
+    };
+    let get_value_async = if is_reference(get_ret) {
+        quote! { ::std::borrow::ToOwned::to_owned(__t.#get_ident().await) }
+    } else {
+        quote! { __t.#get_ident().await }
+    };
+    let get_reg = if get_async {
+        quote! {
+            __b.property_get_async(
+                #name,
+                (|__recv: ::haphe::ScriptCow<'_, #self_ty>| -> ::haphe::ScriptCallFuture<'_> {
+                    ::std::boxed::Box::pin(async move {
+                        let __t: &#self_ty = &__recv;
+                        ::core::result::Result::Ok(::haphe::IntoScript::into_script(
+                            #get_value_async,
+                        ))
+                    })
+                }) as for<'a> fn(::haphe::ScriptCow<'a, #self_ty>) -> ::haphe::ScriptCallFuture<'a>,
+            )?;
+        }
+    } else {
+        quote! {
+            __b.property_get(
+                #name,
+                (|__t: &#self_ty| ::haphe::IntoScript::into_script(#get_value))
+                    as fn(&#self_ty) -> ::haphe::ScriptValue,
+            )?;
+        }
+    };
+    let set_reg = match setter {
+        None => TokenStream::new(),
+        Some((set_ident, set_async, param_ty)) => {
+            let stripped = strip_ref(&param_ty);
+            let arg = if is_reference(&param_ty) {
+                quote! { &__v }
+            } else {
+                quote! { __v }
+            };
+            if set_async {
+                quote! {
+                    __b.property_set_async(
+                        #name,
+                        (|__t: &mut #self_ty, __value: ::haphe::ScriptValue| -> ::haphe::ScriptCallFuture<'_> {
+                            ::std::boxed::Box::pin(async move {
+                                let __v = <#stripped as ::haphe::FromScript>::from_script(__value)?;
+                                __t.#set_ident(#arg).await;
+                                ::core::result::Result::Ok(::haphe::ScriptValue::Unit)
+                            })
+                        }) as for<'a> fn(&'a mut #self_ty, ::haphe::ScriptValue) -> ::haphe::ScriptCallFuture<'a>,
+                    )?;
+                }
+            } else {
+                quote! {
+                    __b.property_set(
+                        #name,
+                        (|__t: &mut #self_ty, __value: ::haphe::ScriptValue| -> ::core::result::Result<(), ::haphe::ScriptConvertError> {
+                            let __v = <#stripped as ::haphe::FromScript>::from_script(__value)?;
+                            __t.#set_ident(#arg);
+                            ::core::result::Result::Ok(())
+                        }) as fn(&mut #self_ty, ::haphe::ScriptValue) -> ::core::result::Result<(), ::haphe::ScriptConvertError>,
+                    )?;
+                }
+            }
+        }
+    };
+    quote! { #get_reg #set_reg }
+}
+
+/// Registration for an `async` constructor: the boxed future borrows the
+/// argument slice and resolves to the constructed value.
+fn gen_async_constructor_registration(self_ty: &Type, ctor: &BindMethod) -> TokenStream {
+    let name = &ctor.name;
+    let ident = &ctor.ident;
+    let extractions = gen_param_extractions(&ctor.params);
+    let call_args = gen_call_args(&ctor.params);
+    quote! {
+        __b.constructor_async(
+            #name,
+            (|__args: &[::haphe::ScriptValue]| -> ::haphe::ScriptCtorFuture<'_, #self_ty> {
+                ::std::boxed::Box::pin(async move {
+                    #(#extractions)*
+                    ::core::result::Result::Ok(<#self_ty>::#ident(#(#call_args),*).await)
+                })
+            }) as for<'a> fn(&'a [::haphe::ScriptValue]) -> ::haphe::ScriptCtorFuture<'a, #self_ty>,
         )?;
     }
 }

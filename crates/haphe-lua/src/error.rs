@@ -77,6 +77,27 @@ pub enum LuaBindError {
         /// What is missing or conflicting.
         reason: &'static str,
     },
+    /// An async free function cannot be registered in this configuration.
+    /// An async computed property was declared, but mlua exposes no async
+    /// field accessors — declare an async method for awaited access.
+    UnsupportedAsyncProperty { name: &'static str },
+    /// A computed property shares a name with a plain field; the later
+    /// registration would silently shadow the earlier one.
+    DuplicateField { name: &'static str },
+    UnsupportedAsyncFunction {
+        /// The function's exposed name.
+        name: &'static str,
+        /// What is missing or conflicting.
+        reason: &'static str,
+    },
+    /// A `dyn`-dispatched generic function cannot be bound in this
+    /// configuration.
+    UnsupportedDynFunction {
+        /// The function's exposed name.
+        name: &'static str,
+        /// What is missing or conflicting.
+        reason: &'static str,
+    },
 }
 
 impl std::fmt::Display for LuaBindError {
@@ -148,6 +169,32 @@ impl std::fmt::Display for LuaBindError {
                     "async method `{name}` cannot be bound in this configuration: {reason}"
                 )
             }
+            Self::UnsupportedAsyncFunction { name, reason } => {
+                write!(
+                    f,
+                    "async function `{name}` cannot be bound in this configuration: {reason}"
+                )
+            }
+            Self::UnsupportedDynFunction { name, reason } => {
+                write!(
+                    f,
+                    "dyn function `{name}` cannot be bound in this configuration: {reason}"
+                )
+            }
+            Self::UnsupportedAsyncProperty { name } => {
+                write!(
+                    f,
+                    "async property `{name}` cannot be bound: mlua exposes no async field \
+                     accessors; declare an async method for awaited access"
+                )
+            }
+            Self::DuplicateField { name } => {
+                write!(
+                    f,
+                    "field `{name}` is registered more than once (a computed property shares \
+                     a name with a plain field)"
+                )
+            }
             Self::AmbiguousCall => {
                 write!(
                     f,
@@ -178,11 +225,15 @@ impl std::error::Error for LuaBindError {
             Self::GenericForeignInterface { .. } => None,
             Self::ReservedMethod { .. } => None,
             Self::DuplicateConstructor { .. } => None,
+            Self::UnsupportedAsyncProperty { .. } => None,
+            Self::DuplicateField { .. } => None,
             Self::DuplicateEnumCase { .. } => None,
             Self::UnsupportedOperator { .. } => None,
             Self::UnsupportedAsyncCall { .. } => None,
             Self::AmbiguousCall => None,
             Self::UnsupportedAsyncMethod { .. } => None,
+            Self::UnsupportedAsyncFunction { .. } => None,
+            Self::UnsupportedDynFunction { .. } => None,
         }
     }
 }

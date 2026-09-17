@@ -65,6 +65,11 @@ pub struct BackendCapabilities {
     pub futures: bool,
     /// Supports generic type parameters on struct/enum descriptors.
     pub generics: bool,
+    /// Supports `dyn`-dispatched generic functions: an OPT-IN capability a
+    /// backend satisfies natively (a dynamically-typed runtime) or by
+    /// injecting synthesized dispatch machinery behind a feature flag —
+    /// report `true` only when that machinery is compiled in.
+    pub dyn_generics: bool,
     /// Supports computed properties on struct descriptors.
     pub properties: bool,
     /// Supports `TypeAliasDescriptor` entries in the registry.
@@ -84,6 +89,7 @@ impl BackendCapabilities {
         streams: true,
         futures: true,
         generics: true,
+        dyn_generics: true,
         properties: true,
         type_aliases: true,
         foreign_fns: true,
@@ -117,6 +123,12 @@ impl BackendCapabilities {
     /// Sets whether generic type parameters are supported.
     pub const fn with_generics(mut self, v: bool) -> Self {
         self.generics = v;
+        self
+    }
+
+    /// Sets whether `dyn`-dispatched generic functions are supported.
+    pub const fn with_dyn_generics(mut self, v: bool) -> Self {
+        self.dyn_generics = v;
         self
     }
 
@@ -352,6 +364,12 @@ impl BackendCapabilities {
                 });
             }
             if !function.generic_params.is_empty() {
+                if matches!(function.dispatch, crate::function::Dispatch::Dyn) && !self.dyn_generics
+                {
+                    errors.push(CompatibilityError::DynGenericsUnsupported {
+                        function: function.name,
+                    });
+                }
                 if !self.generics {
                     errors.push(CompatibilityError::UnsupportedModuleGenerics {
                         module: module.name,
@@ -648,6 +666,9 @@ fn meets_thread_safety(actual: &ThreadSafety, required: &ThreadSafety) -> bool {
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub enum CompatibilityError<'a> {
+    /// A `dyn`-dispatched generic function in a backend without dynamic
+    /// dispatch machinery.
+    DynGenericsUnsupported { function: &'a str },
     /// An async function in a backend that doesn't support async.
     UnsupportedAsync {
         type_id: TypeId<'a>,
@@ -709,6 +730,11 @@ pub enum CompatibilityError<'a> {
 impl std::fmt::Display for CompatibilityError<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::DynGenericsUnsupported { function } => write!(
+                f,
+                "function `{function}` declares dyn dispatch, but this backend has no dynamic \
+                 dispatch machinery (natively or via its feature flags)"
+            ),
             Self::UnsupportedAsync { type_id, fn_name } => {
                 write!(
                     f,

@@ -281,6 +281,21 @@ pub fn build_fn_info(
     };
     let is_async = sig.asyncness.is_some();
     let receiver_tokens = receiver.tokens();
+    let dispatch_expr = if let Some(span) = fn_args.dyn_dispatch {
+        if gp_exprs.is_empty() {
+            errors.spanned(span, "`dyn` requires generic parameters");
+        }
+        if fn_args.instantiate.is_empty() {
+            errors.spanned(
+                span,
+                "`dyn` here needs explicit `instantiate(...)` declarations: the default \
+                 candidate set applies only to single-parameter generic free functions",
+            );
+        }
+        quote! { ::haphe::Dispatch::Dyn }
+    } else {
+        quote! { ::haphe::Dispatch::Static }
+    };
 
     let descriptor = quote! {
         ::haphe::FunctionDescriptor {
@@ -289,6 +304,7 @@ pub fn build_fn_info(
             receiver: #receiver_tokens,
             generic_params: &[#(#gp_exprs),*],
             instantiations: &[#(#inst_exprs),*],
+            dispatch: #dispatch_expr,
             params: &[#(#param_exprs),*],
             return_type: #return_expr,
             return_ownership: #return_ownership,

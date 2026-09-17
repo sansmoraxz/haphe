@@ -53,6 +53,7 @@ static EXPECTED_ADD: FunctionDescriptor<'static> = FunctionDescriptor {
     receiver: None,
     generic_params: &[],
     instantiations: &[],
+    dispatch: haphe::Dispatch::Static,
     params: &[
         ParamDescriptor {
             name: "a",
@@ -115,4 +116,235 @@ fn lifetimes_are_erased() {
 fn raw_identifiers_are_unrawed() {
     assert_eq!(<r#loop as ScriptFunction>::DESCRIPTOR.name, "loop");
     assert_eq!(r#loop(7), 7);
+}
+
+// Async free functions register through `FnBinder::function_async` and the
+// boxed future borrows the argument slice.
+#[haphe::script]
+async fn delayed_sum(a: i64, b: i64) -> i64 {
+    a + b
+}
+
+#[test]
+fn async_free_fn_binds_and_awaits() {
+    use haphe::{FnBinder, ScriptBindFn, ScriptCallFuture, ScriptValue, TypeDescriptor};
+    use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+
+    type AsyncWrapper = for<'a> fn(&'a [ScriptValue]) -> ScriptCallFuture<'a>;
+    #[derive(Default)]
+    struct CollectAsync(Vec<(&'static str, AsyncWrapper)>);
+    impl FnBinder for CollectAsync {
+        type Error = std::convert::Infallible;
+        fn function(
+            &mut self,
+            _: &'static str,
+            _: &'static [TypeDescriptor<'static>],
+            _: fn(&[ScriptValue]) -> Result<ScriptValue, haphe::ScriptConvertError>,
+        ) -> Result<(), Self::Error> {
+            Ok(())
+        }
+        fn function_async(
+            &mut self,
+            name: &'static str,
+            _: &'static [TypeDescriptor<'static>],
+            f: AsyncWrapper,
+        ) -> Result<(), Self::Error> {
+            self.0.push((name, f));
+            Ok(())
+        }
+    }
+
+    let mut binder = CollectAsync::default();
+    <delayed_sum as ScriptBindFn>::bind(&mut binder).unwrap();
+    let (name, f) = binder.0[0];
+    assert_eq!(name, "delayed_sum");
+
+    fn noop(_: *const ()) {}
+    fn clone(_: *const ()) -> RawWaker {
+        RawWaker::new(std::ptr::null(), &VTABLE)
+    }
+    static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, noop, noop, noop);
+    let waker = unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &VTABLE)) };
+    let mut cx = Context::from_waker(&waker);
+    let args = [ScriptValue::I64(20), ScriptValue::I64(22)];
+    let mut fut = f(&args);
+    match fut.as_mut().poll(&mut cx) {
+        Poll::Ready(Ok(ScriptValue::I64(42))) => {}
+        other => panic!("expected Ready(I64(42)), got {other:?}"),
+    }
+}
+
+// A dyn generic registers one candidate per instantiation through the dyn
+// channel, carrying the full descriptor for runtime ranking.
+#[haphe::script(dyn, instantiate(i64), instantiate(String))]
+fn relay_dyn<T>(value: T) -> T {
+    value
+}
+
+#[test]
+fn dyn_generic_registers_candidates_with_descriptor() {
+    use haphe::{
+        Dispatch, FnBinder, FunctionDescriptor, ScriptBindFn, ScriptFunction, TypeDescriptor,
+    };
+
+    use haphe::ScriptValue;
+    type Wrapper = fn(&[ScriptValue]) -> Result<ScriptValue, haphe::ScriptConvertError>;
+    #[derive(Default)]
+    struct CollectDyn(
+        Vec<(
+            &'static FunctionDescriptor<'static>,
+            &'static [TypeDescriptor<'static>],
+            Wrapper,
+        )>,
+    );
+    impl FnBinder for CollectDyn {
+        type Error = std::convert::Infallible;
+        fn function(
+            &mut self,
+            _: &'static str,
+            _: &'static [TypeDescriptor<'static>],
+            _: Wrapper,
+        ) -> Result<(), Self::Error> {
+            panic!("dyn fn must not use the static channel");
+        }
+        fn function_async(
+            &mut self,
+            _: &'static str,
+            _: &'static [TypeDescriptor<'static>],
+            _: for<'a> fn(&'a [ScriptValue]) -> haphe::ScriptCallFuture<'a>,
+        ) -> Result<(), Self::Error> {
+            Ok(())
+        }
+        fn function_dyn(
+            &mut self,
+            descriptor: &'static FunctionDescriptor<'static>,
+            type_args: &'static [TypeDescriptor<'static>],
+            f: Wrapper,
+        ) -> Result<(), Self::Error> {
+            self.0.push((descriptor, type_args, f));
+            Ok(())
+        }
+    }
+
+    assert_eq!(
+        <relay_dyn as ScriptFunction>::DESCRIPTOR.dispatch,
+        Dispatch::Dyn
+    );
+    let mut binder = CollectDyn::default();
+    <relay_dyn as ScriptBindFn>::bind(&mut binder).unwrap();
+    assert_eq!(binder.0.len(), 2);
+    let (desc, args, f) = binder.0[0];
+    assert_eq!(desc.name, "relay_dyn");
+    assert!(matches!(args[0], TypeDescriptor::Primitive(_)));
+    let out = f(&[ScriptValue::I64(7)]).unwrap();
+    assert!(matches!(out, ScriptValue::I64(7)));
+
+    // The default trait impl delegates to `function` (verified by the
+    // capability story; here the override captured instead).
+}
+
+// Bare `dyn` on a single-parameter generic auto-instantiates the default
+// bridgeable candidate set, in the documented (tiebreak) order.
+#[haphe::script(dyn)]
+fn mirror<T: haphe::FromScript + haphe::IntoScript>(value: T) -> T {
+    value
+}
+
+#[test]
+fn bare_dyn_gets_default_candidate_set() {
+    use haphe::{
+        FnBinder, FunctionDescriptor, PrimitiveType, ScriptBindFn, ScriptValue, TypeDescriptor,
+    };
+    type Wrapper = fn(&[ScriptValue]) -> Result<ScriptValue, haphe::ScriptConvertError>;
+    #[derive(Default)]
+    struct Collect(Vec<&'static [TypeDescriptor<'static>]>);
+    impl FnBinder for Collect {
+        type Error = std::convert::Infallible;
+        fn function(
+            &mut self,
+            _: &'static str,
+            _: &'static [TypeDescriptor<'static>],
+            _: Wrapper,
+        ) -> Result<(), Self::Error> {
+            panic!("dyn must not use the static channel");
+        }
+        fn function_async(
+            &mut self,
+            _: &'static str,
+            _: &'static [TypeDescriptor<'static>],
+            _: for<'a> fn(&'a [ScriptValue]) -> haphe::ScriptCallFuture<'a>,
+        ) -> Result<(), Self::Error> {
+            Ok(())
+        }
+        fn function_dyn(
+            &mut self,
+            _: &'static FunctionDescriptor<'static>,
+            type_args: &'static [TypeDescriptor<'static>],
+            _: Wrapper,
+        ) -> Result<(), Self::Error> {
+            self.0.push(type_args);
+            Ok(())
+        }
+    }
+    let mut binder = Collect::default();
+    <mirror as ScriptBindFn>::bind(&mut binder).unwrap();
+    let kinds: Vec<&TypeDescriptor<'static>> = binder.0.iter().map(|a| &a[0]).collect();
+    assert_eq!(
+        kinds,
+        vec![
+            &TypeDescriptor::Primitive(PrimitiveType::I64),
+            &TypeDescriptor::Primitive(PrimitiveType::F64),
+            &TypeDescriptor::Primitive(PrimitiveType::Bool),
+            &TypeDescriptor::String,
+            &TypeDescriptor::Primitive(PrimitiveType::Char),
+        ]
+    );
+}
+
+// Container instantiations now compile wrappers (the freefn gate accepts
+// standard containers of bridgeable values).
+#[haphe::script(dyn, instantiate(Vec<i64>), instantiate(i64))]
+fn total<T>(value: T) -> T {
+    value
+}
+
+#[test]
+fn container_instantiations_bind() {
+    use haphe::{FnBinder, FunctionDescriptor, ScriptBindFn, ScriptValue, TypeDescriptor};
+    type Wrapper = fn(&[ScriptValue]) -> Result<ScriptValue, haphe::ScriptConvertError>;
+    #[derive(Default)]
+    struct Collect(Vec<Wrapper>);
+    impl FnBinder for Collect {
+        type Error = std::convert::Infallible;
+        fn function(
+            &mut self,
+            _: &'static str,
+            _: &'static [TypeDescriptor<'static>],
+            _: Wrapper,
+        ) -> Result<(), Self::Error> {
+            Ok(())
+        }
+        fn function_async(
+            &mut self,
+            _: &'static str,
+            _: &'static [TypeDescriptor<'static>],
+            _: for<'a> fn(&'a [ScriptValue]) -> haphe::ScriptCallFuture<'a>,
+        ) -> Result<(), Self::Error> {
+            Ok(())
+        }
+        fn function_dyn(
+            &mut self,
+            _: &'static FunctionDescriptor<'static>,
+            _: &'static [TypeDescriptor<'static>],
+            f: Wrapper,
+        ) -> Result<(), Self::Error> {
+            self.0.push(f);
+            Ok(())
+        }
+    }
+    let mut binder = Collect::default();
+    <total as ScriptBindFn>::bind(&mut binder).unwrap();
+    assert_eq!(binder.0.len(), 2, "container candidate compiled");
+    let out = binder.0[0](&[ScriptValue::List(vec![ScriptValue::I64(1)])]).unwrap();
+    assert!(matches!(out, ScriptValue::List(_)));
 }

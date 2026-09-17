@@ -36,6 +36,7 @@ const fn module_fn(
         receiver: None,
         generic_params: &[],
         instantiations: &[],
+        dispatch: haphe_core::Dispatch::Static,
         params: &[],
         return_type: ty,
         return_ownership: Ownership::Owned,
@@ -362,6 +363,7 @@ fn union_orders_fn_site_first_and_dedupes() {
     static FN_SITE: [&[TypeDescriptor<'static>]; 1] = [&[I32]];
     static FNS: [FunctionDescriptor<'static>; 1] = [FunctionDescriptor {
         instantiations: &FN_SITE,
+        dispatch: haphe_core::Dispatch::Static,
         ..generic_fn("echo")
     }];
     static INSTS: [haphe_core::FnInstantiation<'static>; 2] = [

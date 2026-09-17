@@ -26,6 +26,11 @@ type AsyncFn<T> =
     for<'a> fn(haphe::ScriptCow<'a, T>, &'a [ScriptValue]) -> haphe::ScriptCallFuture<'a>;
 type AsyncMutFn<T> = for<'a> fn(&'a mut T, &'a [ScriptValue]) -> haphe::ScriptCallFuture<'a>;
 type CtorFn<T> = fn(&[ScriptValue]) -> Result<T, ScriptConvertError>;
+type PropGetFn<T> = fn(&T) -> ScriptValue;
+type PropSetFn<T> = fn(&mut T, ScriptValue) -> Result<(), ScriptConvertError>;
+type PropGetAsyncFn<T> = for<'a> fn(haphe::ScriptCow<'a, T>) -> haphe::ScriptCallFuture<'a>;
+type PropSetAsyncFn<T> = for<'a> fn(&'a mut T, ScriptValue) -> haphe::ScriptCallFuture<'a>;
+type AsyncCtorFn<T> = for<'a> fn(&'a [ScriptValue]) -> haphe::ScriptCtorFuture<'a, T>;
 type CowMethodFn<T> =
     for<'a> fn(haphe::ScriptCow<'a, T>, &[ScriptValue]) -> Result<ScriptValue, ScriptConvertError>;
 
@@ -47,6 +52,11 @@ struct MockBinder<T> {
     call_async: Option<AsyncFn<T>>,
     async_methods: Vec<(&'static str, AsyncFn<T>)>,
     async_mut_methods: Vec<(&'static str, AsyncMutFn<T>)>,
+    prop_gets: Vec<(&'static str, PropGetFn<T>)>,
+    prop_sets: Vec<(&'static str, PropSetFn<T>)>,
+    prop_gets_async: Vec<(&'static str, PropGetAsyncFn<T>)>,
+    prop_sets_async: Vec<(&'static str, PropSetAsyncFn<T>)>,
+    async_ctors: Vec<(&'static str, AsyncCtorFn<T>)>,
 }
 
 impl<T> TypeBinder<T> for MockBinder<T> {
@@ -106,6 +116,51 @@ impl<T> TypeBinder<T> for MockBinder<T> {
         f: fn(&[ScriptValue]) -> Result<T, ScriptConvertError>,
     ) -> Result<(), NeverError> {
         self.constructors.push((name, f));
+        Ok(())
+    }
+
+    fn constructor_async(
+        &mut self,
+        name: &'static str,
+        f: for<'a> fn(&'a [ScriptValue]) -> haphe::ScriptCtorFuture<'a, T>,
+    ) -> Result<(), NeverError> {
+        self.async_ctors.push((name, f));
+        Ok(())
+    }
+
+    fn property_get(
+        &mut self,
+        name: &'static str,
+        f: fn(&T) -> ScriptValue,
+    ) -> Result<(), NeverError> {
+        self.prop_gets.push((name, f));
+        Ok(())
+    }
+
+    fn property_set(
+        &mut self,
+        name: &'static str,
+        f: fn(&mut T, ScriptValue) -> Result<(), ScriptConvertError>,
+    ) -> Result<(), NeverError> {
+        self.prop_sets.push((name, f));
+        Ok(())
+    }
+
+    fn property_get_async(
+        &mut self,
+        name: &'static str,
+        f: for<'a> fn(haphe::ScriptCow<'a, T>) -> haphe::ScriptCallFuture<'a>,
+    ) -> Result<(), NeverError> {
+        self.prop_gets_async.push((name, f));
+        Ok(())
+    }
+
+    fn property_set_async(
+        &mut self,
+        name: &'static str,
+        f: for<'a> fn(&'a mut T, ScriptValue) -> haphe::ScriptCallFuture<'a>,
+    ) -> Result<(), NeverError> {
+        self.prop_sets_async.push((name, f));
         Ok(())
     }
 
@@ -295,6 +350,11 @@ fn bound<T: ScriptBind>() -> MockBinder<T> {
         call_async: None,
         async_methods: Vec::new(),
         async_mut_methods: Vec::new(),
+        prop_gets: Vec::new(),
+        prop_sets: Vec::new(),
+        prop_gets_async: Vec::new(),
+        prop_sets_async: Vec::new(),
+        async_ctors: Vec::new(),
     };
     T::bind(&mut binder).unwrap();
     binder
@@ -721,6 +781,15 @@ fn transparent_newtype_free_fn_binds() {
             self.0.push((name, f));
             Ok(())
         }
+
+        fn function_async(
+            &mut self,
+            _: &'static str,
+            _: &'static [haphe::TypeDescriptor<'static>],
+            _: for<'a> fn(&'a [ScriptValue]) -> haphe::ScriptCallFuture<'a>,
+        ) -> Result<(), NeverError> {
+            Ok(())
+        }
     }
 
     let mut binder = CollectFns(Vec::new());
@@ -934,4 +1003,163 @@ fn debug_without_display_still_feeds_tostring_fallback() {
     // is absent, in addition to the new meta_debug channel.
     let binder = bound::<Tag>();
     assert!(binder.debug.is_some());
+}
+
+// ---------------------------------------------------------------------------
+// Properties (sync + async) and async constructors
+// ---------------------------------------------------------------------------
+
+#[derive(Script, Clone)]
+#[script(thread_safety = send_sync, methods)]
+struct Meter {
+    #[script(skip)]
+    raw: i64,
+}
+
+#[haphe::script]
+impl Meter {
+    #[script(constructor)]
+    fn new(raw: i64) -> Self {
+        Meter { raw }
+    }
+
+    #[script(constructor)]
+    async fn connect(raw: i64) -> Self {
+        Meter { raw }
+    }
+
+    #[script(getter)]
+    fn level(&self) -> i64 {
+        self.raw * 2
+    }
+
+    #[script(setter)]
+    fn set_level(&mut self, value: i64) {
+        self.raw = value / 2;
+    }
+
+    #[script(getter)]
+    async fn reading(&self) -> i64 {
+        self.raw + 1
+    }
+
+    #[script(setter = "reading")]
+    async fn set_reading(&mut self, value: i64) {
+        self.raw = value - 1;
+    }
+}
+
+#[test]
+fn sync_properties_register_and_convert() {
+    let binder = bound::<Meter>();
+    let (name, get) = binder
+        .prop_gets
+        .iter()
+        .find(|(n, _)| *n == "level")
+        .expect("level getter registered");
+    assert_eq!(*name, "level");
+    assert!(matches!(get(&Meter { raw: 21 }), ScriptValue::I64(42)));
+
+    let (_, set) = binder
+        .prop_sets
+        .iter()
+        .find(|(n, _)| *n == "level")
+        .expect("level setter registered");
+    let mut m = Meter { raw: 0 };
+    set(&mut m, ScriptValue::I64(10)).unwrap();
+    assert_eq!(m.raw, 5);
+    assert!(set(&mut m, ScriptValue::String("x".into())).is_err());
+}
+
+#[test]
+fn async_properties_register_and_await() {
+    let binder = bound::<Meter>();
+    let (_, get) = binder
+        .prop_gets_async
+        .iter()
+        .find(|(n, _)| *n == "reading")
+        .expect("async getter registered");
+    let m = Meter { raw: 41 };
+    let out = poll_ready(get(haphe::ScriptCow::Borrowed(&m))).unwrap();
+    assert!(matches!(out, ScriptValue::I64(42)));
+
+    let (_, set) = binder
+        .prop_sets_async
+        .iter()
+        .find(|(n, _)| *n == "reading")
+        .expect("async setter registered");
+    let mut target = Meter { raw: 0 };
+    let out = poll_ready(set(&mut target, ScriptValue::I64(42))).unwrap();
+    assert!(matches!(out, ScriptValue::Unit));
+    assert_eq!(target.raw, 41, "async setter mutates in place");
+}
+
+#[test]
+fn async_constructor_registers_and_awaits() {
+    use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+    let binder = bound::<Meter>();
+    // The sync ctor stays on the sync channel.
+    assert!(binder.constructors.iter().any(|(n, _)| *n == "new"));
+    let (name, ctor) = binder
+        .async_ctors
+        .iter()
+        .find(|(n, _)| *n == "connect")
+        .expect("async constructor registered");
+    assert_eq!(*name, "connect");
+
+    fn noop(_: *const ()) {}
+    fn clone(_: *const ()) -> RawWaker {
+        RawWaker::new(std::ptr::null(), &VTABLE)
+    }
+    static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, noop, noop, noop);
+    let waker = unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &VTABLE)) };
+    let mut cx = Context::from_waker(&waker);
+    let args = [ScriptValue::I64(9)];
+    let mut fut = ctor(&args);
+    match fut.as_mut().poll(&mut cx) {
+        Poll::Ready(Ok(m)) => assert_eq!(m.raw, 9),
+        Poll::Ready(Err(e)) => panic!("expected Ok, got error: {e}"),
+        Poll::Pending => panic!("future not immediately ready"),
+    }
+}
+
+// Fallible constructors (returning `Result`) are excluded from BINDING on
+// both the sync and async channels — they remain described. (Documented
+// exclusion; a fallible-ctor bridge channel is a queued follow-up.)
+#[derive(Script, Clone)]
+#[script(thread_safety = send_sync, methods)]
+struct Gauge {
+    #[script(skip)]
+    raw: i64,
+}
+
+#[haphe::script]
+#[allow(dead_code)]
+impl Gauge {
+    #[script(constructor)]
+    fn try_new(raw: i64) -> Result<Self, String> {
+        Ok(Gauge { raw })
+    }
+
+    #[script(constructor)]
+    async fn try_connect(raw: i64) -> Result<Self, String> {
+        Ok(Gauge { raw })
+    }
+
+    fn raw(&self) -> i64 {
+        self.raw
+    }
+}
+
+#[test]
+fn fallible_constructors_are_described_but_not_bound() {
+    use haphe::ScriptImpl;
+    let ctors = <Gauge as ScriptImpl>::CONSTRUCTORS;
+    assert_eq!(ctors.len(), 2, "both fallible ctors described");
+    assert!(ctors.iter().any(|c| c.name == "try_new"));
+    assert!(ctors.iter().any(|c| c.name == "try_connect" && c.is_async));
+
+    let binder = bound::<Gauge>();
+    assert!(binder.constructors.is_empty(), "fallible sync ctor unbound");
+    assert!(binder.async_ctors.is_empty(), "fallible async ctor unbound");
 }

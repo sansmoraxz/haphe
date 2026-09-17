@@ -1,0 +1,11 @@
+error: `dyn` requires generic parameters
+ --> tests/ui/dyn_non_generic.rs:3:10
+  |
+3 | #[script(dyn)]
+  |          ^^^
+
+error: `dyn` here needs explicit `instantiate(...)` declarations: the default candidate set applies only to single-parameter generic free functions
+ --> tests/ui/dyn_non_generic.rs:3:10
+  |
+3 | #[script(dyn)]
+  |          ^^^

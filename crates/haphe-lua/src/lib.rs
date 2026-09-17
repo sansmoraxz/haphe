@@ -125,6 +125,10 @@ impl LuaBinder {
 
         BackendCapabilities::ALL
             .with_async_fns(cfg!(feature = "async"))
+            // Dyn generic dispatch rides the same opt-in as the rest of the
+            // generics extension: the runtime is natively dynamic, but the
+            // scan machinery is only compiled in with the feature.
+            .with_dyn_generics(cfg!(feature = "generics"))
             .with_required_thread_safety(thread_safety)
     }
 }

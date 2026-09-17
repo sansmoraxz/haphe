@@ -28,6 +28,7 @@ pub use bitflags;
 #[doc(hidden)]
 pub use bitflags_support::bitflags_repr;
 pub mod bridge;
+pub mod dispatch;
 pub mod foreign;
 pub mod function;
 pub mod haphe_type;
@@ -55,11 +56,11 @@ pub use backend::{
 pub use bridge::{
     BindTarget, BridgeProbe, FnBinder, ForeignCaller, ForeignError, ForeignErrorKind,
     ForeignHandle, FromScript, IntoScript, OpaqueUserData, ScriptBind, ScriptBindFn,
-    ScriptCallFuture, ScriptConvertError, ScriptCow, ScriptIter, ScriptValue, SkipBind, SkipBindFn,
-    TypeBinder,
+    ScriptCallFuture, ScriptConvertError, ScriptCow, ScriptCtorFuture, ScriptIter, ScriptValue,
+    SkipBind, SkipBindFn, TypeBinder,
 };
 pub use foreign::ForeignInterfaceDescriptor;
-pub use function::{FunctionDescriptor, Ownership, ParamDescriptor, Receiver, any_async};
+pub use function::{Dispatch, FunctionDescriptor, Ownership, ParamDescriptor, Receiver, any_async};
 pub use haphe_type::HapheType;
 pub use module::{ConstantDescriptor, FnInstantiation, ModuleDescriptor, union_instantiations};
 pub use registry::{

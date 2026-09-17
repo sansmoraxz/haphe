@@ -17,8 +17,8 @@ use wasmtime::component::{
 use wasmtime::{AsContextMut, Store};
 
 use crate::host::{
-    AnyBox, CowAny, EMethod, GuestResource, HostRep, HostTable, RawTable, ResourceEntry,
-    ValueEntry, block_on, erase_resource, erase_value, trap_convert,
+    AnyBox, CowAny, EMethod, GuestResource, HostRep, HostResState, HostResource, HostTable,
+    RawTable, ResourceEntry, ValueEntry, block_on, erase_resource, erase_value, trap_convert,
 };
 use crate::model::{Direction, Plan, ProjKind, Projected, projected_trait_members};
 use crate::names::{NameMap, to_kebab};
@@ -52,9 +52,15 @@ struct Registrations {
         (&'static str, &'static [TypeDescriptor<'static>]),
         ProvidedFn,
     )>,
+    /// Async free functions, same keying; dispatched through `block_on`.
+    async_fns: Vec<(
+        (&'static str, &'static [TypeDescriptor<'static>]),
+        AsyncProvidedFn,
+    )>,
 }
 
 type ProvidedFn = fn(&[ScriptValue]) -> Result<ScriptValue, ScriptConvertError>;
+type AsyncProvidedFn = for<'a> fn(&'a [ScriptValue]) -> haphe::ScriptCallFuture<'a>;
 
 /// Collects `ScriptBindFn` registrations.
 #[derive(Default)]
@@ -63,8 +69,18 @@ struct FnCollector {
         (&'static str, &'static [TypeDescriptor<'static>]),
         ProvidedFn,
     )>,
+    async_entries: Vec<(
+        (&'static str, &'static [TypeDescriptor<'static>]),
+        AsyncProvidedFn,
+    )>,
 }
 
+// `function_dyn`/`function_dyn_async` are deliberately NOT overridden: their
+// core defaults delegate to `function`/`function_async`, so a dyn fn that
+// somehow reached this collector would register its monomorphs statically.
+// That path relies on check-before-bind — `WasmBinder::bind` runs the
+// capability check (`dyn_generics: false`) through the facade, which rejects
+// dyn functions with `DynGenericsUnsupported` before any collection happens.
 impl FnBinder for FnCollector {
     type Error = std::convert::Infallible;
 
@@ -75,6 +91,16 @@ impl FnBinder for FnCollector {
         f: ProvidedFn,
     ) -> Result<(), Self::Error> {
         self.entries.push(((name, type_args), f));
+        Ok(())
+    }
+
+    fn function_async(
+        &mut self,
+        name: &'static str,
+        type_args: &'static [TypeDescriptor<'static>],
+        f: AsyncProvidedFn,
+    ) -> Result<(), Self::Error> {
+        self.async_entries.push(((name, type_args), f));
         Ok(())
     }
 }
@@ -191,6 +217,78 @@ impl<T> WasmBinder<T> {
         Ok(self)
     }
 
+    /// Registers one concrete instantiation of a generic record for live
+    /// dispatch of its trait projections (`{mangled-instance}-{op}`). `U` is
+    /// the concrete Rust type, `type_args` its declared type arguments in
+    /// order.
+    pub fn register_record_instance<U>(
+        &mut self,
+        type_args: &[TypeDescriptor<'static>],
+    ) -> Result<&mut Self, WasmBindError>
+    where
+        U: ScriptBind + ScriptStruct + FromScript + IntoScript + Clone + Send + 'static,
+    {
+        let key = instance_key(<U as ScriptStruct>::DESCRIPTOR.id.as_str(), type_args)?;
+        if self.regs.values.contains_key(&key) {
+            return Err(WasmBindError::DuplicateRegistration { name: key });
+        }
+        self.regs
+            .values
+            .insert(key, Arc::new(erase_value(collect_raw::<U>())));
+        Ok(self)
+    }
+
+    /// Registers one concrete instantiation of a generic unit enum for live
+    /// companion dispatch (`{mangled-instance}-{method}`). Same value
+    /// semantics as [`register_enum`](Self::register_enum).
+    ///
+    /// Provided for API symmetry: Rust cannot express a generic enum whose
+    /// variants are all unit (the type parameter would be unused), so no
+    /// deriving type can satisfy these bounds today — generic enum-instance
+    /// companions in practice keep their descriptive stubs.
+    pub fn register_enum_instance<U>(
+        &mut self,
+        type_args: &[TypeDescriptor<'static>],
+    ) -> Result<&mut Self, WasmBindError>
+    where
+        U: ScriptBind + haphe::ScriptEnum + FromScript + IntoScript + Clone + Send + 'static,
+    {
+        let key = instance_key(<U as haphe::ScriptEnum>::DESCRIPTOR.id.as_str(), type_args)?;
+        if self.regs.values.contains_key(&key) {
+            return Err(WasmBindError::DuplicateRegistration { name: key });
+        }
+        self.regs
+            .values
+            .insert(key, Arc::new(erase_value(collect_raw::<U>())));
+        Ok(self)
+    }
+
+    /// Mints a host resource payload for a registered type: inserts `value`
+    /// into this binder's host table and returns the `ScriptValue` a foreign
+    /// (guest-implemented) call can take as a resource-typed argument. An
+    /// `own` position transfers the entry to the guest (its drop reclaims
+    /// it); borrows leave it in place — reclaim an untransferred value with
+    /// the returned payload simply being dropped alongside the table at
+    /// binder teardown.
+    pub fn host_resource<U>(&self, value: U) -> Result<ScriptValue, WasmBindError>
+    where
+        U: ScriptStruct + Send + 'static,
+    {
+        let id = <U as ScriptStruct>::DESCRIPTOR.id.as_str();
+        if !self.regs.resources.contains_key(id) {
+            return Err(WasmBindError::UnregisteredType {
+                name: id.to_string(),
+            });
+        }
+        let type_name = <U as ScriptStruct>::DESCRIPTOR.name;
+        let rep = self.table.insert(type_name, Box::new(value));
+        Ok(ScriptValue::UserData(haphe::OpaqueUserData::new(
+            HostResource {
+                state: Mutex::new(HostResState::Unminted(rep)),
+            },
+        )))
+    }
+
     /// Registers a free function (the hidden `#[script]` type) for live
     /// dispatch; generic functions register every declared instantiation's
     /// monomorphized wrapper.
@@ -207,6 +305,14 @@ impl<T> WasmBinder<T> {
                 });
             }
             self.regs.fns.push((key, f));
+        }
+        for (key, f) in collector.async_entries {
+            if self.regs.async_fns.iter().any(|(k, _)| *k == key) {
+                return Err(WasmBindError::DuplicateRegistration {
+                    name: key.0.to_string(),
+                });
+            }
+            self.regs.async_fns.push((key, f));
         }
         Ok(self)
     }
@@ -243,6 +349,12 @@ pub enum WasmBindError {
         /// The registration key (type id or function name).
         name: String,
     },
+    /// A host resource payload was requested for a type never registered
+    /// with this binder.
+    UnregisteredType {
+        /// The type id.
+        name: String,
+    },
 }
 
 impl fmt::Display for WasmBindError {
@@ -265,6 +377,13 @@ impl fmt::Display for WasmBindError {
             ),
             Self::DuplicateRegistration { name } => {
                 write!(f, "`{name}` is already registered with this binder")
+            }
+            Self::UnregisteredType { name } => {
+                write!(
+                    f,
+                    "`{name}` is not a registered resource type on this binder; \
+                     call `register_type` first"
+                )
             }
         }
     }
@@ -302,7 +421,9 @@ impl<T: 'static> RuntimeBinder for WasmBinder<T> {
     fn capabilities(&self) -> BackendCapabilities {
         // Live binding stores values behind `Send + Sync` linker closures:
         // require `Send` declarations up front (text generation alone does
-        // not, so only the runtime binder tightens this).
+        // not, so only the runtime binder tightens this). `dyn_generics`
+        // stays false via the generator's capabilities: guests name
+        // monomorphs statically, so bare dyn is unrepresentable here.
         BindingGenerator::capabilities(&self.config)
             .with_required_thread_safety(Some(ThreadSafety::SEND))
     }
@@ -404,14 +525,27 @@ impl<T: 'static> RuntimeBinder for WasmBinder<T> {
                 if let Some(TypeKind::Enum(e)) =
                     registry.get_type(&haphe::TypeId::new(planned.erased_id))
                 {
+                    let value = instance_key(planned.erased_id, planned.args)
+                        .ok()
+                        .and_then(|k| self.regs.values.get(&k).cloned());
                     for m in e.methods {
                         let name =
                             member_names.insert(&format!("{}-{}", planned.wit_name, m.name))?;
-                        stub_func_msg(
-                            &mut inst,
-                            &name,
-                            "enum companion methods are not yet bridged",
-                        )?;
+                        match value.as_ref().filter(|v| v.methods.contains_key(m.name)) {
+                            Some(v) => define_enum_companion(
+                                &mut inst,
+                                &name,
+                                v.clone(),
+                                m.name.to_string(),
+                                &cx,
+                            )?,
+                            None => stub_func_msg(
+                                &mut inst,
+                                &name,
+                                "enum companion method not registered; call \
+                                 `register_enum_instance`",
+                            )?,
+                        }
                     }
                 }
             }
@@ -449,13 +583,26 @@ impl<T: 'static> RuntimeBinder for WasmBinder<T> {
                     registry.get_type(&haphe::TypeId::new(planned.erased_id))
                     && !plan.is_resource(planned.erased_id)
                 {
-                    // Generic record instances: WIT parity via stubs (value
-                    // registration for instances is not offered yet).
+                    let value = instance_key(planned.erased_id, planned.args)
+                        .ok()
+                        .and_then(|k| self.regs.values.get(&k).cloned());
                     for proj in projected_trait_members(s)? {
                         let raw = format!("{}-{}", planned.wit_name, proj.source_name);
                         let name =
                             member_names.insert_as(&raw, &format!("trait projection `{raw}`"))?;
-                        stub_func(&mut inst, &name)?;
+                        match value
+                            .as_ref()
+                            .filter(|v| v.projections.contains_key(proj.source_name))
+                        {
+                            Some(v) => define_record_projection(
+                                &mut inst,
+                                &name,
+                                v.clone(),
+                                proj.source_name,
+                                &cx,
+                            )?,
+                            None => stub_func(&mut inst, &name)?,
+                        }
                     }
                 }
             }
@@ -463,17 +610,16 @@ impl<T: 'static> RuntimeBinder for WasmBinder<T> {
             for func in iface.functions {
                 if func.generic_params.is_empty() {
                     let name = member_names.insert(func.name)?;
-                    match self.find_fn(func.name, &[]) {
-                        Some(f) if !func.is_async => define_value_fn(&mut inst, &name, f, &cx)?,
-                        // Async free functions have no `ScriptBindFn`
-                        // wrapper (no async channel on `FnBinder` yet), so
-                        // they can only trap descriptively.
-                        _ if func.is_async => stub_func_msg(
-                            &mut inst,
-                            &name,
-                            "async free functions are not yet bridged",
-                        )?,
-                        _ => stub_func(&mut inst, &name)?,
+                    if func.is_async {
+                        match self.find_async_fn(func.name, &[]) {
+                            Some(f) => define_value_fn_async(&mut inst, &name, f, &cx)?,
+                            None => stub_func(&mut inst, &name)?,
+                        }
+                    } else {
+                        match self.find_fn(func.name, &[]) {
+                            Some(f) => define_value_fn(&mut inst, &name, f, &cx)?,
+                            None => stub_func(&mut inst, &name)?,
+                        }
                     }
                     continue;
                 }
@@ -484,14 +630,16 @@ impl<T: 'static> RuntimeBinder for WasmBinder<T> {
                 for args in haphe::union_instantiations(func, iface.fn_instantiations) {
                     let mangled = plan.mangle_fn_instance(func.name, args, None)?;
                     let name = member_names.insert(&mangled)?;
-                    match self.find_fn(func.name, args) {
-                        Some(f) if !func.is_async => define_value_fn(&mut inst, &name, f, &cx)?,
-                        _ if func.is_async => stub_func_msg(
-                            &mut inst,
-                            &name,
-                            "async free functions are not yet bridged",
-                        )?,
-                        _ => stub_func(&mut inst, &name)?,
+                    if func.is_async {
+                        match self.find_async_fn(func.name, args) {
+                            Some(f) => define_value_fn_async(&mut inst, &name, f, &cx)?,
+                            None => stub_func(&mut inst, &name)?,
+                        }
+                    } else {
+                        match self.find_fn(func.name, args) {
+                            Some(f) => define_value_fn(&mut inst, &name, f, &cx)?,
+                            None => stub_func(&mut inst, &name)?,
+                        }
                     }
                 }
             }
@@ -515,6 +663,14 @@ impl<T> WasmBinder<T> {
     fn find_fn(&self, name: &str, args: &[TypeDescriptor<'_>]) -> Option<ProvidedFn> {
         self.regs
             .fns
+            .iter()
+            .find(|((n, a), _)| *n == name && *a == args)
+            .map(|(_, f)| *f)
+    }
+
+    fn find_async_fn(&self, name: &str, args: &[TypeDescriptor<'_>]) -> Option<AsyncProvidedFn> {
+        self.regs
+            .async_fns
             .iter()
             .find(|((n, a), _)| *n == name && *a == args)
             .map(|(_, f)| *f)
@@ -667,6 +823,50 @@ pub fn foreign_handle_async<H: ScriptForeign + ForeignHandle, T: Send + 'static>
         instance,
         &H::DESCRIPTOR,
         H::TYPE_ARGS,
+    )?))
+}
+
+/// Asynchronous variant of [`foreign_caller_in`]: registry-aware name
+/// resolution (mangled generic-instance interfaces, declared enum-case
+/// translation) with dispatch through `Func::call_async`. The returned
+/// caller's synchronous `call` refuses with a descriptive error.
+pub fn foreign_caller_async_in<T: Send + 'static>(
+    package: &str,
+    store: Arc<Mutex<Store<T>>>,
+    instance: &Instance,
+    descriptor: &ForeignInterfaceDescriptor<'static>,
+    type_args: &'static [TypeDescriptor<'static>],
+    registry: &ValidatedRegistry<'_>,
+) -> Result<Box<dyn ForeignCaller>, WasmBindError> {
+    // Same default-interface note as `foreign_caller_in`.
+    let plan = Plan::build(registry, "types")?;
+    let inner = resolve_foreign(
+        package,
+        store,
+        instance,
+        descriptor,
+        type_args,
+        Some(&plan),
+        declared_enum_cases(registry),
+    )?;
+    Ok(Box::new(AsyncWasmForeignCaller { inner }))
+}
+
+/// Builds the foreign-trait handle `H` with asynchronous dispatch and
+/// registry-aware name resolution (see [`foreign_caller_async_in`]).
+pub fn foreign_handle_async_in<H: ScriptForeign + ForeignHandle, T: Send + 'static>(
+    package: &str,
+    store: Arc<Mutex<Store<T>>>,
+    instance: &Instance,
+    registry: &ValidatedRegistry<'_>,
+) -> Result<H, WasmBindError> {
+    Ok(H::from_caller(foreign_caller_async_in(
+        package,
+        store,
+        instance,
+        &H::DESCRIPTOR,
+        H::TYPE_ARGS,
+        registry,
     )?))
 }
 
@@ -935,6 +1135,30 @@ impl<T: 'static> CallerInner<T> {
                     .take()
                     .ok_or(err("an already-transferred guest handle"))?;
                 Ok(Val::Resource(any))
+            };
+        }
+        if let Some(h) = ud.downcast_ref::<HostResource>() {
+            let mut state = h.state.lock().expect("host resource state poisoned");
+            // Lazily mint ONE `own` handle; wasmtime borrows it in-call for
+            // borrow positions, so the payload stays reusable until an
+            // `own` position transfers it.
+            if let HostResState::Unminted(rep) = *state {
+                let any = Resource::<HostRep>::new_own(rep)
+                    .try_into_resource_any(&mut *_store)
+                    .map_err(|_| err("a mintable host resource handle"))?;
+                *state = HostResState::Minted(any);
+            }
+            return match (&*state, borrow) {
+                (HostResState::Minted(any), true) => Ok(Val::Resource(*any)),
+                (HostResState::Minted(any), false) => {
+                    let any = *any;
+                    // Ownership moves to the guest; its drop runs the
+                    // registered destructor, reclaiming the table entry.
+                    *state = HostResState::Transferred;
+                    Ok(Val::Resource(any))
+                }
+                (HostResState::Transferred, _) => Err(err("an already-transferred host resource")),
+                (HostResState::Unminted(_), _) => unreachable!("minted above"),
             };
         }
         Err(err("an unrecognized userdata payload"))
@@ -1262,6 +1486,40 @@ fn script_to_val(
                     .collect::<Result<_, _>>()?,
             ),
             _ => return Err(err("tuple")),
+        },
+        Type::Flags(fl) => match v {
+            // Flags cross as a list of set flag names (mirroring the lifting
+            // shape); unknown names error descriptively.
+            ScriptValue::List(items) => {
+                let mut names = Vec::with_capacity(items.len());
+                for item in items {
+                    let ScriptValue::String(name) = item else {
+                        return Err(err("a list of flag-name strings"));
+                    };
+                    if !fl.names().any(|n| n == name) {
+                        return Err(err("a declared flag name"));
+                    }
+                    names.push(name.clone());
+                }
+                Val::Flags(names)
+            }
+            _ => return Err(err("a list of flag-name strings")),
+        },
+        Type::Variant(var) => match v {
+            // Variants cross as a single-pair map { case: payload }
+            // (mirroring the lifting shape); Unit payload means no payload.
+            ScriptValue::Map(pairs) if pairs.len() == 1 => {
+                let (case, payload) = &pairs[0];
+                let Some(case_decl) = var.cases().find(|c| c.name == case) else {
+                    return Err(err("a declared variant case"));
+                };
+                let lowered = match (&case_decl.ty, payload) {
+                    (None, _) => None,
+                    (Some(ty), p) => Some(Box::new(script_to_val(p, ty, enums, &mut *res)?)),
+                };
+                Val::Variant(case.clone(), lowered)
+            }
+            _ => return Err(err("a single-case variant map")),
         },
         Type::Map(m) => match v {
             ScriptValue::Map(pairs) => Val::Map(
@@ -1604,6 +1862,26 @@ fn define_value_fn<T: 'static>(
     Ok(())
 }
 
+/// Defines a live `async` free function: the boxed future borrows the lifted
+/// argument slice and is driven to completion on this thread ([`block_on`] —
+/// same trade-offs as async methods: the calling fiber blocks, and
+/// tokio-reactor futures need a multi-thread runtime).
+fn define_value_fn_async<T: 'static>(
+    inst: &mut LinkerInstance<'_, T>,
+    name: &str,
+    f: AsyncProvidedFn,
+    cx: &DispatchCx,
+) -> Result<(), WasmBindError> {
+    let cx = cx.clone();
+    let msg_name = name.to_string();
+    inst.func_new(name, move |mut store, fty, params, results| {
+        let args = lift_args(&cx, &mut store, params, 0, &msg_name)?;
+        let out = block_on(f(&args)).map_err(|e| trap_convert(&msg_name, e))?;
+        lower_result(&cx, &mut store, fty.results(), out, results, &msg_name)
+    })?;
+    Ok(())
+}
+
 /// Defines a live record trait projection (`{type}-{op}`): the receiver and
 /// arguments round-trip through `ScriptValue`.
 fn define_record_projection<T: 'static>(
@@ -1680,20 +1958,29 @@ fn bind_resource_live<T: 'static>(
         }
     }
     for prop in s.properties {
-        // Properties are descriptor-only (no bridge channel yet).
         let getter = members.insert(prop.name)?;
-        stub_func_msg(
-            inst,
-            &format!("[method]{res}.{getter}"),
-            "property accessors are not yet bridged",
-        )?;
-        if !prop.readonly {
-            let setter = members.insert(&format!("set_{}", prop.name))?;
+        if entry.props.contains_key(prop.name) {
+            define_prop_get(inst, res, &getter, prop.name, &entry, cx)?;
+        } else {
+            // Whitelist-gated out at the macro layer: declared, described,
+            // but not bridgeable.
             stub_func_msg(
                 inst,
-                &format!("[method]{res}.{setter}"),
-                "property accessors are not yet bridged",
+                &format!("[method]{res}.{getter}"),
+                "declared but not bridgeable (its script type lacks value conversions)",
             )?;
+        }
+        if !prop.readonly {
+            let setter = members.insert(&format!("set_{}", prop.name))?;
+            if entry.props.contains_key(prop.name) {
+                define_prop_set(inst, res, &setter, prop.name, &entry, cx)?;
+            } else {
+                stub_func_msg(
+                    inst,
+                    &format!("[method]{res}.{setter}"),
+                    "declared but not bridgeable (its script type lacks value conversions)",
+                )?;
+            }
         }
     }
 
@@ -1707,7 +1994,7 @@ fn bind_resource_live<T: 'static>(
             (format!("[static]{res}.{name}"), ctor.name.to_string())
         };
         if ctor.is_async {
-            stub_func_msg(inst, &linker_name, "async constructors are not yet bridged")?;
+            define_ctor_async(inst, &linker_name, ctor_key, &entry, cx)?;
             continue;
         }
         define_ctor(inst, &linker_name, ctor_key, &entry, cx)?;
@@ -1822,6 +2109,107 @@ fn define_field_set<T: 'static>(
             .as_ref()
             .ok_or_else(|| trap(&msg, "field is readonly"))?;
         set(&mut *e.value, value).map_err(|e| trap_convert(&msg, e))?;
+        Ok(())
+    })?;
+    Ok(())
+}
+
+fn define_prop_get<T: 'static>(
+    inst: &mut LinkerInstance<'_, T>,
+    res: &str,
+    getter: &str,
+    prop: &str,
+    entry: &Arc<ResourceEntry>,
+    cx: &DispatchCx,
+) -> Result<(), WasmBindError> {
+    let linker_name = format!("[method]{res}.{getter}");
+    let (entry, cx, prop) = (entry.clone(), cx.clone(), prop.to_string());
+    let msg = linker_name.clone();
+    inst.func_new(&linker_name, move |mut store, fty, params, results| {
+        let rep = self_rep(&mut store, params, &msg)?;
+        let out = {
+            let guard = cx.table.lock();
+            let e = guard
+                .get(&rep)
+                .ok_or_else(|| trap(&msg, "stale resource handle"))?;
+            check_type(&msg, e.type_name, entry.type_name)?;
+            let acc = entry
+                .props
+                .get(prop.as_str())
+                .ok_or_else(|| trap(&msg, "property has no bridge accessor"))?;
+            if let Some(get) = &acc.get {
+                get(&*e.value).map_err(|e| trap_convert(&msg, e))?
+            } else if let Some(get) = &acc.get_async {
+                // Driven on-thread; the table lock is held across awaits
+                // (same re-entrancy caveat as async methods).
+                block_on(get(CowAny::Borrowed(&*e.value))).map_err(|e| trap_convert(&msg, e))?
+            } else {
+                return Err(trap(&msg, "property has no getter channel"));
+            }
+        };
+        lower_result(&cx, &mut store, fty.results(), out, results, &msg)
+    })?;
+    Ok(())
+}
+
+fn define_prop_set<T: 'static>(
+    inst: &mut LinkerInstance<'_, T>,
+    res: &str,
+    setter: &str,
+    prop: &str,
+    entry: &Arc<ResourceEntry>,
+    cx: &DispatchCx,
+) -> Result<(), WasmBindError> {
+    let linker_name = format!("[method]{res}.{setter}");
+    let (entry, cx, prop) = (entry.clone(), cx.clone(), prop.to_string());
+    let msg = linker_name.clone();
+    inst.func_new(&linker_name, move |mut store, _fty, params, _results| {
+        let rep = self_rep(&mut store, params, &msg)?;
+        let args = lift_args(&cx, &mut store, params, 1, &msg)?;
+        let value = args
+            .into_iter()
+            .next()
+            .ok_or_else(|| trap(&msg, "missing setter value"))?;
+        let mut guard = cx.table.lock();
+        let e = guard
+            .get_mut(&rep)
+            .ok_or_else(|| trap(&msg, "stale resource handle"))?;
+        check_type(&msg, e.type_name, entry.type_name)?;
+        let acc = entry
+            .props
+            .get(prop.as_str())
+            .ok_or_else(|| trap(&msg, "property has no bridge accessor"))?;
+        if let Some(set) = &acc.set {
+            set(&mut *e.value, value).map_err(|e| trap_convert(&msg, e))?;
+        } else if let Some(set) = &acc.set_async {
+            // In-place mutation under the held lock (method_async_mut
+            // precedent); same re-entrancy caveat.
+            block_on(set(&mut *e.value, value)).map_err(|e| trap_convert(&msg, e))?;
+        } else {
+            return Err(trap(&msg, "property is readonly"));
+        }
+        Ok(())
+    })?;
+    Ok(())
+}
+
+fn define_ctor_async<T: 'static>(
+    inst: &mut LinkerInstance<'_, T>,
+    linker_name: &str,
+    ctor_key: String,
+    entry: &Arc<ResourceEntry>,
+    cx: &DispatchCx,
+) -> Result<(), WasmBindError> {
+    let (entry, cx) = (entry.clone(), cx.clone());
+    let msg = linker_name.to_string();
+    inst.func_new(linker_name, move |mut store, _fty, params, results| {
+        let args = lift_args(&cx, &mut store, params, 0, &msg)?;
+        let ctor = entry
+            .ctors_async
+            .get(ctor_key.as_str())
+            .ok_or_else(|| trap(&msg, "constructor has no bridge channel"))?;
+        let value = block_on(ctor(&args)).map_err(|e| trap_convert(&msg, e))?;
+        results[0] = cx.own_handle(&mut store, entry.type_name, value)?;
         Ok(())
     })?;
     Ok(())

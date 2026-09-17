@@ -22,27 +22,53 @@ use crate::types::{TypeDescriptor, TypeId};
 
 /// Type-erased wrapper for user-defined types flowing through [`ScriptValue`].
 ///
-/// Uses `Arc` internally so that `ScriptValue` remains `Clone`.
+/// Uses `Arc` internally so that `ScriptValue` remains `Clone`. Values
+/// constructed through [`new_typed`](Self::new_typed) carry their haphe
+/// [`TypeId`] so dynamic dispatch can rank them exactly; untagged values
+/// rank as merely coercible and resolve by try-call.
 #[derive(Clone)]
-pub struct OpaqueUserData(pub Arc<dyn std::any::Any + Send + Sync>);
+pub struct OpaqueUserData {
+    inner: Arc<dyn std::any::Any + Send + Sync>,
+    type_tag: Option<TypeId<'static>>,
+}
 
 impl OpaqueUserData {
     pub fn new<T: Send + Sync + 'static>(value: T) -> Self {
-        Self(Arc::new(value))
+        Self {
+            inner: Arc::new(value),
+            type_tag: None,
+        }
+    }
+
+    /// Wraps a described type, capturing its [`TypeId`] for dynamic
+    /// dispatch.
+    pub fn new_typed<T: crate::script::ScriptType + Send + Sync + 'static>(value: T) -> Self {
+        Self {
+            inner: Arc::new(value),
+            type_tag: Some(<T as crate::script::ScriptType>::ID),
+        }
+    }
+
+    /// The described type's id, when constructed via
+    /// [`new_typed`](Self::new_typed).
+    pub fn type_tag(&self) -> Option<TypeId<'static>> {
+        self.type_tag
     }
 
     pub fn downcast_ref<T: 'static>(&self) -> Option<&T> {
-        self.0.downcast_ref()
+        self.inner.downcast_ref()
     }
 
     pub fn downcast_clone<T: Clone + 'static>(&self) -> Option<T> {
-        self.0.downcast_ref::<T>().cloned()
+        self.inner.downcast_ref::<T>().cloned()
     }
 }
 
 impl std::fmt::Debug for OpaqueUserData {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_tuple("UserData").field(&self.0.type_id()).finish()
+        f.debug_tuple("UserData")
+            .field(&self.inner.type_id())
+            .finish()
     }
 }
 
@@ -485,6 +511,50 @@ pub trait TypeBinder<T>: Sized {
         f: for<'a> fn(&'a mut T, &'a [ScriptValue]) -> ScriptCallFuture<'a>,
     ) -> Result<(), Self::Error>;
 
+    /// Register an `async` constructor. The returned future may borrow the
+    /// argument slice; async-capability gating applies, like
+    /// [`method_async`](Self::method_async).
+    fn constructor_async(
+        &mut self,
+        name: &'static str,
+        f: for<'a> fn(&'a [ScriptValue]) -> ScriptCtorFuture<'a, T>,
+    ) -> Result<(), Self::Error>;
+
+    /// Register a computed-property getter, from `#[script(getter)]`.
+    /// Conversion is infallible on the way out; the setter side converts
+    /// fallibly.
+    fn property_get(
+        &mut self,
+        name: &'static str,
+        f: fn(&T) -> ScriptValue,
+    ) -> Result<(), Self::Error>;
+
+    /// Register a computed-property setter, from `#[script(setter)]`.
+    fn property_set(
+        &mut self,
+        name: &'static str,
+        f: fn(&mut T, ScriptValue) -> Result<(), ScriptConvertError>,
+    ) -> Result<(), Self::Error>;
+
+    /// Register an `async` computed-property getter. The receiver arrives
+    /// as a [`ScriptCow`] the future may borrow (see
+    /// [`method_async`](Self::method_async)); async-capability gating
+    /// applies.
+    fn property_get_async(
+        &mut self,
+        name: &'static str,
+        f: for<'a> fn(ScriptCow<'a, T>) -> ScriptCallFuture<'a>,
+    ) -> Result<(), Self::Error>;
+
+    /// Register an `async` computed-property setter. The future borrows the
+    /// receiver mutably for its whole run, so mutation writes back in place
+    /// (see [`method_async_mut`](Self::method_async_mut)).
+    fn property_set_async(
+        &mut self,
+        name: &'static str,
+        f: for<'a> fn(&'a mut T, ScriptValue) -> ScriptCallFuture<'a>,
+    ) -> Result<(), Self::Error>;
+
     /// Register a constructor (no receiver, returns `T`).
     fn constructor(
         &mut self,
@@ -672,6 +742,12 @@ pub type ScriptCallFuture<'a> = ::core::pin::Pin<
     Box<dyn ::core::future::Future<Output = Result<ScriptValue, ScriptConvertError>> + 'a>,
 >;
 
+/// Boxed future produced by an async constructor
+/// ([`TypeBinder::constructor_async`]): resolves to the constructed value.
+/// Not `Send`, like [`ScriptCallFuture`].
+pub type ScriptCtorFuture<'a, T> =
+    ::core::pin::Pin<Box<dyn ::core::future::Future<Output = Result<T, ScriptConvertError>> + 'a>>;
+
 /// Owned iterator over a value's contents.
 ///
 /// Produced from `IntoIterator` on an owned value, so it borrows nothing and
@@ -742,6 +818,47 @@ pub trait FnBinder: Sized {
         type_args: &'static [crate::types::TypeDescriptor<'static>],
         f: fn(&[ScriptValue]) -> Result<ScriptValue, ScriptConvertError>,
     ) -> Result<(), Self::Error>;
+
+    /// Register an `async` free function. The returned future may borrow the
+    /// argument slice for `'a`. Only reachable when the backend's
+    /// capabilities declare async support — others reject the registration
+    /// with a descriptive error rather than dropping it.
+    fn function_async(
+        &mut self,
+        name: &'static str,
+        type_args: &'static [crate::types::TypeDescriptor<'static>],
+        f: for<'a> fn(&'a [ScriptValue]) -> ScriptCallFuture<'a>,
+    ) -> Result<(), Self::Error>;
+
+    /// Register one candidate of a `dyn`-dispatched generic function.
+    ///
+    /// Called once per declared instantiation, like
+    /// [`function`](Self::function); the whole descriptor is provided
+    /// because dynamic resolution ranks candidates against the declared
+    /// parameter types (see
+    /// [`resolve_dyn_candidate`](crate::dispatch::resolve_dyn_candidate)).
+    /// The default delegates to `function` — safe because the capability
+    /// check rejects `dyn` functions before binding on backends without
+    /// [`dyn_generics`](crate::BackendCapabilities::dyn_generics), and a
+    /// bypassing bind still hits the backend's loud static-generic path.
+    fn function_dyn(
+        &mut self,
+        descriptor: &'static crate::function::FunctionDescriptor<'static>,
+        type_args: &'static [crate::types::TypeDescriptor<'static>],
+        f: fn(&[ScriptValue]) -> Result<ScriptValue, ScriptConvertError>,
+    ) -> Result<(), Self::Error> {
+        self.function(descriptor.name, type_args, f)
+    }
+
+    /// Async sibling of [`function_dyn`](Self::function_dyn).
+    fn function_dyn_async(
+        &mut self,
+        descriptor: &'static crate::function::FunctionDescriptor<'static>,
+        type_args: &'static [crate::types::TypeDescriptor<'static>],
+        f: for<'a> fn(&'a [ScriptValue]) -> ScriptCallFuture<'a>,
+    ) -> Result<(), Self::Error> {
+        self.function_async(descriptor.name, type_args, f)
+    }
 }
 
 // ---------------------------------------------------------------------------
