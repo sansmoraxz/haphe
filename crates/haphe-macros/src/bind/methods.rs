@@ -30,6 +30,35 @@ pub(crate) fn gen_param_extractions(params: &[(Ident, Type)]) -> Vec<TokenStream
         .collect()
 }
 
+/// The wrapper expression producing the call's `ScriptValue` result:
+/// infallible calls convert directly; fallible ones (`Result<T, E>` in the
+/// declared signature) map `Err` into [`ScriptCallError::Host`], rendering
+/// `E` via `Display` and tagging the declared `error_kind`.
+pub(crate) fn gen_result_expr(method: &BindMethod, call: TokenStream) -> TokenStream {
+    if method.fallible {
+        let kind = match &method.error_kind {
+            Some(kind) => quote! { ::core::option::Option::Some(#kind) },
+            None => quote! { ::core::option::Option::None },
+        };
+        return quote! {
+            match #call {
+                ::core::result::Result::Ok(__v) => ::haphe::IntoScript::into_script(__v),
+                ::core::result::Result::Err(__e) => {
+                    return ::core::result::Result::Err(::haphe::ScriptCallError::Host {
+                        message: ::std::string::ToString::to_string(&__e),
+                        kind: #kind,
+                    });
+                }
+            }
+        };
+    }
+    if method.has_return {
+        quote! { ::haphe::IntoScript::into_script(#call) }
+    } else {
+        quote! { { #call; ::haphe::ScriptValue::Unit } }
+    }
+}
+
 pub(crate) fn gen_call_args(params: &[(Ident, Type)]) -> Vec<TokenStream> {
     params
         .iter()
@@ -164,7 +193,7 @@ pub fn gen_dispatched_method_registration(self_ty: &Type, method: &BindMethod) -
                     __b.#register(
                         #name,
                         (|#wrapper_sig, __args: &[::haphe::ScriptValue]|
-                            -> ::core::result::Result<::haphe::ScriptValue, ::haphe::ScriptConvertError> {
+                            -> ::core::result::Result<::haphe::ScriptValue, ::haphe::ScriptCallError> {
                             #wrapper_prep
                             #(
                                 let #p_vars = <__T::#p_assoc as ::haphe::FromScript>::from_script(
@@ -175,7 +204,7 @@ pub fn gen_dispatched_method_registration(self_ty: &Type, method: &BindMethod) -
                                 __T::__invoke(__t, #( #p_vars ),*)
                             ))
                         }) as #cast_ty
-                            -> ::core::result::Result<::haphe::ScriptValue, ::haphe::ScriptConvertError>,
+                            -> ::core::result::Result<::haphe::ScriptValue, ::haphe::ScriptCallError>,
                     )
                 }
             }
@@ -198,11 +227,7 @@ pub(crate) fn gen_async_method_registration(self_ty: &Type, method: &BindMethod)
     let extractions = gen_param_extractions(&method.params);
     let call_args = gen_call_args(&method.params);
 
-    let result_expr = if method.has_return {
-        quote! { ::haphe::IntoScript::into_script(__t.#ident(#(#call_args),*).await) }
-    } else {
-        quote! { { __t.#ident(#(#call_args),*).await; ::haphe::ScriptValue::Unit } }
-    };
+    let result_expr = gen_result_expr(method, quote! { __t.#ident(#(#call_args),*).await });
 
     if matches!(method.receiver, ReceiverShape::RefMut) {
         return quote! {
@@ -329,16 +354,40 @@ pub(crate) fn gen_async_constructor_registration(self_ty: &Type, ctor: &BindMeth
     let ident = &ctor.ident;
     let extractions = gen_param_extractions(&ctor.params);
     let call_args = gen_call_args(&ctor.params);
+    let produce = gen_ctor_expr(ctor, quote! { <#self_ty>::#ident(#(#call_args),*).await });
     quote! {
         __b.constructor_async(
             #name,
             (|__args: &[::haphe::ScriptValue]| -> ::haphe::ScriptCtorFuture<'_, #self_ty> {
                 ::std::boxed::Box::pin(async move {
                     #(#extractions)*
-                    ::core::result::Result::Ok(<#self_ty>::#ident(#(#call_args),*).await)
+                    ::core::result::Result::Ok(#produce)
                 })
             }) as for<'a> fn(&'a [::haphe::ScriptValue]) -> ::haphe::ScriptCtorFuture<'a, #self_ty>,
         )?;
+    }
+}
+
+/// The expression producing the constructed value: a fallible constructor's
+/// `Err` maps into [`ScriptCallError::Host`], like [`gen_result_expr`].
+fn gen_ctor_expr(ctor: &BindMethod, call: TokenStream) -> TokenStream {
+    if !ctor.fallible {
+        return call;
+    }
+    let kind = match &ctor.error_kind {
+        Some(kind) => quote! { ::core::option::Option::Some(#kind) },
+        None => quote! { ::core::option::Option::None },
+    };
+    quote! {
+        match #call {
+            ::core::result::Result::Ok(__v) => __v,
+            ::core::result::Result::Err(__e) => {
+                return ::core::result::Result::Err(::haphe::ScriptCallError::Host {
+                    message: ::std::string::ToString::to_string(&__e),
+                    kind: #kind,
+                });
+            }
+        }
     }
 }
 
@@ -349,18 +398,14 @@ pub(crate) fn gen_method_registration(self_ty: &Type, method: &BindMethod) -> To
     let extractions = gen_param_extractions(&method.params);
     let call_args = gen_call_args(&method.params);
 
-    let result_expr = if method.has_return {
-        quote! { ::haphe::IntoScript::into_script(__t.#ident(#(#call_args),*)) }
-    } else {
-        quote! { { __t.#ident(#(#call_args),*); ::haphe::ScriptValue::Unit } }
-    };
+    let result_expr = gen_result_expr(method, quote! { __t.#ident(#(#call_args),*) });
 
     match method.receiver {
         ReceiverShape::Ref => {
             quote! {
                 __b.method(
                     #name,
-                    |__recv: ::haphe::ScriptCow<'_, #self_ty>, __args: &[::haphe::ScriptValue]| -> ::core::result::Result<::haphe::ScriptValue, ::haphe::ScriptConvertError> {
+                    |__recv: ::haphe::ScriptCow<'_, #self_ty>, __args: &[::haphe::ScriptValue]| -> ::core::result::Result<::haphe::ScriptValue, ::haphe::ScriptCallError> {
                         let __t: &#self_ty = &__recv;
                         #(#extractions)*
                         ::core::result::Result::Ok(#result_expr)
@@ -372,7 +417,7 @@ pub(crate) fn gen_method_registration(self_ty: &Type, method: &BindMethod) -> To
             quote! {
                 __b.method_mut(
                     #name,
-                    |__t: &mut #self_ty, __args: &[::haphe::ScriptValue]| -> ::core::result::Result<::haphe::ScriptValue, ::haphe::ScriptConvertError> {
+                    |__t: &mut #self_ty, __args: &[::haphe::ScriptValue]| -> ::core::result::Result<::haphe::ScriptValue, ::haphe::ScriptCallError> {
                         #(#extractions)*
                         ::core::result::Result::Ok(#result_expr)
                     },
@@ -380,15 +425,10 @@ pub(crate) fn gen_method_registration(self_ty: &Type, method: &BindMethod) -> To
             }
         }
         ReceiverShape::Owned => {
-            let result_expr = if method.has_return {
-                quote! { ::haphe::IntoScript::into_script(__t.#ident(#(#call_args),*)) }
-            } else {
-                quote! { { __t.#ident(#(#call_args),*); ::haphe::ScriptValue::Unit } }
-            };
             quote! {
                 __b.method(
                     #name,
-                    |__recv: ::haphe::ScriptCow<'_, #self_ty>, __args: &[::haphe::ScriptValue]| -> ::core::result::Result<::haphe::ScriptValue, ::haphe::ScriptConvertError> {
+                    |__recv: ::haphe::ScriptCow<'_, #self_ty>, __args: &[::haphe::ScriptValue]| -> ::core::result::Result<::haphe::ScriptValue, ::haphe::ScriptCallError> {
                         // Consuming receiver: clone-at-boundary only when the
                         // backend handed a borrowed carrier.
                         let __t: #self_ty = __recv.into_owned();
@@ -399,12 +439,14 @@ pub(crate) fn gen_method_registration(self_ty: &Type, method: &BindMethod) -> To
             }
         }
         ReceiverShape::None => {
+            let result_expr =
+                gen_result_expr(method, quote! { <#self_ty>::#ident(#(#call_args),*) });
             quote! {
                 __b.method(
                     #name,
-                    |_: ::haphe::ScriptCow<'_, #self_ty>, __args: &[::haphe::ScriptValue]| -> ::core::result::Result<::haphe::ScriptValue, ::haphe::ScriptConvertError> {
+                    |_: ::haphe::ScriptCow<'_, #self_ty>, __args: &[::haphe::ScriptValue]| -> ::core::result::Result<::haphe::ScriptValue, ::haphe::ScriptCallError> {
                         #(#extractions)*
-                        ::core::result::Result::Ok(::haphe::IntoScript::into_script(<#self_ty>::#ident(#(#call_args),*)))
+                        ::core::result::Result::Ok(#result_expr)
                     },
                 )?;
             }
@@ -421,6 +463,27 @@ pub(crate) fn gen_method_registration(self_ty: &Type, method: &BindMethod) -> To
 pub fn gen_generic_method_registration(self_ty: &Type, dm: &GenericBindMethod) -> TokenStream {
     let descriptor = &dm.descriptor;
     let ident = &dm.method.ident;
+    // The self type's generic identity, resolved per monomorph at bind time
+    // (`<T as HapheType>::DESCRIPTOR` const-promotes in the generic bind
+    // impl).
+    let self_inst = if dm.self_params.is_empty() {
+        quote! { ::haphe::SelfInstantiation::NONE }
+    } else {
+        let names: Vec<String> = dm.self_params.iter().map(|i| i.to_string()).collect();
+        let params = &dm.self_params;
+        quote! {
+            ::haphe::SelfInstantiation {
+                params: &[#(
+                    ::haphe::GenericParam {
+                        name: #names,
+                        bounds: &[],
+                        default: ::core::option::Option::None,
+                    }
+                ),*],
+                args: &[#( <#params as ::haphe::HapheType>::DESCRIPTOR ),*],
+            }
+        }
+    };
     let regs: Vec<TokenStream> = dm
         .instantiations
         .iter()
@@ -445,17 +508,8 @@ pub fn gen_generic_method_registration(self_ty: &Type, dm: &GenericBindMethod) -
                 ReceiverShape::None => quote! { <#self_ty>::#ident::<#(#types),*>(#(#call_args),*) },
                 _ => quote! { __t.#ident::<#(#types),*>(#(#call_args),*) },
             };
-            let (sync_result, async_result) = if dm.method.has_return {
-                (
-                    quote! { ::haphe::IntoScript::into_script(#call) },
-                    quote! { ::haphe::IntoScript::into_script(#call.await) },
-                )
-            } else {
-                (
-                    quote! { { #call; ::haphe::ScriptValue::Unit } },
-                    quote! { { #call.await; ::haphe::ScriptValue::Unit } },
-                )
-            };
+            let sync_result = gen_result_expr(&dm.method, call.clone());
+            let async_result = gen_result_expr(&dm.method, quote! { #call.await });
             let recv_prep = match dm.method.receiver {
                 ReceiverShape::Owned => quote! { let __t: #self_ty = __recv.into_owned(); },
                 ReceiverShape::Ref => quote! { let __t: &#self_ty = &__recv; },
@@ -468,21 +522,21 @@ pub fn gen_generic_method_registration(self_ty: &Type, dm: &GenericBindMethod) -
                         __b.method_generic_mut(
                             #name,
                             #type_args,
-                            (|__t: &mut #self_ty, __args: &[::haphe::ScriptValue]| -> ::core::result::Result<::haphe::ScriptValue, ::haphe::ScriptConvertError> {
+                            (|__t: &mut #self_ty, __args: &[::haphe::ScriptValue]| -> ::core::result::Result<::haphe::ScriptValue, ::haphe::ScriptCallError> {
                                 #(#extractions)*
                                 ::core::result::Result::Ok(#sync_result)
-                            }) as fn(&mut #self_ty, &[::haphe::ScriptValue]) -> ::core::result::Result<::haphe::ScriptValue, ::haphe::ScriptConvertError>,
+                            }) as fn(&mut #self_ty, &[::haphe::ScriptValue]) -> ::core::result::Result<::haphe::ScriptValue, ::haphe::ScriptCallError>,
                         )?;
                     },
                     (false, _) => quote::quote_spanned! {*span=>
                         __b.method_generic(
                             #name,
                             #type_args,
-                            (|__recv: ::haphe::ScriptCow<'_, #self_ty>, __args: &[::haphe::ScriptValue]| -> ::core::result::Result<::haphe::ScriptValue, ::haphe::ScriptConvertError> {
+                            (|__recv: ::haphe::ScriptCow<'_, #self_ty>, __args: &[::haphe::ScriptValue]| -> ::core::result::Result<::haphe::ScriptValue, ::haphe::ScriptCallError> {
                                 #recv_prep
                                 #(#extractions)*
                                 ::core::result::Result::Ok(#sync_result)
-                            }) as for<'a> fn(::haphe::ScriptCow<'a, #self_ty>, &[::haphe::ScriptValue]) -> ::core::result::Result<::haphe::ScriptValue, ::haphe::ScriptConvertError>,
+                            }) as for<'a> fn(::haphe::ScriptCow<'a, #self_ty>, &[::haphe::ScriptValue]) -> ::core::result::Result<::haphe::ScriptValue, ::haphe::ScriptCallError>,
                         )?;
                     },
                     (true, ReceiverShape::RefMut) => quote::quote_spanned! {*span=>
@@ -517,27 +571,30 @@ pub fn gen_generic_method_registration(self_ty: &Type, dm: &GenericBindMethod) -
                     __b.method_dyn_mut(
                         &__HAPHE_DYN_DESC,
                         #type_args,
-                        (|__t: &mut #self_ty, __args: &[::haphe::ScriptValue]| -> ::core::result::Result<::haphe::ScriptValue, ::haphe::ScriptConvertError> {
+                        #self_inst,
+                        (|__t: &mut #self_ty, __args: &[::haphe::ScriptValue]| -> ::core::result::Result<::haphe::ScriptValue, ::haphe::ScriptCallError> {
                             #(#extractions)*
                             ::core::result::Result::Ok(#sync_result)
-                        }) as fn(&mut #self_ty, &[::haphe::ScriptValue]) -> ::core::result::Result<::haphe::ScriptValue, ::haphe::ScriptConvertError>,
+                        }) as fn(&mut #self_ty, &[::haphe::ScriptValue]) -> ::core::result::Result<::haphe::ScriptValue, ::haphe::ScriptCallError>,
                     )?;
                 },
                 (false, _) => quote::quote_spanned! {*span=>
                     __b.method_dyn(
                         &__HAPHE_DYN_DESC,
                         #type_args,
-                        (|__recv: ::haphe::ScriptCow<'_, #self_ty>, __args: &[::haphe::ScriptValue]| -> ::core::result::Result<::haphe::ScriptValue, ::haphe::ScriptConvertError> {
+                        #self_inst,
+                        (|__recv: ::haphe::ScriptCow<'_, #self_ty>, __args: &[::haphe::ScriptValue]| -> ::core::result::Result<::haphe::ScriptValue, ::haphe::ScriptCallError> {
                             #recv_prep
                             #(#extractions)*
                             ::core::result::Result::Ok(#sync_result)
-                        }) as for<'a> fn(::haphe::ScriptCow<'a, #self_ty>, &[::haphe::ScriptValue]) -> ::core::result::Result<::haphe::ScriptValue, ::haphe::ScriptConvertError>,
+                        }) as for<'a> fn(::haphe::ScriptCow<'a, #self_ty>, &[::haphe::ScriptValue]) -> ::core::result::Result<::haphe::ScriptValue, ::haphe::ScriptCallError>,
                     )?;
                 },
                 (true, ReceiverShape::RefMut) => quote::quote_spanned! {*span=>
                     __b.method_dyn_async_mut(
                         &__HAPHE_DYN_DESC,
                         #type_args,
+                        #self_inst,
                         (|__t: &mut #self_ty, __args: &[::haphe::ScriptValue]| -> ::haphe::ScriptCallFuture<'_> {
                             ::std::boxed::Box::pin(async move {
                                 #(#extractions)*
@@ -550,6 +607,7 @@ pub fn gen_generic_method_registration(self_ty: &Type, dm: &GenericBindMethod) -
                     __b.method_dyn_async(
                         &__HAPHE_DYN_DESC,
                         #type_args,
+                        #self_inst,
                         (|__recv: ::haphe::ScriptCow<'_, #self_ty>, __args: &[::haphe::ScriptValue]| -> ::haphe::ScriptCallFuture<'_> {
                             ::std::boxed::Box::pin(async move {
                                 #recv_prep
@@ -582,12 +640,13 @@ pub(crate) fn gen_constructor_registration(self_ty: &Type, ctor: &BindMethod) ->
     let extractions = gen_param_extractions(&ctor.params);
     let call_args = gen_call_args(&ctor.params);
 
+    let produce = gen_ctor_expr(ctor, quote! { <#self_ty>::#ident(#(#call_args),*) });
     quote! {
         __b.constructor(
             #name,
-            |__args: &[::haphe::ScriptValue]| -> ::core::result::Result<#self_ty, ::haphe::ScriptConvertError> {
+            |__args: &[::haphe::ScriptValue]| -> ::core::result::Result<#self_ty, ::haphe::ScriptCallError> {
                 #(#extractions)*
-                ::core::result::Result::Ok(<#self_ty>::#ident(#(#call_args),*))
+                ::core::result::Result::Ok(#produce)
             },
         )?;
     }

@@ -1,5 +1,0 @@
-error: generic impl-block functions on generic self types are not supported yet
-  --> tests/ui/dyn_method_generic_self.rs:12:12
-   |
-12 |     fn echo<U>(&self, value: U) -> U {
-   |            ^

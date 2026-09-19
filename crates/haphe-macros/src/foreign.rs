@@ -14,40 +14,8 @@ use crate::attrs::{
     Errors, ThreadSafetyKind, extract_doc, option_str_tokens, parse_fn_args, parse_foreign_args,
     strip_script_attrs,
 };
-use crate::fn_desc::{ReceiverShape, build_fn_info, strip_param_script_attrs};
+use crate::fn_desc::{ReceiverShape, build_fn_info, result_types, strip_param_script_attrs};
 use crate::ty_map::TyCtx;
-
-/// `Result<T, E>` split syntactically, mirroring the built-in-container rules
-/// of `ty_map` (bare name, or a `std`/`core` path).
-fn result_types(ty: &Type) -> Option<(&Type, &Type)> {
-    let Type::Path(p) = ty else { return None };
-    if p.qself.is_some() {
-        return None;
-    }
-    let is_builtin_path = p.path.segments.len() == 1
-        || matches!(
-            p.path.segments.first().map(|seg| seg.ident.to_string()),
-            Some(ref first) if matches!(first.as_str(), "std" | "core")
-        );
-    if !is_builtin_path {
-        return None;
-    }
-    let last = p.path.segments.last()?;
-    if last.ident != "Result" {
-        return None;
-    }
-    let syn::PathArguments::AngleBracketed(args) = &last.arguments else {
-        return None;
-    };
-    let mut types = args.args.iter().filter_map(|a| match a {
-        syn::GenericArgument::Type(t) => Some(t),
-        _ => None,
-    });
-    match (types.next(), types.next(), types.next()) {
-        (Some(ok), Some(err), None) => Some((ok, err)),
-        _ => None,
-    }
-}
 
 /// Strips helper attributes from every method so error paths never re-emit
 /// them (they would be unresolved attributes on plain trait items).

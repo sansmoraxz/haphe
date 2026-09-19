@@ -572,6 +572,7 @@ impl WitGenerator {
                         member_names.insert_as(&raw, &format!("trait projection `{raw}`"))?;
                     emit_projection(p, &proj, &fn_name, &rec_name, false, plan, None, s.name)?;
                 }
+                emit_record_properties(p, s, &rec_name, s.name, plan, None, &mut member_names)?;
             }
         }
         for &i in &iface.instance_indices {
@@ -596,6 +597,15 @@ impl WitGenerator {
                         s.name,
                     )?;
                 }
+                emit_record_properties(
+                    p,
+                    s,
+                    &inst.wit_name,
+                    &inst.wit_name,
+                    plan,
+                    Some(&env),
+                    &mut member_names,
+                )?;
             }
         }
 
@@ -723,6 +733,42 @@ fn validate_package_name(package: &str) -> Result<(), WitGenError> {
             || segment.ends_with('-')
         {
             return Err(err());
+        }
+    }
+    Ok(())
+}
+
+/// Computed properties of a RECORD (value semantics): projected as
+/// interface-level accessor functions — `{type}-{prop}: func(this) -> T`
+/// and, when writable, `{type}-set-{prop}: func(this, value) -> {type}`
+/// returning the UPDATED record (mirroring the `IndexSet` projection; a
+/// record cannot write back in place).
+fn emit_record_properties(
+    p: &mut Printer,
+    s: &StructDescriptor<'_>,
+    rec_name: &str,
+    owner_raw: &str,
+    plan: &Plan<'_>,
+    env: Option<&Env<'_, '_>>,
+    member_names: &mut NameMap,
+) -> Result<(), WitGenError> {
+    for prop in s.properties {
+        let context = format!("{}.{}", s.name, prop.name);
+        let getter_raw = format!("{}-{}", owner_raw, prop.name);
+        let getter =
+            member_names.insert_as(&getter_raw, &format!("property accessor `{getter_raw}`"))?;
+        let ty = render_type(prop.ty, Pos::Return(Ownership::Owned), plan, env, &context)?;
+        p.doc(prop.doc);
+        p.line(&format!("{getter}: func(this: {rec_name}) -> {ty};"));
+        if !prop.readonly {
+            let setter_raw = format!("{}-set-{}", owner_raw, prop.name);
+            let setter = member_names
+                .insert_as(&setter_raw, &format!("property accessor `{setter_raw}`"))?;
+            let vty = render_type(prop.ty, Pos::Param(Ownership::Owned), plan, env, &context)?;
+            p.doc(Some("Returns the updated record (value semantics)."));
+            p.line(&format!(
+                "{setter}: func(this: {rec_name}, value: {vty}) -> {rec_name};"
+            ));
         }
     }
     Ok(())

@@ -77,7 +77,7 @@ pub(crate) fn gen_metamethod_registrations(self_ty: &Type, traits: &[TraitDecl])
                         "default",
                         (|_: &[::haphe::ScriptValue]| ::core::result::Result::Ok(
                             <#self_ty as ::core::default::Default>::default()
-                        )) as fn(&[::haphe::ScriptValue]) -> ::core::result::Result<#self_ty, ::haphe::ScriptConvertError>,
+                        )) as fn(&[::haphe::ScriptValue]) -> ::core::result::Result<#self_ty, ::haphe::ScriptCallError>,
                     )?;
                 });
             }

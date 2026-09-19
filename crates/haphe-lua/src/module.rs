@@ -24,7 +24,10 @@ pub(crate) fn bind_module(
     // for every unit case, where the value is the case-name string for
     // string-represented enums and the integer discriminant for numeric
     // ones (a Rust `#[repr]` integer type; flags carry their real bit
-    // values).
+    // values). A case WITH a payload gets a CONSTRUCTOR FUNCTION instead —
+    // `Table.Case(v1, v2)` builds its case table
+    // (`{ case = "Case", v1, v2 }`), arity-checked against the declared
+    // payload shape.
     for type_id in module.type_ids {
         let type_kind = registry.get_type(type_id);
         let name = type_kind
@@ -42,19 +45,40 @@ pub(crate) fn bind_module(
             let type_table = lua.create_table()?;
             if let Some(haphe::TypeKind::Enum(e)) = type_kind {
                 for variant in e.variants {
-                    if !matches!(variant.kind, haphe::VariantKind::Unit) {
-                        continue;
-                    }
                     if !type_table.get::<Value>(variant.name)?.is_nil() {
                         return Err(LuaBindError::DuplicateEnumCase {
                             enum_name: name.to_owned(),
                             case: variant.name.to_owned(),
                         });
                     }
-                    match variant.discriminant {
-                        Some(value) => type_table.set(variant.name, value)?,
-                        None => type_table.set(variant.name, variant.name)?,
-                    }
+                    let arity = match &variant.kind {
+                        haphe::VariantKind::Unit => {
+                            match variant.discriminant {
+                                Some(value) => type_table.set(variant.name, value)?,
+                                None => type_table.set(variant.name, variant.name)?,
+                            }
+                            continue;
+                        }
+                        haphe::VariantKind::Tuple(tys) => tys.len(),
+                        haphe::VariantKind::Struct(fields) => fields.len(),
+                    };
+                    let case = variant.name.to_owned();
+                    let enum_name = name.to_owned();
+                    let ctor = lua.create_function(move |lua, args: mlua::MultiValue| {
+                        if args.len() != arity {
+                            return Err(mlua::Error::runtime(format!(
+                                "{enum_name}.{case} expects {arity} value(s), got {}",
+                                args.len()
+                            )));
+                        }
+                        let case_table = lua.create_table()?;
+                        case_table.raw_set("case", case.as_str())?;
+                        for (i, v) in args.into_iter().enumerate() {
+                            case_table.raw_set(i + 1, v)?;
+                        }
+                        Ok(case_table)
+                    })?;
+                    type_table.set(variant.name, ctor)?;
                 }
             }
             table.set(name, type_table)?;

@@ -17,14 +17,14 @@ let output = haphe::generate(&generator, &REGISTRY)?;
 | haphe IR | WIT |
 |---|---|
 | module (recursively flattened, e.g. `geometry::utils`) | `interface geometry-utils` |
-| struct without methods/constructors/properties | `record` |
-| struct with any of those | `resource` (fields become getter/setter funcs) |
+| struct without methods/constructors | `record` (computed properties, if any, project as interface functions: `{type}-{prop}: func(this) -> T` and, when writable, `{type}-set-{prop}: func(this, value) -> {type}` returning the UPDATED record — value semantics, like the `IndexSet` projection) |
+| struct with methods or constructors | `resource` (fields and computed properties become getter/setter members) |
 | enum with unit variants only | `enum` |
 | `#[script(flags)]` enum / `haphe::script_bitflags!` type | `flags` (bit positions follow declaration order; composite masks are compile errors) |
-| enum with payload variants | `variant` (struct variants get a synthesized companion `record`) |
+| enum with payload variants | `variant` (single-field cases carry the field directly, multi-field tuple cases a `tuple<...>`, struct cases a synthesized companion `record`) — at runtime a `ScriptValue::Enum { case, payload }` lowers under the case's kebab spelling with its positional payload reassembled per that shape, and a guest variant whose case translates through the registry (and matches the declared shape) lifts back the same way; untranslated variants keep the single-pair map `{ case: payload }` convention |
 | enum methods | free functions `enum-name-method(this: enum-name, ...)` in the owning interface |
 | type alias | `type x = y;` |
-| module constants | nullary getter functions (value preserved in a doc comment); configurable via `ConstantMode` |
+| module constants | nullary getter functions (value preserved in a doc comment); configurable via `ConstantMode`. Primitive and string constants only: user-type constants (enum cases and payloads have no literal form — `registry!` cannot even declare them) are rejected descriptively at bind |
 | `&T`/`&mut T` params where `T` is a resource | `borrow<t>` |
 | `Borrowed { lifetime, inner }` (lifetime carriers, e.g. `Cow<'a, T>`) | lowered as `inner` — WIT values cross by copy, so the carried lifetime does not exist in the text |
 | `Result<T, E>` | `result<t, e>` (unit sides collapse) |
@@ -76,12 +76,37 @@ selectable: `winch`, `pulley`, `all-arch`, `incremental-cache`, `call-hook`,
 `memory-protection-keys`, `wmemcheck`, and `trace-log` (each implies
 `runtime`).
 
-Current depth: module constants are bound as real,
-callable host functions; all other functions (free functions, resource
-constructors/methods, enum-method companions) are stubs that trap with
-"not yet implemented"; resource types get placeholder host registrations.
-Full dispatch into the described Rust functions via haphe's bridge machinery
-is a future tranche.
+Binding depth depends on registration: surfaces registered on the
+`WasmBinder` (`register_type`/`register_fn`/`register_instance`/…) dispatch
+LIVE into the described Rust implementations through haphe's bridge
+machinery — free functions, resource constructors/methods (sync and async),
+properties, generic monomorphs and `dyn` dispatchers, enum companions, trait
+projections, and constants. Anything declared in the registry but not
+registered is defined as a stub that traps descriptively when called, so
+guests always link.
+
+## Errors: conversion failures and fallible Rust surfaces
+
+Every bound call wrapper yields haphe's `ScriptCallError`. Both variants map
+to a **wasmtime trap** on the guest boundary:
+
+- `Convert` (an argument or result failed to convert) traps as
+  `` haphe-wit: `name`: argument/result conversion failed: … `` — unchanged
+  behavior.
+- `Host` (a fallible Rust implementation — a `Result<T, E>` constructor,
+  method, or free function — returned `Err`) traps with the error's
+  `Display` rendering, prefixed by the declared `error_kind` hint when one
+  exists: `` haphe-wit: `bounded`: RangeError: negative seed -1 ``.
+
+Fallible surfaces describe their **ok type** in WIT text (`Result<T, E>`
+never appears as `result<t, e>` for these; the error has no wire
+representation). Hand-built descriptors using `TypeDescriptor::Result`
+explicitly are unrelated and still lower to WIT `result`. A future
+refinement could lower `Host` errors into a native `result<T>` return the
+way the foreign direction's `error_kind` convention does; the trap mapping
+is the minimal contract today. In `dyn` dispatch, only `Convert` errors fall
+through to the next candidate — a `Host` error means the matched
+implementation itself failed and propagates immediately.
 
 ## Naming: implicit kebab-case conversion
 
@@ -213,6 +238,18 @@ One documented divergence: a dyn METHOD dispatcher acquires its receiver
 by borrow-and-clone per attempt — a consuming (`self`) candidate does not
 consume the handle, keeping fall-through possible.
 
+**Generic self types.** A dyn method on a generic self type composes two
+substitutions. In the TEXT, positions typed by the SELF type's parameters
+render concretely per resource monomorph (they are fixed there — only the
+method's own parameters become dispatcher cases); statically dispatched
+generic methods likewise compose the resource instantiation's environment
+with the method's own (`mix-f64: func(base: s64, k: f64) -> f64` on
+`dial-s64`). At RUNTIME each candidate carries its
+`haphe::SelfInstantiation`; ranking merges the self parameters/arguments
+with the candidate's own before running the same core matcher
+(`value_matches_descriptor`), so a self-typed parameter ranks against the
+monomorph's concrete type.
+
 ### Foreign dispatch modes
 
 Generic FOREIGN methods declare their dispatch mode at the source
@@ -260,6 +297,10 @@ every linker definition against the guest component at instantiation.
   (`haphe::GenerateError::Incompatible`).
 - WIT `constructor` cannot be `async`, so an async constructor is emitted as a
   `static async func` returning the resource instead.
+- Receiver-less associated functions emit as `static func` members but their
+  runtime binding traps descriptively ("not yet bridged"): the typed bridge
+  erasure cannot fabricate a receiver, so bridging them needs a
+  receiver-less `TypeBinder` channel in haphe-core (tracked upstream).
 - Declared `trait_impls` are PROJECTED into WIT-native named functions
   (interusability: every trait a type declares is reachable from guests).
   On resources they are members; on records they are interface-level

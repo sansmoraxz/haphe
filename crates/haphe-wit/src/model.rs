@@ -128,12 +128,14 @@ impl<'a> Plan<'a> {
             type_names.insert(a.id.as_str(), names.insert(a.name)?);
         }
 
+        // Methods and constructors imply identity (handles); a struct whose
+        // only callable surface is computed properties keeps value semantics
+        // and lowers as a record, its accessors projected as
+        // `{type}-{prop}` / `{type}-set-{prop}` interface functions.
         let resources = registry
             .structs()
             .iter()
-            .filter(|s| {
-                !(s.methods.is_empty() && s.constructors.is_empty() && s.properties.is_empty())
-            })
+            .filter(|s| !(s.methods.is_empty() && s.constructors.is_empty()))
             .map(|s| s.id.as_str())
             .collect();
 

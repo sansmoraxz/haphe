@@ -108,9 +108,37 @@ impl Counter {
         Counter { n }
     }
 
+    /// Fallible constructor: rejects negative seeds.
+    #[script(constructor, error_kind = "RangeError")]
+    fn bounded(n: i64) -> Result<Self, String> {
+        if n < 0 {
+            Err(format!("negative seed {n}"))
+        } else {
+            Ok(Counter { n })
+        }
+    }
+
+    /// Fallible method: errors on underflow.
+    fn checked_sub(&mut self, by: i64) -> Result<i64, String> {
+        if by > self.n {
+            return Err("underflow".to_string());
+        }
+        self.n -= by;
+        Ok(self.n)
+    }
+
     fn bump(&mut self) -> i64 {
         self.n += 1;
         self.n
+    }
+
+    /// Async fallible method: rejects targets below the current count.
+    #[script(error_kind = "PowerError")]
+    async fn recharged(&self, to: i64) -> Result<i64, String> {
+        if to < self.n {
+            return Err(format!("target {to} below charge"));
+        }
+        Ok(to)
     }
 
     #[script(getter)]
@@ -181,13 +209,23 @@ fn delayed(x: f64) -> haphe::Future<f64> {
     haphe::Future::new(async move { x })
 }
 
+/// Halves an even number; odd input is a host error.
+#[script(error_kind = "ParityError")]
+fn halve_even(n: i64) -> Result<i64, String> {
+    if n % 2 == 0 {
+        Ok(n / 2)
+    } else {
+        Err(format!("{n} is odd"))
+    }
+}
+
 haphe::registry! {
     pub static REGISTRY = {
         structs: [Point, Counter],
         modules: [
             mod geometry {
                 doc: "Geometry utilities",
-                functions: [add, midpoint, fetch_rate, counts, delayed],
+                functions: [add, midpoint, fetch_rate, counts, delayed, halve_even],
                 types: [Point, Counter],
                 constants: [
                     /// Circle constant.
@@ -1084,7 +1122,7 @@ fn numeric_enum_discriminants_cross_the_boundary() {
         .unwrap();
     assert!(matches!(
         out,
-        haphe::ScriptValue::Enum { ref case, discriminant: Some(1) } if case == "DragonFruit"
+        haphe::ScriptValue::Enum { ref case, discriminant: Some(1), .. } if case == "DragonFruit"
     ));
 
     // A plain integer lowers into a numeric enum parameter.
@@ -1463,6 +1501,7 @@ fn live_binder() -> WasmBinder<()> {
     b.register_type::<Counter>().unwrap();
     b.register_fn::<add>().unwrap();
     b.register_fn::<midpoint>().unwrap();
+    b.register_fn::<halve_even>().unwrap();
     b
 }
 
@@ -2938,4 +2977,758 @@ fn dyn_method_dispatcher_executes_live() {
 
     let result = run_guest(&engine, &linker, (), DYN_METHOD_GUEST).expect("guest runs");
     assert!(matches!(result, Val::S64(8)), "got: {result:?}");
+}
+
+// ---------------------------------------------------------------------------
+// Fallible surfaces: Ok paths return the value; Err paths trap with the
+// kind-prefixed Host message.
+// ---------------------------------------------------------------------------
+
+/// bounded(6) -> checked-sub(2) = 4; halve-even(8) = 4; total 8.
+const FALLIBLE_OK_GUEST: &str = r#"
+(component
+  (import "haphe:demo/geometry" (instance $geo
+    (export "counter" (type $counter (sub resource)))
+    (export "[static]counter.bounded" (func (param "n" s64) (result (own $counter))))
+    (export "[method]counter.checked-sub" (func (param "self" (borrow $counter)) (param "by" s64) (result s64)))
+    (export "halve-even" (func (param "n" s64) (result s64)))
+  ))
+  (core func $bounded (canon lower (func $geo "[static]counter.bounded")))
+  (core func $sub (canon lower (func $geo "[method]counter.checked-sub")))
+  (core func $halve (canon lower (func $geo "halve-even")))
+  (core module $m
+    (import "geo" "bounded" (func $bounded (param i64) (result i32)))
+    (import "geo" "sub" (func $sub (param i32 i64) (result i64)))
+    (import "geo" "halve" (func $halve (param i64) (result i64)))
+    (func (export "run") (result i64) (local $c i32)
+      (local.set $c (call $bounded (i64.const 6)))
+      (i64.add
+        (call $sub (local.get $c) (i64.const 2))
+        (call $halve (i64.const 8))))
+  )
+  (core instance $mi (instantiate $m
+    (with "geo" (instance
+      (export "bounded" (func $bounded))
+      (export "sub" (func $sub))
+      (export "halve" (func $halve))))
+  ))
+  (func (export "run") (result s64) (canon lift (core func $mi "run")))
+)
+"#;
+
+/// bounded(-1) traps before any handle exists.
+const FALLIBLE_CTOR_TRAP_GUEST: &str = r#"
+(component
+  (import "haphe:demo/geometry" (instance $geo
+    (export "counter" (type $counter (sub resource)))
+    (export "[static]counter.bounded" (func (param "n" s64) (result (own $counter))))
+  ))
+  (core func $bounded (canon lower (func $geo "[static]counter.bounded")))
+  (core module $m
+    (import "geo" "bounded" (func $bounded (param i64) (result i32)))
+    (func (export "run") (result i64)
+      (i64.extend_i32_s (call $bounded (i64.const -1))))
+  )
+  (core instance $mi (instantiate $m
+    (with "geo" (instance (export "bounded" (func $bounded))))
+  ))
+  (func (export "run") (result s64) (canon lift (core func $mi "run")))
+)
+"#;
+
+/// checked-sub(5) on a counter seeded with 1 traps.
+const FALLIBLE_METHOD_TRAP_GUEST: &str = r#"
+(component
+  (import "haphe:demo/geometry" (instance $geo
+    (export "counter" (type $counter (sub resource)))
+    (export "[static]counter.bounded" (func (param "n" s64) (result (own $counter))))
+    (export "[method]counter.checked-sub" (func (param "self" (borrow $counter)) (param "by" s64) (result s64)))
+  ))
+  (core func $bounded (canon lower (func $geo "[static]counter.bounded")))
+  (core func $sub (canon lower (func $geo "[method]counter.checked-sub")))
+  (core module $m
+    (import "geo" "bounded" (func $bounded (param i64) (result i32)))
+    (import "geo" "sub" (func $sub (param i32 i64) (result i64)))
+    (func (export "run") (result i64)
+      (call $sub (call $bounded (i64.const 1)) (i64.const 5)))
+  )
+  (core instance $mi (instantiate $m
+    (with "geo" (instance
+      (export "bounded" (func $bounded))
+      (export "sub" (func $sub))))
+  ))
+  (func (export "run") (result s64) (canon lift (core func $mi "run")))
+)
+"#;
+
+/// halve-even(3) traps.
+const FALLIBLE_FN_TRAP_GUEST: &str = r#"
+(component
+  (import "haphe:demo/geometry" (instance $geo
+    (export "halve-even" (func (param "n" s64) (result s64)))
+  ))
+  (core func $halve (canon lower (func $geo "halve-even")))
+  (core module $m
+    (import "geo" "halve" (func $halve (param i64) (result i64)))
+    (func (export "run") (result i64) (call $halve (i64.const 3)))
+  )
+  (core instance $mi (instantiate $m
+    (with "geo" (instance (export "halve" (func $halve))))
+  ))
+  (func (export "run") (result s64) (canon lift (core func $mi "run")))
+)
+"#;
+
+#[test]
+fn fallible_surfaces_dispatch_ok_paths_live() {
+    let engine = Engine::default();
+    let mut linker = Linker::new(&engine);
+    haphe::bind(&live_binder(), &REGISTRY, &mut linker).expect("binding succeeds");
+
+    let result = run_guest(&engine, &linker, (), FALLIBLE_OK_GUEST).expect("guest runs");
+    assert!(matches!(result, Val::S64(8)), "got: {result:?}");
+}
+
+#[test]
+fn fallible_constructor_err_traps_with_kind() {
+    let engine = Engine::default();
+    let mut linker = Linker::new(&engine);
+    haphe::bind(&live_binder(), &REGISTRY, &mut linker).expect("binding succeeds");
+
+    let err = run_guest(&engine, &linker, (), FALLIBLE_CTOR_TRAP_GUEST).expect_err("Err traps");
+    let msg = format!("{err:?}");
+    assert!(msg.contains("RangeError: negative seed -1"), "got: {msg}");
+}
+
+#[test]
+fn fallible_method_err_traps_without_kind() {
+    let engine = Engine::default();
+    let mut linker = Linker::new(&engine);
+    haphe::bind(&live_binder(), &REGISTRY, &mut linker).expect("binding succeeds");
+
+    let err = run_guest(&engine, &linker, (), FALLIBLE_METHOD_TRAP_GUEST).expect_err("Err traps");
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("checked-sub") && msg.contains("underflow"),
+        "got: {msg}"
+    );
+}
+
+#[test]
+fn fallible_free_fn_err_traps_with_kind() {
+    let engine = Engine::default();
+    let mut linker = Linker::new(&engine);
+    haphe::bind(&live_binder(), &REGISTRY, &mut linker).expect("binding succeeds");
+
+    let err = run_guest(&engine, &linker, (), FALLIBLE_FN_TRAP_GUEST).expect_err("Err traps");
+    let msg = format!("{err:?}");
+    assert!(msg.contains("ParityError: 3 is odd"), "got: {msg}");
+}
+
+// ---------------------------------------------------------------------------
+// Payload enums (native variants) across the foreign boundary
+// ---------------------------------------------------------------------------
+
+/// A pointer event: mixed unit / single / struct cases.
+#[derive(Script, Debug, PartialEq, Clone)]
+enum Event {
+    Idle,
+    Scroll(f64),
+    Move { x: f64, y: f64 },
+}
+
+/// Host-side event operations.
+#[script(foreign, thread_safety = none)]
+trait Events {
+    /// Consumes an event, measuring it.
+    fn area(&self, e: Event) -> f64;
+    /// Builds an event from a selector.
+    fn make(&self, kind: i64) -> Event;
+}
+
+const EVENTS_GUEST: &str = r#"
+(component
+  (core module $m
+    (memory (export "mem") 1)
+    ;; area: (tag, a, b) — idle -> 0, scroll(v) -> v, move{x,y} -> x + y.
+    (func (export "area") (param i32 f64 f64) (result f64)
+      (if (result f64) (i32.eq (local.get 0) (i32.const 1))
+        (then (local.get 1))
+        (else
+          (if (result f64) (i32.eq (local.get 0) (i32.const 2))
+            (then (f64.add (local.get 1) (local.get 2)))
+            (else (f64.const 0))))))
+    ;; make: variant returns through memory (disc byte + 8-aligned payload).
+    (func (export "make") (param i64) (result i32)
+      (i32.store8 (i32.const 32) (i32.wrap_i64 (local.get 0)))
+      (f64.store (i32.const 40) (f64.const 1.5))
+      (f64.store (i32.const 48) (f64.const 4.0))
+      (i32.const 32)))
+  (core instance $mi (instantiate $m))
+  (type $event-move (record (field "x" f64) (field "y" f64)))
+  (type $event (variant (case "idle") (case "scroll" f64) (case "move" $event-move)))
+  (func $area (param "e" $event) (result f64)
+    (canon lift (core func $mi "area")))
+  (func $make (param "kind" s64) (result $event)
+    (canon lift (core func $mi "make") (memory (core memory $mi "mem"))))
+  (instance $i
+    (export "event-move" (type $event-move))
+    (export "event" (type $event))
+    (export "area" (func $area))
+    (export "make" (func $make)))
+  (export "haphe:demo/events" (instance $i))
+)
+"#;
+
+haphe::registry! {
+    pub static EVENTS_REGISTRY = {
+        enums: [Event],
+        foreign: [EventsHandle],
+    };
+}
+
+#[test]
+fn payload_enum_cases_cross_the_foreign_boundary() {
+    let engine = Engine::default();
+    let component = Component::new(&engine, wat::parse_str(EVENTS_GUEST).unwrap()).unwrap();
+    let linker: Linker<()> = Linker::new(&engine);
+    let mut store = wasmtime::Store::new(&engine, ());
+    let instance = linker.instantiate(&mut store, &component).unwrap();
+    let store = std::sync::Arc::new(std::sync::Mutex::new(store));
+    let validated = EVENTS_REGISTRY.validate().unwrap();
+    let events: EventsHandle =
+        haphe_wit::foreign_handle_in("haphe:demo", store, &instance, &validated).unwrap();
+
+    // Every payload shape lowers: unit, single value, struct record.
+    assert_eq!(events.area(Event::Idle), 0.0);
+    assert_eq!(events.area(Event::Scroll(2.5)), 2.5);
+    assert_eq!(events.area(Event::Move { x: 3.0, y: 4.0 }), 7.0);
+
+    // Lifting picks a DIFFERENT case per selector and reassembles the
+    // payload positionally (guest writes 1.5 / {1.5, 4.0}).
+    assert_eq!(events.make(0), Event::Idle);
+    assert_eq!(events.make(1), Event::Scroll(1.5));
+    assert_eq!(events.make(2), Event::Move { x: 1.5, y: 4.0 });
+}
+
+#[test]
+fn payload_enum_errors_are_descriptive() {
+    let engine = Engine::default();
+    let component = Component::new(&engine, wat::parse_str(EVENTS_GUEST).unwrap()).unwrap();
+    let linker: Linker<()> = Linker::new(&engine);
+    let mut store = wasmtime::Store::new(&engine, ());
+    let instance = linker.instantiate(&mut store, &component).unwrap();
+    let store = std::sync::Arc::new(std::sync::Mutex::new(store));
+    let validated = EVENTS_REGISTRY.validate().unwrap();
+    let caller = haphe_wit::foreign_caller_in(
+        "haphe:demo",
+        store,
+        &instance,
+        &<EventsHandle as haphe::ScriptForeign>::DESCRIPTOR,
+        &[],
+        &validated,
+    )
+    .unwrap();
+
+    // Unknown case.
+    let err = caller
+        .call(
+            "area",
+            &[],
+            &[haphe::ScriptValue::Enum {
+                case: "Nope".into(),
+                discriminant: None,
+                payload: vec![],
+            }],
+        )
+        .unwrap_err();
+    assert!(
+        format!("{err}").contains("a declared variant case"),
+        "got: {err}"
+    );
+    // Wrong arity for a single-value case.
+    let err = caller
+        .call(
+            "area",
+            &[],
+            &[haphe::ScriptValue::Enum {
+                case: "Scroll".into(),
+                discriminant: None,
+                payload: vec![haphe::ScriptValue::F64(1.0), haphe::ScriptValue::F64(2.0)],
+            }],
+        )
+        .unwrap_err();
+    assert!(
+        format!("{err}").contains("single-value payload"),
+        "got: {err}"
+    );
+    // A payload on a unit case.
+    let err = caller
+        .call(
+            "area",
+            &[],
+            &[haphe::ScriptValue::Enum {
+                case: "Idle".into(),
+                discriminant: None,
+                payload: vec![haphe::ScriptValue::F64(1.0)],
+            }],
+        )
+        .unwrap_err();
+    assert!(
+        format!("{err}").contains("no payload on a unit case"),
+        "got: {err}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Async fallible surfaces (the sync harness drives provided async futures
+// internally — no separate async store is needed for the provided direction).
+// ---------------------------------------------------------------------------
+
+/// bounded(5) -> recharged(2) traps: 2 < 5.
+const ASYNC_FALLIBLE_TRAP_GUEST: &str = r#"
+(component
+  (import "haphe:demo/geometry" (instance $geo
+    (export "counter" (type $counter (sub resource)))
+    (export "[static]counter.bounded" (func (param "n" s64) (result (own $counter))))
+    (export "[method]counter.recharged" (func (param "self" (borrow $counter)) (param "to" s64) (result s64)))
+  ))
+  (core func $bounded (canon lower (func $geo "[static]counter.bounded")))
+  (core func $rech (canon lower (func $geo "[method]counter.recharged")))
+  (core module $m
+    (import "geo" "bounded" (func $bounded (param i64) (result i32)))
+    (import "geo" "rech" (func $rech (param i32 i64) (result i64)))
+    (func (export "run") (result i64)
+      (call $rech (call $bounded (i64.const 5)) (i64.const 2)))
+  )
+  (core instance $mi (instantiate $m
+    (with "geo" (instance
+      (export "bounded" (func $bounded))
+      (export "rech" (func $rech))))
+  ))
+  (func (export "run") (result s64) (canon lift (core func $mi "run")))
+)
+"#;
+
+#[test]
+fn async_fallible_method_err_traps_with_kind() {
+    let engine = Engine::default();
+    let mut linker = Linker::new(&engine);
+    haphe::bind(&live_binder(), &REGISTRY, &mut linker).expect("binding succeeds");
+    let err = run_guest(&engine, &linker, (), ASYNC_FALLIBLE_TRAP_GUEST).expect_err("Err traps");
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("PowerError: target 2 below charge"),
+        "got: {msg}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Record properties: value-semantics accessors dispatch live.
+// ---------------------------------------------------------------------------
+
+/// A record with computed accessors only.
+#[derive(Script, Clone)]
+#[script(thread_safety = send, methods)]
+struct MeterR {
+    raw: f64,
+}
+
+#[script]
+impl MeterR {
+    #[script(getter)]
+    fn level(&self) -> f64 {
+        self.raw
+    }
+
+    #[script(setter)]
+    fn set_level(&mut self, value: f64) {
+        self.raw = value;
+    }
+}
+
+impl From<MeterR> for haphe::ScriptValue {
+    fn from(m: MeterR) -> Self {
+        haphe::ScriptValue::Map(vec![("raw".to_string(), haphe::ScriptValue::F64(m.raw))])
+    }
+}
+
+impl haphe::FromScript for MeterR {
+    fn from_script(v: haphe::ScriptValue) -> Result<Self, haphe::ScriptConvertError> {
+        let haphe::ScriptValue::Map(pairs) = v else {
+            return Err(haphe::ScriptConvertError {
+                expected: "MeterR",
+                got: v.variant_name(),
+            });
+        };
+        let raw = pairs
+            .iter()
+            .find(|(k, _)| k == "raw")
+            .map(|(_, v)| v.clone())
+            .ok_or(haphe::ScriptConvertError {
+                expected: "MeterR.raw",
+                got: "missing field",
+            })?;
+        Ok(MeterR {
+            raw: haphe::FromScript::from_script(raw)?,
+        })
+    }
+}
+
+haphe::registry! {
+    static METER_R_REGISTRY = {
+        structs: [MeterR],
+        modules: [
+            mod meters { types: [MeterR] },
+        ],
+    };
+}
+
+/// set-level({raw: 1.0}, 4.0) -> updated record; level(updated) + raw field
+/// of updated = 8.0.
+const METER_GUEST: &str = r#"
+(component
+  (type $meter (record (field "raw" f64)))
+  (import "haphe:demo/meters" (instance $mt
+    (export "meter-r" (type $m (eq $meter)))
+    (export "meter-r-level" (func (param "this" $m) (result f64)))
+    (export "meter-r-set-level" (func (param "this" $m) (param "value" f64) (result $m)))
+  ))
+  (core func $level (canon lower (func $mt "meter-r-level")))
+  (core func $set (canon lower (func $mt "meter-r-set-level")))
+  (core module $m
+    (import "mt" "level" (func $level (param f64) (result f64)))
+    (import "mt" "set" (func $set (param f64 f64) (result f64)))
+    (func (export "run") (result f64) (local $u f64)
+      (local.set $u (call $set (f64.const 1) (f64.const 4)))
+      (f64.add (local.get $u) (call $level (local.get $u))))
+  )
+  (core instance $mi (instantiate $m
+    (with "mt" (instance
+      (export "level" (func $level))
+      (export "set" (func $set))))
+  ))
+  (func (export "run") (result f64) (canon lift (core func $mi "run")))
+)
+"#;
+
+#[test]
+fn record_properties_dispatch_live() {
+    let engine = Engine::default();
+    let mut linker = Linker::new(&engine);
+    let mut b = WasmBinder::new(WitGenerator::new("haphe:demo"));
+    b.register_record::<MeterR>().unwrap();
+    haphe::bind(&b, &METER_R_REGISTRY, &mut linker).expect("binding succeeds");
+
+    let result = run_guest(&engine, &linker, (), METER_GUEST).expect("guest runs");
+    match result {
+        Val::Float64(v) => assert!((v - 8.0).abs() < 1e-12, "got: {v}"),
+        other => panic!("expected f64, got: {other:?}"),
+    }
+}
+
+/// Unregistered record properties keep descriptive stubs.
+#[test]
+fn unregistered_record_properties_trap_descriptively() {
+    let engine = Engine::default();
+    let mut linker = Linker::new(&engine);
+    let b = WasmBinder::<()>::new(WitGenerator::new("haphe:demo"));
+    haphe::bind(&b, &METER_R_REGISTRY, &mut linker).expect("binding succeeds");
+
+    let err = run_guest(&engine, &linker, (), METER_GUEST).expect_err("stub should trap");
+    let msg = format!("{err:?}");
+    assert!(msg.contains("not registered"), "got: {msg}");
+}
+
+// ---------------------------------------------------------------------------
+// Receiver-less associated functions: emitted, but bridging needs a
+// receiver-less core channel — the stub trap is the pinned contract.
+// ---------------------------------------------------------------------------
+
+#[derive(Script, Clone)]
+#[script(thread_safety = send, methods)]
+struct FabricR {
+    n: i64,
+}
+
+#[script]
+impl FabricR {
+    #[script(constructor)]
+    fn new(n: i64) -> Self {
+        FabricR { n }
+    }
+
+    fn origin() -> i64 {
+        0
+    }
+}
+
+haphe::registry! {
+    static FABRIC_R_REGISTRY = {
+        structs: [FabricR],
+        modules: [
+            mod fabrics { types: [FabricR] },
+        ],
+    };
+}
+
+const FABRIC_GUEST: &str = r#"
+(component
+  (import "haphe:demo/fabrics" (instance $fb
+    (export "fabric-r" (type $f (sub resource)))
+    (export "[static]fabric-r.origin" (func (result s64)))
+  ))
+  (core func $origin (canon lower (func $fb "[static]fabric-r.origin")))
+  (core module $m
+    (import "fb" "origin" (func $origin (result i64)))
+    (func (export "run") (result i64) (call $origin))
+  )
+  (core instance $mi (instantiate $m
+    (with "fb" (instance (export "origin" (func $origin))))
+  ))
+  (func (export "run") (result s64) (canon lift (core func $mi "run")))
+)
+"#;
+
+#[test]
+fn receiverless_associated_fn_stub_traps_descriptively() {
+    let engine = Engine::default();
+    let mut linker = Linker::new(&engine);
+    let mut b = WasmBinder::new(WitGenerator::new("haphe:demo"));
+    b.register_type::<FabricR>().unwrap();
+    haphe::bind(&b, &FABRIC_R_REGISTRY, &mut linker).expect("binding succeeds");
+
+    let err = run_guest(&engine, &linker, (), FABRIC_GUEST).expect_err("stub should trap");
+    let msg = format!("{err:?}");
+    assert!(msg.contains("not yet bridged"), "got: {msg}");
+}
+
+// ---------------------------------------------------------------------------
+// User-type constants: unreachable from `registry!` (literals only); a
+// hand-built descriptor is rejected descriptively at bind, never silently.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn user_type_constant_rejected_descriptively_at_bind() {
+    static COLOR_REF: haphe::TypeDescriptor =
+        haphe::TypeDescriptor::Ref(haphe::TypeId::new("rt::Hue"));
+    static VARIANTS: [haphe::EnumVariant; 1] = [haphe::EnumVariant {
+        name: "Red",
+        doc: None,
+        kind: haphe::VariantKind::Unit,
+        discriminant: None,
+    }];
+    static ENUMS: [haphe::EnumDescriptor; 1] = [haphe::EnumDescriptor {
+        id: haphe::TypeId::new("rt::Hue"),
+        name: "Hue",
+        doc: None,
+        variants: &VARIANTS,
+        methods: &[],
+        trait_impls: &[],
+        thread_safety: haphe::ThreadSafety::SEND_SYNC,
+        generic_params: &[],
+        repr: None,
+        is_flags: false,
+    }];
+    static CONSTANTS: [haphe::ConstantDescriptor; 1] = [haphe::ConstantDescriptor {
+        name: "FAVORITE",
+        doc: None,
+        ty: &COLOR_REF,
+        value: "Red",
+    }];
+    static MODULES: [haphe::ModuleDescriptor; 1] = [haphe::ModuleDescriptor {
+        name: "palette",
+        doc: None,
+        functions: &[],
+        type_ids: &[haphe::TypeId::new("rt::Hue")],
+        submodules: &[],
+        constants: &CONSTANTS,
+        function_instantiations: &[],
+    }];
+    static REGISTRY: haphe::TypeRegistry =
+        haphe::TypeRegistry::new(&[], &ENUMS, &[], &MODULES, &[], &[]);
+
+    let engine = Engine::default();
+    let mut linker: Linker<()> = Linker::new(&engine);
+    let b = WasmBinder::<()>::new(WitGenerator::new("haphe:demo"));
+    let err = haphe::bind(&b, &REGISTRY, &mut linker).expect_err("constant must be rejected");
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("cannot be bound") && msg.contains("FAVORITE"),
+        "got: {msg}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Generic SELF types: static generic methods compose the resource and
+// method environments; dyn methods carry the self instantiation into the
+// merged resolver.
+// ---------------------------------------------------------------------------
+
+/// A generic dial resource.
+#[cfg(all(feature = "generics", feature = "dyn-generics"))]
+#[derive(Script, Clone)]
+#[script(thread_safety = send_sync, methods)]
+struct Dial<T: haphe::FromScript + haphe::IntoScript + haphe::HapheType + Clone + Send + Sync> {
+    #[script(skip)]
+    v: T,
+}
+
+#[cfg(all(feature = "generics", feature = "dyn-generics"))]
+#[script]
+impl<T: haphe::FromScript + haphe::IntoScript + haphe::HapheType + Clone + Send + Sync> Dial<T> {
+    #[script(constructor)]
+    fn new(v: T) -> Self {
+        Dial { v }
+    }
+
+    /// STATIC generic monomorph on a generic self: `base` is self-typed.
+    #[script(instantiate(f64))]
+    fn mix<U>(&self, base: T, k: U) -> U {
+        let _ = base;
+        k
+    }
+
+    /// Dyn method whose first parameter is SELF-typed: resolvable only
+    /// through the carried self instantiation.
+    #[script(dyn, instantiate(bool), instantiate(i64))]
+    fn tag<U>(&self, base: T, flag: U) -> U {
+        let _ = base;
+        flag
+    }
+}
+
+#[cfg(all(feature = "generics", feature = "dyn-generics"))]
+haphe::registry! {
+    static DIAL_REGISTRY = {
+        structs: [Dial<i64>],
+        modules: [
+            mod dials { types: [Dial<i64>] },
+        ],
+    };
+}
+
+/// tag-dyn(base=7, bool(true)) -> bool true (1); tag-s64 monomorph
+/// (base=7, 40) -> 40; mix-f64(base=7, 1.5) -> 1.5. Total 42.5.
+#[cfg(all(feature = "generics", feature = "dyn-generics"))]
+const DIAL_GUEST: &str = r#"
+(component
+  (type $vt (variant (case "bool" bool) (case "s64" s64)))
+  (import "haphe:demo/dials" (instance $dl
+    (export "dial-s64" (type $d (sub resource)))
+    (export "dial-s64-tag-dyn-flag" (type $v (eq $vt)))
+    (export "[constructor]dial-s64" (func (param "v" s64) (result (own $d))))
+    (export "[method]dial-s64.mix-f64" (func (param "self" (borrow $d)) (param "base" s64) (param "k" f64) (result f64)))
+    (export "[method]dial-s64.tag-s64" (func (param "self" (borrow $d)) (param "base" s64) (param "flag" s64) (result s64)))
+    (export "[method]dial-s64.tag-dyn" (func (param "self" (borrow $d)) (param "base" s64) (param "flag" $v) (result $v)))
+  ))
+  (core module $libc (memory (export "mem") 1))
+  (core instance $li (instantiate $libc))
+  (core func $ctor (canon lower (func $dl "[constructor]dial-s64")))
+  (core func $mix (canon lower (func $dl "[method]dial-s64.mix-f64")))
+  (core func $tag64 (canon lower (func $dl "[method]dial-s64.tag-s64")))
+  (core func $tagdyn (canon lower (func $dl "[method]dial-s64.tag-dyn") (memory (core memory $li "mem"))))
+  (core module $m
+    (import "libc" "mem" (memory 1))
+    (import "dl" "ctor" (func $ctor (param i64) (result i32)))
+    (import "dl" "mix" (func $mix (param i32 i64 f64) (result f64)))
+    (import "dl" "tag64" (func $tag64 (param i32 i64 i64) (result i64)))
+    (import "dl" "tagdyn" (func $tagdyn (param i32 i64 i32 i64 i32)))
+    (func (export "run") (result f64) (local $d i32) (local $acc f64)
+      (local.set $d (call $ctor (i64.const 7)))
+      ;; dyn: case 0 (bool), payload true
+      (call $tagdyn (local.get $d) (i64.const 7) (i32.const 0) (i64.const 1) (i32.const 16))
+      (local.set $acc (f64.convert_i32_u (i32.load8_u (i32.const 24))))
+      ;; static monomorph from the same dyn candidate table
+      (local.set $acc (f64.add (local.get $acc)
+        (f64.convert_i64_s (call $tag64 (local.get $d) (i64.const 7) (i64.const 40)))))
+      ;; static generic monomorph with a self-typed param
+      (local.set $acc (f64.add (local.get $acc)
+        (call $mix (local.get $d) (i64.const 7) (f64.const 1.5))))
+      (local.get $acc))
+  )
+  (core instance $mi (instantiate $m
+    (with "libc" (instance (export "mem" (memory $li "mem"))))
+    (with "dl" (instance
+      (export "ctor" (func $ctor))
+      (export "mix" (func $mix))
+      (export "tag64" (func $tag64))
+      (export "tagdyn" (func $tagdyn))))
+  ))
+  (func (export "run") (result f64) (canon lift (core func $mi "run")))
+)
+"#;
+
+#[cfg(all(feature = "generics", feature = "dyn-generics"))]
+#[test]
+fn generic_self_dyn_and_static_methods_dispatch_live() {
+    static I64_ARGS: [haphe::TypeDescriptor<'static>; 1] =
+        [haphe::TypeDescriptor::Primitive(haphe::PrimitiveType::I64)];
+
+    let engine = Engine::default();
+    let mut linker = Linker::new(&engine);
+    let mut b = WasmBinder::<()>::new(WitGenerator::new("haphe:demo"));
+    b.register_type_instance::<Dial<i64>>(&I64_ARGS).unwrap();
+    haphe::bind(&b, &DIAL_REGISTRY, &mut linker).expect("binding succeeds");
+
+    let result = run_guest(&engine, &linker, (), DIAL_GUEST).expect("guest runs");
+    match result {
+        Val::Float64(v) => assert!((v - 42.5).abs() < 1e-12, "got: {v}"),
+        other => panic!("expected f64, got: {other:?}"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Async dyn foreign: erased addressing through the async caller.
+// ---------------------------------------------------------------------------
+
+/// Async host codec with an erased dyn method.
+#[cfg(feature = "dyn-generics")]
+#[script(foreign, thread_safety = none)]
+trait AsyncCodec {
+    #[script(dyn, instantiate(i64), instantiate(f64))]
+    async fn bump<T>(&self, value: T) -> T;
+}
+
+/// Same guest surface as the sync codec, exported under the async trait's
+/// interface name.
+#[cfg(feature = "dyn-generics")]
+const ASYNC_CODEC_GUEST: &str = r#"
+(component
+  (type $vt (variant (case "s64" s64) (case "f64" f64)))
+  (core module $m
+    (memory (export "mem") 1)
+    (func (export "bump") (param i32 i64) (result i32)
+      (if (i32.eqz (local.get 0))
+        (then (i64.store offset=8 (i32.const 16) (i64.add (local.get 1) (i64.const 1))))
+        (else (f64.store offset=8 (i32.const 16)
+          (f64.add (f64.reinterpret_i64 (local.get 1)) (f64.const 0.5)))))
+      (i32.store8 (i32.const 16) (local.get 0))
+      (i32.const 16))
+  )
+  (core instance $mi (instantiate $m))
+  (func $bump (param "value" $vt) (result $vt)
+    (canon lift (core func $mi "bump") (memory (core memory $mi "mem"))))
+  (instance $i
+    (export "bump-dyn-value" (type $vt))
+    (export "bump" (func $bump)))
+  (export "haphe:demo/async-codec" (instance $i))
+)
+"#;
+
+#[cfg(feature = "dyn-generics")]
+#[test]
+fn async_dyn_foreign_dispatches_through_async_caller() {
+    let engine = Engine::default();
+    let component = Component::new(&engine, wat::parse_str(ASYNC_CODEC_GUEST).unwrap()).unwrap();
+    let linker: Linker<()> = Linker::new(&engine);
+    let mut store = wasmtime::Store::new(&engine, ());
+    let instance = block_on(linker.instantiate_async(&mut store, &component)).unwrap();
+    let store = std::sync::Arc::new(std::sync::Mutex::new(store));
+    let codec: AsyncCodecHandle =
+        haphe_wit::foreign_handle_async("haphe:demo", store, &instance).unwrap();
+    let n: i64 = block_on(codec.bump(41));
+    assert_eq!(n, 42);
+    let f: f64 = block_on(codec.bump(2.0f64));
+    assert_eq!(f, 2.5);
 }

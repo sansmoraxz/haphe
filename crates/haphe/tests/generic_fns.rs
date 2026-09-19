@@ -6,7 +6,7 @@
 
 use haphe::{
     BackendCapabilities, CompatibilityError, FnBinder, PrimitiveType, ScriptBindFn,
-    ScriptConvertError, ScriptFunction, ScriptValue, TypeDescriptor, script,
+    ScriptCallError, ScriptFunction, ScriptValue, TypeDescriptor, script,
 };
 
 /// Echoes a value.
@@ -145,7 +145,7 @@ fn union_dedupes_across_sources() {
     );
 }
 
-type Wrapper = fn(&[ScriptValue]) -> Result<ScriptValue, ScriptConvertError>;
+type Wrapper = fn(&[ScriptValue]) -> Result<ScriptValue, ScriptCallError>;
 
 #[derive(Default)]
 struct Collect(Vec<(&'static str, &'static [TypeDescriptor<'static>], Wrapper)>);

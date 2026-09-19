@@ -5,13 +5,45 @@ use proc_macro2::TokenStream;
 use quote::{quote, quote_spanned};
 use syn::ext::IdentExt;
 use syn::spanned::Spanned;
-use syn::{FnArg, Pat, ReceiverKind, ReturnType, Safety, Signature};
+use syn::{FnArg, Pat, ReceiverKind, ReturnType, Safety, Signature, Type};
 
 use crate::attrs::{
     Errors, FnArgs, extract_doc, option_str_tokens, parse_param_args, strip_script_attrs,
 };
 use crate::ty_map::{TyCtx, descriptor_expr, ownership_expr, substitute_self};
 use crate::verify;
+
+/// `Result<T, E>` split syntactically, mirroring the built-in-container rules
+/// of `ty_map` (bare name, or a `std`/`core` path).
+pub(crate) fn result_types(ty: &Type) -> Option<(&Type, &Type)> {
+    let Type::Path(p) = ty else { return None };
+    if p.qself.is_some() {
+        return None;
+    }
+    let is_builtin_path = p.path.segments.len() == 1
+        || matches!(
+            p.path.segments.first().map(|seg| seg.ident.to_string()),
+            Some(ref first) if matches!(first.as_str(), "std" | "core")
+        );
+    if !is_builtin_path {
+        return None;
+    }
+    let last = p.path.segments.last()?;
+    if last.ident != "Result" {
+        return None;
+    }
+    let syn::PathArguments::AngleBracketed(args) = &last.arguments else {
+        return None;
+    };
+    let mut types = args.args.iter().filter_map(|a| match a {
+        syn::GenericArgument::Type(t) => Some(t),
+        _ => None,
+    });
+    match (types.next(), types.next(), types.next()) {
+        (Some(ok), Some(err), None) => Some((ok, err)),
+        _ => None,
+    }
+}
 
 /// The receiver shape of an exposed function.
 #[derive(Clone, Copy, PartialEq, Eq)]

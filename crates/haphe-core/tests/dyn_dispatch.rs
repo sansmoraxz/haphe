@@ -72,7 +72,8 @@ fn matcher_policy_table() {
         q(
             &ScriptValue::Enum {
                 case: "A".into(),
-                discriminant: None
+                discriminant: None,
+                payload: vec![],
             },
             &T::Ref(TypeId::new("m::E"))
         ),

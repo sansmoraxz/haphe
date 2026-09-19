@@ -31,6 +31,12 @@ pub struct BindMethod {
     pub params: Vec<(Ident, Type)>,
     pub has_return: bool,
     pub return_ty: Option<Type>,
+    /// The declared return was `Result<T, E>`: `return_ty` holds `T` and the
+    /// wrapper maps `Err(e)` into [`ScriptCallError::Host`] (rendered via
+    /// `Display`), tagged with `error_kind`.
+    pub fallible: bool,
+    /// The `error_kind = "..."` hint, carried into `Host` errors.
+    pub error_kind: Option<String>,
 }
 
 /// A generic method: one monomorphized wrapper per declared instantiation.
@@ -39,6 +45,11 @@ pub struct BindMethod {
 /// `method_generic*`, keyed on `(name, type_args)`.
 pub struct GenericBindMethod {
     pub method: BindMethod,
+    /// The impl's (self type's) generic type parameters — empty on a
+    /// non-generic self type. `dyn` registrations carry their identity as
+    /// [`SelfInstantiation`](https://docs.rs/haphe) so the resolver can
+    /// substitute them alongside the method's own.
+    pub self_params: Vec<Ident>,
     /// The function's own generic type parameters, in declaration order.
     pub type_params: Vec<Ident>,
     /// Declared instantiations: concrete type arguments per entry.
@@ -75,6 +86,7 @@ pub fn gen_derive_bind(
     fields: &[BindField],
     traits: &[TraitDecl],
     has_methods: bool,
+    async_probe_in_bind: bool,
     generics: &Generics,
 ) -> TokenStream {
     let mod_ident = hidden_mod_ident(ident);
@@ -108,6 +120,7 @@ pub fn gen_derive_bind(
             if let syn::GenericParam::Type(tp) = param {
                 tp.bounds.push(syn::parse_quote!(::haphe::FromScript));
                 tp.bounds.push(syn::parse_quote!(::haphe::IntoScript));
+                tp.bounds.push(syn::parse_quote!(::haphe::HapheType));
             }
         }
     }
@@ -178,12 +191,28 @@ pub fn gen_derive_bind(
         TokenStream::new()
     };
 
+    // A generic type without a declared thread_safety checks the async rule
+    // here: `bind` monomorphizes exactly when the type is exposed (a
+    // top-level `const _` cannot name the type's parameters).
+    let async_probe = if async_probe_in_bind {
+        quote! {
+            const {
+                ::core::assert!(
+                    !<Self as ::haphe::ScriptImpl>::HAS_ASYNC,
+                    "types with async methods must declare #[script(thread_safety = ...)] explicitly"
+                )
+            };
+        }
+    } else {
+        TokenStream::new()
+    };
     let script_bind = quote! {
         #[automatically_derived]
         impl #bind_impl_g ::haphe::ScriptBind for #self_ty #bind_where_c {
             fn bind<__B: ::haphe::TypeBinder<Self>>(
                 __b: &mut __B,
             ) -> ::core::result::Result<(), __B::Error> {
+                #async_probe
                 #fields_fn_ident(__b)?;
                 #metamethods_fn_ident(__b)?;
                 #methods_call
@@ -246,12 +275,15 @@ pub fn gen_impl_bind_methods(input: BindImplInput<'_>) -> TokenStream {
         .iter()
         .map(|c| gen_constructor_registration(self_ty, c));
 
-    // For generic impls, add FromScript + IntoScript bounds on type params.
+    // For generic impls, add FromScript + IntoScript + HapheType bounds on
+    // type params (the last so dyn methods can materialize the self type's
+    // instantiation descriptors; every bridgeable type is describable).
     let mut bind_generics = generics.clone();
     for param in &mut bind_generics.params {
         if let syn::GenericParam::Type(tp) = param {
             tp.bounds.push(syn::parse_quote!(::haphe::FromScript));
             tp.bounds.push(syn::parse_quote!(::haphe::IntoScript));
+            tp.bounds.push(syn::parse_quote!(::haphe::HapheType));
         }
     }
     let (impl_g, _ty_g, where_c) = bind_generics.split_for_impl();

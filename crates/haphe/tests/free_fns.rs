@@ -139,7 +139,7 @@ fn async_free_fn_binds_and_awaits() {
             &mut self,
             _: &'static str,
             _: &'static [TypeDescriptor<'static>],
-            _: fn(&[ScriptValue]) -> Result<ScriptValue, haphe::ScriptConvertError>,
+            _: fn(&[ScriptValue]) -> Result<ScriptValue, haphe::ScriptCallError>,
         ) -> Result<(), Self::Error> {
             Ok(())
         }
@@ -205,7 +205,7 @@ fn async_static_generic_free_fn_binds_monomorphs() {
             &mut self,
             _: &'static str,
             _: &'static [TypeDescriptor<'static>],
-            _: fn(&[ScriptValue]) -> Result<ScriptValue, haphe::ScriptConvertError>,
+            _: fn(&[ScriptValue]) -> Result<ScriptValue, haphe::ScriptCallError>,
         ) -> Result<(), Self::Error> {
             panic!("async generic must not use the sync channel");
         }
@@ -250,7 +250,7 @@ fn dyn_generic_registers_candidates_with_descriptor() {
     };
 
     use haphe::ScriptValue;
-    type Wrapper = fn(&[ScriptValue]) -> Result<ScriptValue, haphe::ScriptConvertError>;
+    type Wrapper = fn(&[ScriptValue]) -> Result<ScriptValue, haphe::ScriptCallError>;
     #[derive(Default)]
     struct CollectDyn(
         Vec<(
@@ -317,7 +317,7 @@ fn bare_dyn_gets_default_candidate_set() {
     use haphe::{
         FnBinder, FunctionDescriptor, PrimitiveType, ScriptBindFn, ScriptValue, TypeDescriptor,
     };
-    type Wrapper = fn(&[ScriptValue]) -> Result<ScriptValue, haphe::ScriptConvertError>;
+    type Wrapper = fn(&[ScriptValue]) -> Result<ScriptValue, haphe::ScriptCallError>;
     #[derive(Default)]
     struct Collect(Vec<&'static [TypeDescriptor<'static>]>);
     impl FnBinder for Collect {
@@ -373,7 +373,7 @@ fn total<T>(value: T) -> T {
 #[test]
 fn container_instantiations_bind() {
     use haphe::{FnBinder, FunctionDescriptor, ScriptBindFn, ScriptValue, TypeDescriptor};
-    type Wrapper = fn(&[ScriptValue]) -> Result<ScriptValue, haphe::ScriptConvertError>;
+    type Wrapper = fn(&[ScriptValue]) -> Result<ScriptValue, haphe::ScriptCallError>;
     #[derive(Default)]
     struct Collect(Vec<Wrapper>);
     impl FnBinder for Collect {

@@ -15,13 +15,16 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
 use haphe::{
-    FromScript, IntoScript, OpaqueUserData, ScriptCallFuture, ScriptConvertError, ScriptCow,
-    ScriptCtorFuture, ScriptIter, ScriptValue, TypeBinder, TypeDescriptor,
+    FromScript, IntoScript, OpaqueUserData, ScriptCallError, ScriptCallFuture, ScriptConvertError,
+    ScriptCow, ScriptCtorFuture, ScriptIter, ScriptValue, TypeBinder, TypeDescriptor,
 };
 use wasmtime::component::ResourceAny;
 
 type Sv = ScriptValue;
 type Sce = ScriptConvertError;
+/// Wrapper-channel error: conversion failures plus Host errors from
+/// fallible Rust implementations.
+type Ce = ScriptCallError;
 
 /// Boxed live host value stored behind a resource handle.
 pub(crate) type AnyBox = Box<dyn Any + Send>;
@@ -127,11 +130,11 @@ impl Drop for GuestResource {
 
 type FieldGet<U> = Box<dyn Fn(&U) -> Sv + Send + Sync>;
 type FieldSet<U> = Box<dyn Fn(&mut U, Sv) -> Result<(), Sce> + Send + Sync>;
-type CowFn<U> = for<'a> fn(ScriptCow<'a, U>, &[Sv]) -> Result<Sv, Sce>;
-type MutFn<U> = fn(&mut U, &[Sv]) -> Result<Sv, Sce>;
+type CowFn<U> = for<'a> fn(ScriptCow<'a, U>, &[Sv]) -> Result<Sv, Ce>;
+type MutFn<U> = fn(&mut U, &[Sv]) -> Result<Sv, Ce>;
 type AsyncCowFn<U> = for<'a> fn(ScriptCow<'a, U>, &'a [Sv]) -> ScriptCallFuture<'a>;
 type AsyncMutFn<U> = for<'a> fn(&'a mut U, &'a [Sv]) -> ScriptCallFuture<'a>;
-type CtorFn<U> = fn(&[Sv]) -> Result<U, Sce>;
+type CtorFn<U> = fn(&[Sv]) -> Result<U, Ce>;
 type AsyncCtorFn<U> = for<'a> fn(&'a [Sv]) -> ScriptCtorFuture<'a, U>;
 type PropGetFn<U> = fn(&U) -> Sv;
 type PropSetFn<U> = fn(&mut U, Sv) -> Result<(), Sce>;
@@ -149,12 +152,15 @@ type BinSelfEntry<U> = (&'static str, fn(U, U) -> U);
 pub(crate) type GenericKey = (&'static str, &'static [TypeDescriptor<'static>]);
 
 /// Dispatch key for one `dyn`-dispatched generic-method candidate: the full
-/// descriptor (the dispatcher ranks candidates against its parameters) plus
-/// the candidate's type arguments.
+/// descriptor (the dispatcher ranks candidates against its parameters), the
+/// candidate's type arguments, and the SELF type's instantiation (its
+/// parameters substitute concretely — they are fixed per monomorph, so only
+/// the method's own parameters become dispatcher cases).
 #[cfg(feature = "dyn-generics")]
 pub(crate) type DynKey = (
     &'static haphe::FunctionDescriptor<'static>,
     &'static [TypeDescriptor<'static>],
+    haphe::SelfInstantiation,
 );
 
 /// Everything one `ScriptBind::bind` pass hands a binder, in typed form.
@@ -338,9 +344,11 @@ impl<U: 'static> TypeBinder<U> for RawTable<U> {
         &mut self,
         descriptor: &'static haphe::FunctionDescriptor<'static>,
         type_args: &'static [TypeDescriptor<'static>],
+        self_inst: haphe::SelfInstantiation,
         f: CowFn<U>,
     ) -> Result<(), Infallible> {
-        self.methods_dyn.push(((descriptor, type_args), f));
+        self.methods_dyn
+            .push(((descriptor, type_args, self_inst), f));
         Ok(())
     }
 
@@ -349,9 +357,11 @@ impl<U: 'static> TypeBinder<U> for RawTable<U> {
         &mut self,
         descriptor: &'static haphe::FunctionDescriptor<'static>,
         type_args: &'static [TypeDescriptor<'static>],
+        self_inst: haphe::SelfInstantiation,
         f: MutFn<U>,
     ) -> Result<(), Infallible> {
-        self.methods_dyn_mut.push(((descriptor, type_args), f));
+        self.methods_dyn_mut
+            .push(((descriptor, type_args, self_inst), f));
         Ok(())
     }
 
@@ -360,9 +370,11 @@ impl<U: 'static> TypeBinder<U> for RawTable<U> {
         &mut self,
         descriptor: &'static haphe::FunctionDescriptor<'static>,
         type_args: &'static [TypeDescriptor<'static>],
+        self_inst: haphe::SelfInstantiation,
         f: AsyncCowFn<U>,
     ) -> Result<(), Infallible> {
-        self.methods_dyn_async.push(((descriptor, type_args), f));
+        self.methods_dyn_async
+            .push(((descriptor, type_args, self_inst), f));
         Ok(())
     }
 
@@ -371,10 +383,11 @@ impl<U: 'static> TypeBinder<U> for RawTable<U> {
         &mut self,
         descriptor: &'static haphe::FunctionDescriptor<'static>,
         type_args: &'static [TypeDescriptor<'static>],
+        self_inst: haphe::SelfInstantiation,
         f: AsyncMutFn<U>,
     ) -> Result<(), Infallible> {
         self.methods_dyn_async_mut
-            .push(((descriptor, type_args), f));
+            .push(((descriptor, type_args, self_inst), f));
         Ok(())
     }
 
@@ -523,12 +536,12 @@ pub(crate) enum CowAny<'a> {
 
 type EGet = Box<dyn Fn(&(dyn Any + Send)) -> Result<Sv, Sce> + Send + Sync>;
 type ESet = Box<dyn Fn(&mut (dyn Any + Send), Sv) -> Result<(), Sce> + Send + Sync>;
-type ECow = Box<dyn for<'a> Fn(CowAny<'a>, &[Sv]) -> Result<Sv, Sce> + Send + Sync>;
-type EMut = Box<dyn Fn(&mut (dyn Any + Send), &[Sv]) -> Result<Sv, Sce> + Send + Sync>;
+type ECow = Box<dyn for<'a> Fn(CowAny<'a>, &[Sv]) -> Result<Sv, Ce> + Send + Sync>;
+type EMut = Box<dyn Fn(&mut (dyn Any + Send), &[Sv]) -> Result<Sv, Ce> + Send + Sync>;
 type EAsyncCow = Box<dyn for<'a> Fn(CowAny<'a>, &'a [Sv]) -> ScriptCallFuture<'a> + Send + Sync>;
 type EAsyncMut =
     Box<dyn for<'a> Fn(&'a mut (dyn Any + Send), &'a [Sv]) -> ScriptCallFuture<'a> + Send + Sync>;
-type ECtor = Box<dyn Fn(&[Sv]) -> Result<AnyBox, Sce> + Send + Sync>;
+type ECtor = Box<dyn Fn(&[Sv]) -> Result<AnyBox, Ce> + Send + Sync>;
 type ERef<R> = Box<dyn Fn(&(dyn Any + Send)) -> R + Send + Sync>;
 type EPair<R> = Box<dyn Fn(&(dyn Any + Send), &(dyn Any + Send)) -> R + Send + Sync>;
 type EBinSelf = Box<dyn Fn(AnyBox, AnyBox) -> AnyBox + Send + Sync>;
@@ -540,7 +553,7 @@ type EAsyncGet = Box<dyn for<'a> Fn(CowAny<'a>) -> ScriptCallFuture<'a> + Send +
 type EAsyncSet =
     Box<dyn for<'a> Fn(&'a mut (dyn Any + Send), Sv) -> ScriptCallFuture<'a> + Send + Sync>;
 type EAsyncCtorFut<'a> =
-    std::pin::Pin<Box<dyn std::future::Future<Output = Result<AnyBox, Sce>> + 'a>>;
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<AnyBox, Ce>> + 'a>>;
 type EAsyncCtor = Box<dyn for<'a> Fn(&'a [Sv]) -> EAsyncCtorFut<'a> + Send + Sync>;
 
 /// Erased computed-property accessors: any mix of sync and async halves.
@@ -859,8 +872,8 @@ where
 // Erased value entry (records and enums: value semantics, self by value)
 // ---------------------------------------------------------------------------
 
-type ESelfFn = Box<dyn Fn(Sv, &[Sv]) -> Result<Sv, Sce> + Send + Sync>;
-type EValueCtor = Box<dyn Fn(&[Sv]) -> Result<Sv, Sce> + Send + Sync>;
+type ESelfFn = Box<dyn Fn(Sv, &[Sv]) -> Result<Sv, Ce> + Send + Sync>;
+type EValueCtor = Box<dyn Fn(&[Sv]) -> Result<Sv, Ce> + Send + Sync>;
 
 /// Erased dispatch table for one registered value type (record or enum):
 /// the receiver round-trips through `ScriptValue` conversions.
@@ -884,6 +897,13 @@ pub(crate) struct ValueEntry {
     /// the receiver (and, where applicable, further args) as `ScriptValue`s:
     /// `args[0]` is always the receiver.
     pub projections: HashMap<&'static str, EValueCtor>,
+    /// Computed-property getters with value semantics: `args[0]` is the
+    /// receiver, the property value comes back.
+    pub props_get: HashMap<&'static str, EValueCtor>,
+    /// Computed-property setters with value semantics: `args[0]` receiver,
+    /// `args[1]` value; the UPDATED record comes back (mirroring the
+    /// `IndexSet` projection — a record cannot write back in place).
+    pub props_set: HashMap<&'static str, EValueCtor>,
 }
 
 fn from_sv<U: FromScript>(v: &Sv) -> Result<U, Sce> {
@@ -960,6 +980,67 @@ where
         entry
             .ctors
             .insert(name, Box::new(move |args| Ok(f(args)?.into_script())));
+    }
+
+    // Computed properties: value semantics — getters return the property,
+    // setters return the UPDATED record (no write-back channel exists).
+    for (name, f) in raw.props_get {
+        entry.props_get.insert(
+            name,
+            Box::new(move |args| {
+                let u: U = from_sv(args.first().ok_or(Sce {
+                    expected: "a receiver argument",
+                    got: "no arguments",
+                })?)?;
+                Ok(f(&u))
+            }),
+        );
+    }
+    for (name, f) in raw.props_get_async {
+        entry.props_get.insert(
+            name,
+            Box::new(move |args| {
+                let u: U = from_sv(args.first().ok_or(Sce {
+                    expected: "a receiver argument",
+                    got: "no arguments",
+                })?)?;
+                block_on(f(ScriptCow::Owned(u)))
+            }),
+        );
+    }
+    for (name, f) in raw.props_set {
+        entry.props_set.insert(
+            name,
+            Box::new(move |args| {
+                let mut u: U = from_sv(args.first().ok_or(Sce {
+                    expected: "a receiver argument",
+                    got: "no arguments",
+                })?)?;
+                let value = args.get(1).cloned().ok_or(Sce {
+                    expected: "a property value argument",
+                    got: "no value",
+                })?;
+                f(&mut u, value)?;
+                Ok(u.into_script())
+            }),
+        );
+    }
+    for (name, f) in raw.props_set_async {
+        entry.props_set.insert(
+            name,
+            Box::new(move |args| {
+                let mut u: U = from_sv(args.first().ok_or(Sce {
+                    expected: "a receiver argument",
+                    got: "no arguments",
+                })?)?;
+                let value = args.get(1).cloned().ok_or(Sce {
+                    expected: "a property value argument",
+                    got: "no value",
+                })?;
+                block_on(f(&mut u, value))?;
+                Ok(u.into_script())
+            }),
+        );
     }
 
     // Projections: receiver is args[0].
@@ -1066,7 +1147,7 @@ where
     if let Some(f) = raw.index {
         entry.projections.insert(
             "at",
-            Box::new(move |args| f(&from_sv::<U>(this(args)?)?, &args[1..])),
+            Box::new(move |args| Ok(f(&from_sv::<U>(this(args)?)?, &args[1..])?)),
         );
     }
     if let Some(f) = raw.newindex {
@@ -1084,7 +1165,7 @@ where
     if let Some(f) = raw.call {
         entry.projections.insert(
             "call",
-            Box::new(move |args| f(&from_sv::<U>(this(args)?)?, &args[1..])),
+            Box::new(move |args| Ok(f(&from_sv::<U>(this(args)?)?, &args[1..])?)),
         );
     }
     if let Some(f) = raw.call_async {
@@ -1160,6 +1241,17 @@ pub(crate) fn block_on<F: std::future::Future>(fut: F) -> F::Output {
                     std::thread::park();
                 }
             }
+        }
+    }
+}
+
+/// Renders a wrapper-channel error into a trap message: conversion failures
+/// like [`trap_convert`], Host errors as their kind-prefixed rendering.
+pub(crate) fn trap_call(name: &str, e: Ce) -> wasmtime::Error {
+    match e {
+        ScriptCallError::Convert(e) => trap_convert(name, e),
+        host @ ScriptCallError::Host { .. } => {
+            wasmtime::Error::msg(format!("haphe-wit: `{name}`: {host}"))
         }
     }
 }

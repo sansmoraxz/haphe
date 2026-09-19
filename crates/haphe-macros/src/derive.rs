@@ -461,7 +461,7 @@ fn expand_inner(input: DeriveInput) -> syn::Result<TokenStream> {
             #[automatically_derived]
             impl #impl_g ::haphe::__verify::HasScriptMethods for #ident #ty_g #where_c {}
         });
-        if container.thread_safety.is_none() {
+        if container.thread_safety.is_none() && input.generics.params.is_empty() {
             handshake.extend(quote_spanned! {span=>
                 const _: () = ::core::assert!(
                     !<#self_ty as ::haphe::ScriptImpl>::HAS_ASYNC,
@@ -554,8 +554,8 @@ fn expand_inner(input: DeriveInput) -> syn::Result<TokenStream> {
             let mut next_discriminant: i64 = 0;
             let mut variant_exprs = Vec::new();
             let mut unit_cases: Vec<(syn::Ident, String, Option<i64>)> = Vec::new();
+            let mut payload_cases: Vec<(syn::Ident, String, Fields)> = Vec::new();
             let mut any_skipped = false;
-            let mut all_unit = true;
             for variant in &data.variants {
                 // Explicit discriminants must be integer literals so the IR
                 // can record them; the implicit chain follows Rust's rules.
@@ -642,7 +642,11 @@ fn expand_inner(input: DeriveInput) -> syn::Result<TokenStream> {
                 if matches!(variant.fields, Fields::Unit) {
                     unit_cases.push((variant.ident.clone(), vname.clone(), discriminant));
                 } else {
-                    all_unit = false;
+                    payload_cases.push((
+                        variant.ident.clone(),
+                        vname.clone(),
+                        variant.fields.clone(),
+                    ));
                 }
                 let vdoc = doc_tokens(&extract_doc(&variant.attrs));
                 if container.flags.is_some() && !matches!(variant.fields, Fields::Unit) {
@@ -692,90 +696,203 @@ fn expand_inner(input: DeriveInput) -> syn::Result<TokenStream> {
                     }
                 });
             }
-            // Unit-only, non-flags, non-generic enums with no skipped
-            // variants get value conversions: cases cross the bridge as
-            // `ScriptValue::Enum` carrying the declared name, matched
-            // exactly — backends translate native spellings at their own
-            // boundary.
-            let case_conversions =
-                if all_unit && !any_skipped && !is_flags && !is_generic && !unit_cases.is_empty() {
-                    let vidents: Vec<&syn::Ident> = unit_cases.iter().map(|(i, _, _)| i).collect();
-                    let vnames: Vec<&str> = unit_cases.iter().map(|(_, n, _)| n.as_str()).collect();
-                    let vdiscs: Vec<TokenStream> = unit_cases
-                        .iter()
-                        .map(|(_, _, d)| match d {
-                            Some(v) => quote! { ::core::option::Option::Some(#v) },
-                            None => quote! { ::core::option::Option::None },
-                        })
-                        .collect();
-                    let expected = ident_str.clone();
-                    // Numeric enums additionally accept their discriminant as
-                    // a plain integer.
-                    let numeric_arm = if numeric {
-                        let discs: Vec<i64> =
-                            unit_cases.iter().map(|(_, _, d)| d.unwrap_or(0)).collect();
+            // Non-flags, non-generic enums with no skipped variants get value
+            // conversions when every payload field crosses the bridge: cases
+            // cross as `ScriptValue::Enum` carrying the declared name
+            // (matched exactly — backends translate native spellings at
+            // their own boundary) plus the case's values (tuple positional;
+            // struct fields in declaration order).
+            let payload_bridgeable = payload_cases.iter().all(|(_, _, fields)| {
+                fields.iter().all(|f| {
+                    !matches!(&f.ty, Type::Reference(_)) && crate::bind::is_bridge_value_type(&f.ty)
+                })
+            });
+            let case_conversions = if !any_skipped
+                && !is_flags
+                && !is_generic
+                && payload_bridgeable
+                && !(unit_cases.is_empty() && payload_cases.is_empty())
+            {
+                let vidents: Vec<&syn::Ident> = unit_cases.iter().map(|(i, _, _)| i).collect();
+                let vdiscs: Vec<TokenStream> = unit_cases
+                    .iter()
+                    .map(|(_, _, d)| match d {
+                        Some(v) => quote! { ::core::option::Option::Some(#v) },
+                        None => quote! { ::core::option::Option::None },
+                    })
+                    .collect();
+                let expected = ident_str.clone();
+                // Unit-case From arms plus one arm per payload case
+                // deconstructing its fields into the payload vector.
+                let mut from_arms: Vec<TokenStream> = unit_cases
+                    .iter()
+                    .zip(&vdiscs)
+                    .map(|((vi, name, _), disc)| {
                         quote! {
-                            if let ::haphe::ScriptValue::I64(__n) = &value {
-                                #(
-                                    if *__n == #discs {
-                                        return ::core::result::Result::Ok(#ident::#vidents);
-                                    }
-                                )*
-                                return ::core::result::Result::Err(::haphe::ScriptConvertError {
-                                    expected: #expected,
-                                    got: "unknown enum discriminant",
-                                });
-                            }
+                            #ident::#vi => (#name, #disc, ::std::vec::Vec::new()),
                         }
-                    } else {
-                        TokenStream::new()
-                    };
-                    quote! {
-                        #[automatically_derived]
-                        impl ::core::convert::From<#ident> for ::haphe::ScriptValue {
-                            fn from(value: #ident) -> Self {
-                                let (case, discriminant) = match value {
-                                    #( #ident::#vidents => (#vnames, #vdiscs), )*
+                    })
+                    .collect();
+                // Case-matching FromScript arms.
+                let mut into_arms: Vec<TokenStream> = unit_cases
+                    .iter()
+                    .map(|(vi, name, _)| {
+                        quote! {
+                            if __case == #name {
+                                return if __payload.is_empty() {
+                                    ::core::result::Result::Ok(#ident::#vi)
+                                } else {
+                                    ::core::result::Result::Err(::haphe::ScriptConvertError {
+                                        expected: #expected,
+                                        got: "payload on a unit case",
+                                    })
                                 };
-                                ::haphe::ScriptValue::Enum {
-                                    case: ::std::string::String::from(case),
-                                    discriminant,
-                                }
                             }
                         }
-                        #[automatically_derived]
-                        impl ::haphe::FromScript for #ident {
-                            fn from_script(
-                                value: ::haphe::ScriptValue,
-                            ) -> ::core::result::Result<Self, ::haphe::ScriptConvertError> {
-                                #numeric_arm
-                                let case = match &value {
-                                    ::haphe::ScriptValue::Enum { case, .. } => case.as_str(),
-                                    ::haphe::ScriptValue::String(s) => s.as_str(),
-                                    other => {
+                    })
+                    .collect();
+                for (vi, name, fields) in &payload_cases {
+                    match fields {
+                        Fields::Unnamed(unnamed) => {
+                            let binds: Vec<syn::Ident> = (0..unnamed.unnamed.len())
+                                .map(|i| quote::format_ident!("__f{i}"))
+                                .collect();
+                            let len = binds.len();
+                            let tys: Vec<&Type> = unnamed.unnamed.iter().map(|f| &f.ty).collect();
+                            from_arms.push(quote! {
+                                #ident::#vi(#(#binds),*) => (
+                                    #name,
+                                    ::core::option::Option::None,
+                                    <[_]>::into_vec(::std::boxed::Box::new([
+                                        #(::haphe::IntoScript::into_script(#binds)),*
+                                    ])),
+                                ),
+                            });
+                            into_arms.push(quote! {
+                                if __case == #name {
+                                    if __payload.len() != #len {
                                         return ::core::result::Result::Err(
                                             ::haphe::ScriptConvertError {
                                                 expected: #expected,
-                                                got: other.variant_name(),
+                                                got: "payload of mismatched length",
                                             },
                                         );
                                     }
-                                };
-                                #(
-                                    if case == #vnames {
-                                        return ::core::result::Result::Ok(#ident::#vidents);
+                                    let mut __it = __payload.into_iter();
+                                    return ::core::result::Result::Ok(#ident::#vi(
+                                        #( <#tys as ::haphe::FromScript>::from_script(
+                                            __it.next().expect("length checked")
+                                        )? ),*
+                                    ));
+                                }
+                            });
+                        }
+                        Fields::Named(named) => {
+                            let fids: Vec<&syn::Ident> = named
+                                .named
+                                .iter()
+                                .map(|f| f.ident.as_ref().expect("named field"))
+                                .collect();
+                            let len = fids.len();
+                            let tys: Vec<&Type> = named.named.iter().map(|f| &f.ty).collect();
+                            from_arms.push(quote! {
+                                #ident::#vi { #(#fids),* } => (
+                                    #name,
+                                    ::core::option::Option::None,
+                                    <[_]>::into_vec(::std::boxed::Box::new([
+                                        #(::haphe::IntoScript::into_script(#fids)),*
+                                    ])),
+                                ),
+                            });
+                            into_arms.push(quote! {
+                                if __case == #name {
+                                    if __payload.len() != #len {
+                                        return ::core::result::Result::Err(
+                                            ::haphe::ScriptConvertError {
+                                                expected: #expected,
+                                                got: "payload of mismatched length",
+                                            },
+                                        );
                                     }
-                                )*
-                                ::core::result::Result::Err(::haphe::ScriptConvertError {
-                                    expected: #expected,
-                                    got: "unknown enum case",
-                                })
-                            }
+                                    let mut __it = __payload.into_iter();
+                                    return ::core::result::Result::Ok(#ident::#vi {
+                                        #( #fids: <#tys as ::haphe::FromScript>::from_script(
+                                            __it.next().expect("length checked")
+                                        )? ),*
+                                    });
+                                }
+                            });
+                        }
+                        Fields::Unit => unreachable!("unit variants collect separately"),
+                    }
+                }
+                // Numeric enums additionally accept their discriminant as
+                // a plain integer (unit cases only — payload cases have no
+                // discriminant).
+                let numeric_arm = if numeric {
+                    let discs: Vec<i64> =
+                        unit_cases.iter().map(|(_, _, d)| d.unwrap_or(0)).collect();
+                    quote! {
+                        if let ::haphe::ScriptValue::I64(__n) = &value {
+                            #(
+                                if *__n == #discs {
+                                    return ::core::result::Result::Ok(#ident::#vidents);
+                                }
+                            )*
+                            return ::core::result::Result::Err(::haphe::ScriptConvertError {
+                                expected: #expected,
+                                got: "unknown enum discriminant",
+                            });
                         }
                     }
                 } else {
                     TokenStream::new()
                 };
+                quote! {
+                    #[automatically_derived]
+                    impl ::core::convert::From<#ident> for ::haphe::ScriptValue {
+                        fn from(value: #ident) -> Self {
+                            let (case, discriminant, payload) = match value {
+                                #(#from_arms)*
+                            };
+                            ::haphe::ScriptValue::Enum {
+                                case: ::std::string::String::from(case),
+                                discriminant,
+                                payload,
+                            }
+                        }
+                    }
+                    #[automatically_derived]
+                    impl ::haphe::FromScript for #ident {
+                        fn from_script(
+                            value: ::haphe::ScriptValue,
+                        ) -> ::core::result::Result<Self, ::haphe::ScriptConvertError> {
+                            #numeric_arm
+                            let (__case, __payload) = match value {
+                                ::haphe::ScriptValue::Enum { case, payload, .. } => {
+                                    (case, payload)
+                                }
+                                ::haphe::ScriptValue::String(s) => (s, ::std::vec::Vec::new()),
+                                other => {
+                                    return ::core::result::Result::Err(
+                                        ::haphe::ScriptConvertError {
+                                            expected: #expected,
+                                            got: other.variant_name(),
+                                        },
+                                    );
+                                }
+                            };
+                            #(#into_arms)*
+                            ::core::result::Result::Err(::haphe::ScriptConvertError {
+                                expected: #expected,
+                                got: "unknown enum case",
+                            })
+                        }
+                    }
+                }
+            } else {
+                TokenStream::new()
+            };
             let enum_asserts = container.methods.map(|span| {
                 quote_spanned! {span=>
                     const _: () = ::core::assert!(
@@ -850,6 +967,9 @@ fn expand_inner(input: DeriveInput) -> syn::Result<TokenStream> {
             &bind_fields,
             &container.traits,
             container.methods.is_some(),
+            container.methods.is_some()
+                && container.thread_safety.is_none()
+                && !input.generics.params.is_empty(),
             &input.generics,
         )
     } else {
@@ -859,6 +979,9 @@ fn expand_inner(input: DeriveInput) -> syn::Result<TokenStream> {
             &[],
             &container.traits,
             container.methods.is_some(),
+            container.methods.is_some()
+                && container.thread_safety.is_none()
+                && !input.generics.params.is_empty(),
             &input.generics,
         )
     };

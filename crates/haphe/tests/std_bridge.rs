@@ -10,7 +10,7 @@ use std::num::NonZeroU32;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use haphe::{FnBinder, ScriptBindFn, ScriptValue, TypeDescriptor, script};
+use haphe::{FnBinder, ScriptBindFn, ScriptCallError, ScriptValue, TypeDescriptor, script};
 
 #[script]
 fn total(values: HashSet<i64>) -> i64 {
@@ -62,7 +62,7 @@ fn share<T>(value: T) -> std::rc::Rc<T> {
     std::rc::Rc::new(value)
 }
 
-type Wrapper = fn(&[ScriptValue]) -> Result<ScriptValue, haphe::ScriptConvertError>;
+type Wrapper = fn(&[ScriptValue]) -> Result<ScriptValue, haphe::ScriptCallError>;
 
 #[derive(Default)]
 struct Collect(Vec<(&'static str, Wrapper)>);
@@ -137,7 +137,7 @@ fn addresses_bind_as_strings() {
     let out = f(&[ScriptValue::String("127.0.0.1".into())]).unwrap();
     assert!(matches!(out, ScriptValue::Bool(true)));
     let err = f(&[ScriptValue::String("nope".into())]).unwrap_err();
-    assert_eq!(err.got, "malformed address string");
+    assert!(matches!(err, ScriptCallError::Convert(e) if e.got == "malformed address string"));
 }
 
 #[test]
@@ -161,7 +161,7 @@ fn non_zero_binds_and_rejects_zero() {
     let out = f(&[ScriptValue::I64(8)]).unwrap();
     assert!(matches!(out, ScriptValue::I64(4)));
     let err = f(&[ScriptValue::I64(0)]).unwrap_err();
-    assert_eq!(err.got, "zero");
+    assert!(matches!(err, ScriptCallError::Convert(e) if e.got == "zero"));
 }
 
 #[test]

@@ -7,9 +7,11 @@
 //!   description), colon-syntax methods, constructors as dot functions on
 //!   the module's type table, operator traits as `---@operator` lines;
 //! - unit-only enums → `---@enum Name` on a table literal mirroring the
-//!   runtime case table (string names, or numeric discriminants per repr)
-//!   (payload enums are an opaque `---@class`; enum methods are not exposed
-//!   by the runtime binder and are omitted here too);
+//!   runtime case table (string names, or numeric discriminants per repr);
+//!   enums with payload cases → a `---@class` table keeping unit-case
+//!   constants plus one constructor function per payload case, building its
+//!   case table (`{ case = "Name", <values> }`) (enum methods are not
+//!   exposed by the runtime binder and are omitted here too);
 //! - type aliases → `---@alias` to the underlying type;
 //! - generic types → one erased class (as the runtime exposes), with
 //!   generic parameters typed `any`;
@@ -134,7 +136,7 @@ impl BindingGenerator for LuaDeclGenerator {
             emit_struct(&mut out, registry, s)?;
         }
         for e in registry.enums() {
-            emit_enum(&mut out, e)?;
+            emit_enum(&mut out, registry, e)?;
         }
         for a in registry.type_aliases() {
             emit_doc(&mut out, a.doc);
@@ -416,7 +418,11 @@ fn emit_operators(
     Ok(())
 }
 
-fn emit_enum(out: &mut String, e: &EnumDescriptor<'_>) -> Result<(), LuaDeclError> {
+fn emit_enum(
+    out: &mut String,
+    registry: &ValidatedRegistry<'_>,
+    e: &EnumDescriptor<'_>,
+) -> Result<(), LuaDeclError> {
     emit_doc(out, e.doc);
     let unit_only = e
         .variants
@@ -441,11 +447,61 @@ fn emit_enum(out: &mut String, e: &EnumDescriptor<'_>) -> Result<(), LuaDeclErro
         }
         let _ = writeln!(out, "}}\n");
     } else {
+        // Payload cases cross as case tables (`{ case = "Name", <values> }`)
+        // and construct through per-case functions; unit cases keep their
+        // constant values on the same table.
         let _ = writeln!(
             out,
-            "---Opaque enum value (payload variants cross as userdata)."
+            "---Payload cases cross as case tables: `{{ case = \"Name\", <values> }}`."
         );
-        let _ = writeln!(out, "---@class {}\n", e.name);
+        let _ = writeln!(out, "---@class {}", e.name);
+        let _ = writeln!(out, "local {} = {{", e.name);
+        for v in e.variants {
+            if matches!(v.kind, VariantKind::Unit) {
+                match v.discriminant {
+                    Some(value) => {
+                        let _ = writeln!(out, "    {} = {},", v.name, value);
+                    }
+                    None => {
+                        let _ = writeln!(out, "    {} = \"{}\",", v.name, v.name);
+                    }
+                }
+            }
+        }
+        let _ = writeln!(out, "}}\n");
+        for v in e.variants {
+            let context = format!("{}.{}", e.name, v.name);
+            let params: Vec<(String, String)> = match &v.kind {
+                VariantKind::Unit => continue,
+                VariantKind::Tuple(tys) => tys
+                    .iter()
+                    .enumerate()
+                    .map(|(i, ty)| {
+                        Ok((
+                            format!("arg{}", i + 1),
+                            render_type(registry, ty, &context)?,
+                        ))
+                    })
+                    .collect::<Result<_, LuaDeclError>>()?,
+                VariantKind::Struct(fields) => fields
+                    .iter()
+                    .map(|f| Ok((f.name.to_string(), render_type(registry, f.ty, &context)?)))
+                    .collect::<Result<_, LuaDeclError>>()?,
+            };
+            let _ = writeln!(out, "---Constructs the `{}` case table.", v.name);
+            for (pname, pty) in &params {
+                let _ = writeln!(out, "---@param {pname} {pty}");
+            }
+            let _ = writeln!(out, "---@return {}", e.name);
+            let names: Vec<&str> = params.iter().map(|(n, _)| n.as_str()).collect();
+            let _ = writeln!(
+                out,
+                "function {}.{}({}) end\n",
+                e.name,
+                v.name,
+                names.join(", ")
+            );
+        }
     }
     Ok(())
 }

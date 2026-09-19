@@ -92,6 +92,15 @@ pub fn expand(mut item: ItemImpl) -> TokenStream {
         })
         .collect();
     let has_type_params = !impl_generic_names.is_empty();
+    let impl_type_param_idents: Vec<syn::Ident> = item
+        .generics
+        .params
+        .iter()
+        .filter_map(|p| match p {
+            syn::GenericParam::Type(tp) => Some(tp.ident.clone()),
+            _ => None,
+        })
+        .collect();
     let ctx = TyCtx {
         generic_params: &impl_generic_names,
         self_ty: Some(&self_ty),
@@ -144,14 +153,10 @@ pub fn expand(mut item: ItemImpl) -> TokenStream {
                 strip_param_script_attrs(&mut func.sig);
                 continue;
             }
-            if has_type_params {
-                errors.spanned(
-                    span,
-                    "generic impl-block functions on generic self types are not supported yet",
-                );
-                strip_param_script_attrs(&mut func.sig);
-                continue;
-            }
+            // Static monomorphs on a generic self type key on (name,
+            // type_args) like anywhere else: the registration surface is
+            // per-monomorph (each bound instantiation has its own metatable/
+            // resource), so the self identity is implicit.
             if fn_args.dyn_dispatch.is_none() && fn_args.instantiate.is_empty() {
                 // Static dispatch: monomorphs keyed on (name, type_args),
                 // like static generic free functions — each use must be
@@ -166,19 +171,70 @@ pub fn expand(mut item: ItemImpl) -> TokenStream {
             }
             fn_args.inject_bare_dyn_defaults(fn_type_params.len());
         }
-        let fn_generic_names: Vec<String> = fn_type_params.iter().map(|i| i.to_string()).collect();
+        // Generic methods see the impl's parameters plus their own.
+        let fn_generic_names: Vec<String> = impl_generic_names
+            .iter()
+            .cloned()
+            .chain(fn_type_params.iter().map(|i| i.to_string()))
+            .collect();
         let fn_ctx = TyCtx {
             generic_params: &fn_generic_names,
             self_ty: Some(&self_ty),
         };
         let info_ctx = if has_fn_generics { &fn_ctx } else { &ctx };
-        let Some(info) = build_fn_info(&mut func.sig, &fn_args, &func.attrs, info_ctx, &mut errors)
-        else {
+        // A `Result<T, E>` return is fallible: the descriptor and the bridge
+        // see `T` (mirroring foreign methods — the host receives the value
+        // or a Host error rendered from `E` via Display, tagged with the
+        // declared `error_kind`), so `E` needs no bridge representation.
+        let fallible = matches!(
+            &func.sig.output,
+            syn::ReturnType::Type(_, ret) if crate::fn_desc::result_types(ret).is_some()
+        );
+        let info = if fallible {
+            let mut desc_sig = func.sig.clone();
+            if let syn::ReturnType::Type(_, ret) = &func.sig.output
+                && let Some((ok, err)) = crate::fn_desc::result_types(ret)
+            {
+                // The error crosses as a rendered message: `E: Display` is
+                // the only requirement, checked here so the failure points
+                // at the declared error type.
+                if !has_fn_generics && !has_type_params {
+                    let err = crate::ty_map::substitute_self(err, info_ctx);
+                    probes.push(quote_spanned! {err.span()=>
+                        const _: () = {
+                            fn __haphe_fallible_error_is_display<__E: ::core::fmt::Display>() {}
+                            let _ = __haphe_fallible_error_is_display::<#err>;
+                        };
+                    });
+                }
+                let ok = ok.clone();
+                // `Result<(), E>` is a unit return on the ok path.
+                desc_sig.output = if matches!(&ok, syn::Type::Tuple(t) if t.elems.is_empty()) {
+                    syn::ReturnType::Default
+                } else {
+                    syn::parse_quote! { -> #ok }
+                };
+            }
+            let info = build_fn_info(&mut desc_sig, &fn_args, &func.attrs, info_ctx, &mut errors);
+            strip_param_script_attrs(&mut func.sig);
+            info
+        } else {
+            build_fn_info(&mut func.sig, &fn_args, &func.attrs, info_ctx, &mut errors)
+        };
+        let Some(info) = info else {
             continue;
         };
         let cfgs = cfg_attrs(&func.attrs);
         let is_accessor = fn_args.getter.is_some() || fn_args.setter.is_some();
         if is_accessor {
+            if fallible {
+                let span = fn_args.getter.or(fn_args.setter.as_ref().map(|(_, s)| *s));
+                errors.spanned(
+                    span.expect("accessor implies a getter/setter span"),
+                    "property accessors cannot return `Result`; expose a fallible method instead",
+                );
+                continue;
+            }
             if let Some(kind) = &fn_args.error_kind {
                 errors.spanned(kind.span(), "properties cannot carry `error_kind`");
                 continue;
@@ -214,21 +270,14 @@ pub fn expand(mut item: ItemImpl) -> TokenStream {
                     };
                 });
             }
-            // Bridge: register non-async, non-cfg-gated, infallible constructors.
-            // Fallible constructors (-> Result<Self, E>) need error mapping
-            // which is deferred to a future iteration.
-            let is_fallible = info.return_ty.as_ref().is_some_and(|ty| {
-                if let Type::Path(p) = ty {
-                    p.path.segments.last().is_some_and(|s| s.ident == "Result")
-                } else {
-                    false
-                }
-            });
-            if cfgs.is_empty() && !is_fallible {
+            // Bridge: register non-cfg-gated constructors; a fallible one
+            // maps its `Err` into a Host error inside the wrapper.
+            if cfgs.is_empty() {
+                let bind = extract_bind_method(func, &info, fallible, &fn_args);
                 if info.is_async {
-                    async_constructors.push(extract_bind_method(func, &info));
+                    async_constructors.push(bind);
                 } else {
-                    bind_constructors.push(extract_bind_method(func, &info));
+                    bind_constructors.push(bind);
                 }
             }
             constructors.push(Entry {
@@ -333,7 +382,7 @@ pub fn expand(mut item: ItemImpl) -> TokenStream {
                 // Generic methods: each declared instantiation must produce a
                 // bridgeable signature — an unbindable candidate is a
                 // compile error, never a silent drop.
-                let method = extract_bind_method(func, &info);
+                let method = extract_bind_method(func, &info, fallible, &fn_args);
                 let render = |t: &Type| {
                     quote::quote!(#t)
                         .to_string()
@@ -342,15 +391,21 @@ pub fn expand(mut item: ItemImpl) -> TokenStream {
                         .replace(" >", ">")
                 };
                 for (types, span) in &fn_args.instantiate {
-                    let subst: std::collections::HashMap<String, Type> = fn_generic_names
+                    // Substitute the method's OWN parameters; the impl's stay
+                    // (they resolve at the self type's monomorphization, with
+                    // FromScript/IntoScript bounds on the bind impl).
+                    let subst: std::collections::HashMap<String, Type> = fn_type_params
                         .iter()
-                        .cloned()
+                        .map(|i| i.to_string())
                         .zip(types.iter().cloned())
                         .collect();
                     for (_, ty) in &method.params {
                         let t = crate::bind::strip_ref(&crate::bind::substitute_type_params(
                             ty, &subst,
                         ));
+                        if crate::bind::is_generic_type_param(&t, &impl_generic_names) {
+                            continue;
+                        }
                         if !crate::bind::is_bridge_value_type(&t) {
                             errors.spanned(
                                 *span,
@@ -364,6 +419,9 @@ pub fn expand(mut item: ItemImpl) -> TokenStream {
                     }
                     if let Some(ret) = &method.return_ty {
                         let t = crate::bind::substitute_type_params(ret, &subst);
+                        if crate::bind::is_generic_type_param(&t, &impl_generic_names) {
+                            continue;
+                        }
                         if matches!(t, Type::Reference(_)) || !crate::bind::is_bridge_value_type(&t)
                         {
                             errors.spanned(
@@ -380,6 +438,7 @@ pub fn expand(mut item: ItemImpl) -> TokenStream {
                 if cfgs.is_empty() {
                     generic_methods.push(crate::bind::GenericBindMethod {
                         method,
+                        self_params: impl_type_param_idents.clone(),
                         type_params: fn_type_params.clone(),
                         instantiations: fn_args.instantiate.clone(),
                         is_async: info.is_async,
@@ -396,15 +455,15 @@ pub fn expand(mut item: ItemImpl) -> TokenStream {
                     // syntactic whitelist is the criterion (the dispatch
                     // machinery stays sync-only for now).
                     if !has_type_params && is_bind_compatible(func, &info) {
-                        async_methods.push(extract_bind_method(func, &info));
+                        async_methods.push(extract_bind_method(func, &info, fallible, &fn_args));
                     }
                 } else if has_type_params || is_bind_compatible(func, &info) {
-                    bind_methods.push(extract_bind_method(func, &info));
-                } else if !has_type_params && is_dispatch_eligible(func, &info) {
+                    bind_methods.push(extract_bind_method(func, &info, fallible, &fn_args));
+                } else if !has_type_params && !fallible && is_dispatch_eligible(func, &info) {
                     // Types the whitelist can't judge (e.g. transparent
                     // primitive newtypes): registration is decided by
                     // compile-time trait-presence dispatch instead.
-                    dispatch_methods.push(extract_bind_method(func, &info));
+                    dispatch_methods.push(extract_bind_method(func, &info, fallible, &fn_args));
                 }
             }
             methods.push(Entry {
@@ -617,6 +676,8 @@ fn is_bind_compatible(func: &syn::ImplItemFn, info: &crate::fn_desc::FnInfo) -> 
 fn extract_bind_method(
     func: &syn::ImplItemFn,
     info: &crate::fn_desc::FnInfo,
+    fallible: bool,
+    fn_args: &crate::attrs::FnArgs,
 ) -> crate::bind::BindMethod {
     let params: Vec<(syn::Ident, Type)> = func
         .sig
@@ -640,6 +701,8 @@ fn extract_bind_method(
         params,
         has_return: info.return_ty.is_some(),
         return_ty: info.return_ty.clone(),
+        fallible,
+        error_kind: fn_args.error_kind.as_ref().map(|k| k.value()),
     }
 }
 

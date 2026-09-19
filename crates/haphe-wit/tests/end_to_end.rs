@@ -128,6 +128,14 @@ enum Color {
     Rgb(u8, u8, u8),
 }
 
+/// A pointer event: a mixed payload enum (unit + single + struct cases).
+#[derive(Script)]
+enum Event {
+    Idle,
+    Scroll(f64),
+    Move { x: f64, y: f64 },
+}
+
 /// Cardinal directions.
 #[derive(Script)]
 enum Direction {
@@ -184,6 +192,10 @@ fn sum_block(samples: [u8; 4]) -> u32 {
 }
 
 /// Parses a point from text.
+///
+/// Fallible with a described-record ok type: the descriptor (and the WIT
+/// text) see `point`; the error crosses as a Host failure with no wire
+/// representation.
 #[script]
 fn parse_point(text: String) -> Result<Point, String> {
     let (x, y) = text.split_once(',').ok_or("bad format")?;
@@ -227,7 +239,7 @@ impl From<Point> for haphe::ScriptValue {
 haphe::registry! {
     pub static REGISTRY = {
         structs: [Point, Size, Buffer],
-        enums: [Color, Direction],
+        enums: [Color, Direction, Event],
         foreign: [NotifierHandle],
         modules: [
             mod geometry {
@@ -331,6 +343,18 @@ fn unit_enum_and_variant() {
 }
 
 #[test]
+fn payload_enum_emits_variant_with_record_case() {
+    let wit = generate();
+    // Struct cases synthesize a record, emitted before the variant.
+    assert!(wit.contains("record event-move {"), "got:\n{wit}");
+    assert!(wit.contains("x: f64,"), "got:\n{wit}");
+    assert!(wit.contains("variant event {"), "got:\n{wit}");
+    assert!(wit.contains("idle,"), "got:\n{wit}");
+    assert!(wit.contains("scroll(f64),"), "got:\n{wit}");
+    assert!(wit.contains("move(event-move),"), "got:\n{wit}");
+}
+
+#[test]
 fn free_functions() {
     let wit = generate();
     assert!(
@@ -351,7 +375,7 @@ fn free_functions() {
         "got:\n{wit}"
     );
     assert!(
-        wit.contains("parse-point: func(text: string) -> result<point, string>;"),
+        wit.contains("parse-point: func(text: string) -> point;"),
         "got:\n{wit}"
     );
     assert!(
@@ -716,4 +740,223 @@ fn record_trait_projections_emit_as_interface_functions() {
         wit.contains("size-eq: func(this: size, other: size) -> bool;"),
         "got:\n{wit}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Record properties: a struct whose only callable surface is computed
+// properties keeps value semantics — it lowers as a record, its accessors
+// projected as interface functions.
+// ---------------------------------------------------------------------------
+
+/// A measurement with computed accessors only.
+#[derive(Script, Clone)]
+#[script(methods)]
+struct Meter {
+    raw: f64,
+}
+
+#[script]
+impl Meter {
+    #[script(getter)]
+    fn level(&self) -> f64 {
+        self.raw
+    }
+
+    #[script(setter)]
+    fn set_level(&mut self, value: f64) {
+        self.raw = value;
+    }
+
+    #[script(getter)]
+    fn doubled(&self) -> f64 {
+        self.raw * 2.0
+    }
+}
+
+haphe::registry! {
+    static METER_REGISTRY = {
+        structs: [Meter],
+        modules: [
+            mod meters { types: [Meter] },
+        ],
+    };
+}
+
+#[test]
+fn property_only_structs_lower_as_records_with_projected_accessors() {
+    let generator = WitGenerator::new("haphe:demo");
+    let output = haphe::generate(&generator, &METER_REGISTRY).expect("generation succeeds");
+    let wit = String::from_utf8_lossy(&output.files[0].content).to_string();
+    assert!(wit.contains("record meter"), "got:\n{wit}");
+    assert!(!wit.contains("resource meter"), "got:\n{wit}");
+    assert!(
+        wit.contains("meter-level: func(this: meter) -> f64;"),
+        "got:\n{wit}"
+    );
+    assert!(
+        wit.contains("meter-set-level: func(this: meter, value: f64) -> meter;"),
+        "got:\n{wit}"
+    );
+    // Readonly property: getter only.
+    assert!(
+        wit.contains("meter-doubled: func(this: meter) -> f64;"),
+        "got:\n{wit}"
+    );
+    assert!(!wit.contains("meter-set-doubled"), "got:\n{wit}");
+}
+
+// ---------------------------------------------------------------------------
+// Generic self types: a static generic method on a generic resource composes
+// the resource instantiation's environment with the method's own.
+// ---------------------------------------------------------------------------
+
+/// A generic gauge resource.
+#[cfg(feature = "generics")]
+#[derive(Script, Clone)]
+#[script(thread_safety = send_sync, methods)]
+struct Gauge2<T: haphe::FromScript + haphe::IntoScript + haphe::HapheType + Clone + Send + Sync> {
+    #[script(skip)]
+    v: T,
+}
+
+#[cfg(feature = "generics")]
+#[script]
+impl<T: haphe::FromScript + haphe::IntoScript + haphe::HapheType + Clone + Send + Sync> Gauge2<T> {
+    #[script(constructor)]
+    fn new(v: T) -> Self {
+        Gauge2 { v }
+    }
+
+    /// `base` is typed by the SELF parameter, `k` by the method's own.
+    #[script(instantiate(f64))]
+    fn mix<U>(&self, base: T, k: U) -> U {
+        let _ = base;
+        k
+    }
+}
+
+#[cfg(feature = "generics")]
+haphe::registry! {
+    static GAUGE2_REGISTRY = {
+        structs: [Gauge2<i64>],
+        modules: [
+            mod gauges { types: [Gauge2<i64>] },
+        ],
+    };
+}
+
+#[cfg(feature = "generics")]
+#[test]
+fn generic_resource_composes_method_instantiation_envs() {
+    let generator = WitGenerator::new("haphe:demo");
+    let output = haphe::generate(&generator, &GAUGE2_REGISTRY).expect("generation succeeds");
+    let wit = String::from_utf8_lossy(&output.files[0].content).to_string();
+    assert!(wit.contains("resource gauge2-s64"), "got:\n{wit}");
+    // T substitutes from the resource instance, U from the method's own
+    // instantiation.
+    assert!(
+        wit.contains("mix-f64: func(base: s64, k: f64) -> f64;"),
+        "got:\n{wit}"
+    );
+}
+
+// A dyn method on a generic self type: self-parameter positions render
+// concretely (pass-through); only the method's own parameter becomes a
+// dispatcher variant.
+#[cfg(all(feature = "generics", feature = "dyn-generics"))]
+#[derive(Script, Clone)]
+#[script(thread_safety = send_sync, methods)]
+struct Gauge3<T: haphe::FromScript + haphe::IntoScript + haphe::HapheType + Clone + Send + Sync> {
+    #[script(skip)]
+    v: T,
+}
+
+#[cfg(all(feature = "generics", feature = "dyn-generics"))]
+#[script]
+impl<T: haphe::FromScript + haphe::IntoScript + haphe::HapheType + Clone + Send + Sync> Gauge3<T> {
+    #[script(constructor)]
+    fn new(v: T) -> Self {
+        Gauge3 { v }
+    }
+
+    #[script(dyn, instantiate(bool), instantiate(String))]
+    fn pick<U>(&self, base: T, flag: U) -> U {
+        let _ = base;
+        flag
+    }
+}
+
+#[cfg(all(feature = "generics", feature = "dyn-generics"))]
+haphe::registry! {
+    static GAUGE3_REGISTRY = {
+        structs: [Gauge3<i64>],
+        modules: [
+            mod gauges3 { types: [Gauge3<i64>] },
+        ],
+    };
+}
+
+#[cfg(all(feature = "generics", feature = "dyn-generics"))]
+#[test]
+fn generic_self_dyn_dispatcher_passes_self_typed_positions_through() {
+    let generator = WitGenerator::new("haphe:demo");
+    let output = haphe::generate(&generator, &GAUGE3_REGISTRY).expect("generation succeeds");
+    let wit = String::from_utf8_lossy(&output.files[0].content).to_string();
+    // The self-typed position is concrete; the method's own is a variant.
+    // The identically-shaped result variant dedups onto the flag's.
+    assert!(
+        wit.contains(
+            "pick-dyn: func(base: s64, flag: gauge3-s64-pick-dyn-flag) -> gauge3-s64-pick-dyn-flag;"
+        ),
+        "got:\n{wit}"
+    );
+    assert!(
+        wit.contains("variant gauge3-s64-pick-dyn-flag"),
+        "got:\n{wit}"
+    );
+    assert!(wit.contains("%bool(bool)"), "got:\n{wit}");
+    // The static monomorphs remain, self positions concrete.
+    assert!(
+        wit.contains("pick-bool: func(base: s64, flag: bool) -> bool;"),
+        "got:\n{wit}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Receiver-less associated functions: emitted as `static func` members;
+// their runtime stub is pinned in tests/runtime.rs.
+// ---------------------------------------------------------------------------
+
+#[derive(Script, Clone)]
+#[script(methods)]
+struct Fabric {
+    n: i64,
+}
+
+#[script]
+impl Fabric {
+    fn origin() -> i64 {
+        0
+    }
+
+    fn read(&self) -> i64 {
+        self.n
+    }
+}
+
+haphe::registry! {
+    static FABRIC_REGISTRY = {
+        structs: [Fabric],
+        modules: [
+            mod fabrics { types: [Fabric] },
+        ],
+    };
+}
+
+#[test]
+fn receiverless_associated_fns_emit_as_static_members() {
+    let generator = WitGenerator::new("haphe:demo");
+    let output = haphe::generate(&generator, &FABRIC_REGISTRY).expect("generation succeeds");
+    let wit = String::from_utf8_lossy(&output.files[0].content).to_string();
+    assert!(wit.contains("origin: static func() -> s64;"), "got:\n{wit}");
 }

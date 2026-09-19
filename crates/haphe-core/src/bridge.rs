@@ -102,11 +102,66 @@ pub enum ScriptValue {
         case: String,
         /// The numeric discriminant, when the enum has a numeric script
         /// representation ([`repr`](crate::EnumDescriptor::repr)); `None`
-        /// for string-represented enums. The case NAME remains the
-        /// canonical identity; the discriminant is carried data backends
-        /// may render natively.
+        /// for string-represented enums and payload cases. The case NAME
+        /// remains the canonical identity; the discriminant is carried data
+        /// backends may render natively.
         discriminant: Option<i64>,
+        /// The case's carried values: empty for unit cases; a tuple case's
+        /// values positionally; a struct case's field values in declaration
+        /// order (the descriptor's
+        /// [`VariantKind`](crate::VariantKind) names them).
+        payload: Vec<ScriptValue>,
     },
+}
+
+/// Error produced by a bridge call wrapper: either an argument/return
+/// conversion mismatch, or an error the Rust implementation itself returned
+/// (a fallible constructor or `Result`-returning function). Backends map
+/// `Host` onto their native error construct, using `kind` (the descriptor's
+/// [`error_kind`](crate::FunctionDescriptor::error_kind) hint) to pick an
+/// error class where the runtime has them.
+#[derive(Debug, Clone)]
+pub enum ScriptCallError {
+    /// A value didn't convert at the boundary.
+    Convert(ScriptConvertError),
+    /// The Rust implementation returned its error (rendered via `Display`).
+    Host {
+        /// The error's rendered message.
+        message: String,
+        /// Error-class hint from the descriptor, when declared.
+        kind: Option<&'static str>,
+    },
+}
+
+impl From<ScriptConvertError> for ScriptCallError {
+    fn from(e: ScriptConvertError) -> Self {
+        Self::Convert(e)
+    }
+}
+
+impl std::fmt::Display for ScriptCallError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Convert(e) => e.fmt(f),
+            Self::Host {
+                message,
+                kind: Some(kind),
+            } => write!(f, "{kind}: {message}"),
+            Self::Host {
+                message,
+                kind: None,
+            } => f.write_str(message),
+        }
+    }
+}
+
+impl std::error::Error for ScriptCallError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Convert(e) => Some(e),
+            Self::Host { .. } => None,
+        }
+    }
 }
 
 /// Error returned when a [`ScriptValue`] variant doesn't match the expected
@@ -443,6 +498,27 @@ pub trait ScriptBind: Sized {
     fn bind<B: TypeBinder<Self>>(binder: &mut B) -> Result<(), B::Error>;
 }
 
+/// The self type's generic identity, for `dyn` method registrations on a
+/// generic self type: the declared parameters and this monomorph's concrete
+/// arguments (both empty on a non-generic self type). Backends merge these
+/// with each candidate's own parameters and `type_args` into one
+/// [`GenericSubst`](crate::dispatch::GenericSubst) before ranking.
+#[derive(Debug, Clone, Copy)]
+pub struct SelfInstantiation {
+    /// The self type's declared generic parameters, in order.
+    pub params: &'static [crate::types::GenericParam<'static>],
+    /// This monomorph's concrete type arguments, in the same order.
+    pub args: &'static [crate::types::TypeDescriptor<'static>],
+}
+
+impl SelfInstantiation {
+    /// A non-generic self type.
+    pub const NONE: Self = Self {
+        params: &[],
+        args: &[],
+    };
+}
+
 /// Backend-provided registrar for a specific Rust type `T`.
 ///
 /// Each method receives a concrete fn pointer with fully monomorphized
@@ -473,14 +549,14 @@ pub trait TypeBinder<T>: Sized {
     fn method(
         &mut self,
         name: &'static str,
-        f: for<'a> fn(ScriptCow<'a, T>, &[ScriptValue]) -> Result<ScriptValue, ScriptConvertError>,
+        f: for<'a> fn(ScriptCow<'a, T>, &[ScriptValue]) -> Result<ScriptValue, ScriptCallError>,
     ) -> Result<(), Self::Error>;
 
     /// Register a `&mut self` method.
     fn method_mut(
         &mut self,
         name: &'static str,
-        f: fn(&mut T, &[ScriptValue]) -> Result<ScriptValue, ScriptConvertError>,
+        f: fn(&mut T, &[ScriptValue]) -> Result<ScriptValue, ScriptCallError>,
     ) -> Result<(), Self::Error>;
 
     /// Register a non-mutating `async` method (`&self` or consuming
@@ -529,7 +605,7 @@ pub trait TypeBinder<T>: Sized {
         &mut self,
         name: &'static str,
         type_args: &'static [crate::types::TypeDescriptor<'static>],
-        f: for<'a> fn(ScriptCow<'a, T>, &[ScriptValue]) -> Result<ScriptValue, ScriptConvertError>,
+        f: for<'a> fn(ScriptCow<'a, T>, &[ScriptValue]) -> Result<ScriptValue, ScriptCallError>,
     ) -> Result<(), Self::Error> {
         let _ = type_args;
         self.method(name, f)
@@ -540,7 +616,7 @@ pub trait TypeBinder<T>: Sized {
         &mut self,
         name: &'static str,
         type_args: &'static [crate::types::TypeDescriptor<'static>],
-        f: fn(&mut T, &[ScriptValue]) -> Result<ScriptValue, ScriptConvertError>,
+        f: fn(&mut T, &[ScriptValue]) -> Result<ScriptValue, ScriptCallError>,
     ) -> Result<(), Self::Error> {
         let _ = type_args;
         self.method_mut(name, f)
@@ -574,6 +650,14 @@ pub trait TypeBinder<T>: Sized {
     /// Register one candidate of a `dyn`-dispatched generic method (`&self`,
     /// consuming `self`, or receiver-less).
     ///
+    /// `self_inst` carries the SELF type's generic identity when the method
+    /// lives on a generic self type: candidates' descriptors may reference
+    /// the type's parameters (e.g. `GenericParam("T")`) alongside the
+    /// method's own, so backends merge `self_inst` with the candidate's
+    /// `type_args` into one [`GenericSubst`](crate::dispatch::GenericSubst)
+    /// before ranking. [`SelfInstantiation::NONE`] on non-generic self
+    /// types.
+    ///
     /// Called once per declared instantiation, like
     /// [`method`](Self::method); the whole descriptor is provided because
     /// dynamic resolution ranks candidates against the declared parameter
@@ -586,9 +670,10 @@ pub trait TypeBinder<T>: Sized {
         &mut self,
         descriptor: &'static crate::function::FunctionDescriptor<'static>,
         type_args: &'static [crate::types::TypeDescriptor<'static>],
-        f: for<'a> fn(ScriptCow<'a, T>, &[ScriptValue]) -> Result<ScriptValue, ScriptConvertError>,
+        self_inst: SelfInstantiation,
+        f: for<'a> fn(ScriptCow<'a, T>, &[ScriptValue]) -> Result<ScriptValue, ScriptCallError>,
     ) -> Result<(), Self::Error> {
-        let _ = type_args;
+        let _ = (type_args, self_inst);
         self.method(descriptor.name, f)
     }
 
@@ -597,9 +682,10 @@ pub trait TypeBinder<T>: Sized {
         &mut self,
         descriptor: &'static crate::function::FunctionDescriptor<'static>,
         type_args: &'static [crate::types::TypeDescriptor<'static>],
-        f: fn(&mut T, &[ScriptValue]) -> Result<ScriptValue, ScriptConvertError>,
+        self_inst: SelfInstantiation,
+        f: fn(&mut T, &[ScriptValue]) -> Result<ScriptValue, ScriptCallError>,
     ) -> Result<(), Self::Error> {
-        let _ = type_args;
+        let _ = (type_args, self_inst);
         self.method_mut(descriptor.name, f)
     }
 
@@ -608,9 +694,10 @@ pub trait TypeBinder<T>: Sized {
         &mut self,
         descriptor: &'static crate::function::FunctionDescriptor<'static>,
         type_args: &'static [crate::types::TypeDescriptor<'static>],
+        self_inst: SelfInstantiation,
         f: for<'a> fn(ScriptCow<'a, T>, &'a [ScriptValue]) -> ScriptCallFuture<'a>,
     ) -> Result<(), Self::Error> {
-        let _ = type_args;
+        let _ = (type_args, self_inst);
         self.method_async(descriptor.name, f)
     }
 
@@ -619,9 +706,10 @@ pub trait TypeBinder<T>: Sized {
         &mut self,
         descriptor: &'static crate::function::FunctionDescriptor<'static>,
         type_args: &'static [crate::types::TypeDescriptor<'static>],
+        self_inst: SelfInstantiation,
         f: for<'a> fn(&'a mut T, &'a [ScriptValue]) -> ScriptCallFuture<'a>,
     ) -> Result<(), Self::Error> {
-        let _ = type_args;
+        let _ = (type_args, self_inst);
         self.method_async_mut(descriptor.name, f)
     }
 
@@ -673,7 +761,7 @@ pub trait TypeBinder<T>: Sized {
     fn constructor(
         &mut self,
         name: &'static str,
-        f: fn(&[ScriptValue]) -> Result<T, ScriptConvertError>,
+        f: fn(&[ScriptValue]) -> Result<T, ScriptCallError>,
     ) -> Result<(), Self::Error>;
 
     /// Register a `Display` / `__tostring` metamethod.
@@ -853,14 +941,14 @@ impl<T: Clone> ScriptCow<'_, T> {
 /// Intentionally not `Send`; a backend whose threading model demands `Send`
 /// handles that at its own boundary.
 pub type ScriptCallFuture<'a> = ::core::pin::Pin<
-    Box<dyn ::core::future::Future<Output = Result<ScriptValue, ScriptConvertError>> + 'a>,
+    Box<dyn ::core::future::Future<Output = Result<ScriptValue, ScriptCallError>> + 'a>,
 >;
 
 /// Boxed future produced by an async constructor
 /// ([`TypeBinder::constructor_async`]): resolves to the constructed value.
 /// Not `Send`, like [`ScriptCallFuture`].
 pub type ScriptCtorFuture<'a, T> =
-    ::core::pin::Pin<Box<dyn ::core::future::Future<Output = Result<T, ScriptConvertError>> + 'a>>;
+    ::core::pin::Pin<Box<dyn ::core::future::Future<Output = Result<T, ScriptCallError>> + 'a>>;
 
 /// Owned iterator over a value's contents.
 ///
@@ -930,7 +1018,7 @@ pub trait FnBinder: Sized {
         &mut self,
         name: &'static str,
         type_args: &'static [crate::types::TypeDescriptor<'static>],
-        f: fn(&[ScriptValue]) -> Result<ScriptValue, ScriptConvertError>,
+        f: fn(&[ScriptValue]) -> Result<ScriptValue, ScriptCallError>,
     ) -> Result<(), Self::Error>;
 
     /// Register an `async` free function. The returned future may borrow the
@@ -959,7 +1047,7 @@ pub trait FnBinder: Sized {
         &mut self,
         descriptor: &'static crate::function::FunctionDescriptor<'static>,
         type_args: &'static [crate::types::TypeDescriptor<'static>],
-        f: fn(&[ScriptValue]) -> Result<ScriptValue, ScriptConvertError>,
+        f: fn(&[ScriptValue]) -> Result<ScriptValue, ScriptCallError>,
     ) -> Result<(), Self::Error> {
         self.function(descriptor.name, type_args, f)
     }

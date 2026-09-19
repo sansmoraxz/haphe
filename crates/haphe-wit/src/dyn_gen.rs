@@ -36,7 +36,7 @@ pub(crate) fn is_dyn(f: &FunctionDescriptor<'_>) -> bool {
     !f.generic_params.is_empty() && matches!(f.dispatch, Dispatch::Dyn)
 }
 
-pub(crate) use crate::types::mentions_generic;
+pub(crate) use crate::types::mentions_named_generic;
 
 /// One rendered dispatcher signature: parameter and return types are final
 /// WIT text (variant names or passed-through plain types).
@@ -121,7 +121,7 @@ impl DynCx {
         let mut params = Vec::new();
         for param in f.params {
             let pname = to_kebab(param.name);
-            if !mentions_generic(param.ty) {
+            if !mentions_named_generic(param.ty, f.generic_params) {
                 let ty = render_type(param.ty, Pos::Param(param.ownership), plan, env, &context)?;
                 params.push((pname, ty));
                 continue;
@@ -142,7 +142,7 @@ impl DynCx {
 
         let ret = match crate::types::peel_borrowed(f.return_type) {
             TypeDescriptor::Unit => None,
-            ret if !mentions_generic(ret) => Some(render_type(
+            ret if !mentions_named_generic(ret, f.generic_params) => Some(render_type(
                 ret,
                 Pos::Return(f.return_ownership),
                 plan,

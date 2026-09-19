@@ -6,7 +6,9 @@
 
 use std::fmt;
 
-use haphe::{Script, ScriptBind, ScriptConvertError, ScriptIter, ScriptValue, TypeBinder};
+use haphe::{
+    Script, ScriptBind, ScriptCallError, ScriptConvertError, ScriptIter, ScriptValue, TypeBinder,
+};
 
 #[derive(Debug)]
 struct NeverError;
@@ -25,14 +27,14 @@ type NewIndexFn<T> = fn(&mut T, &[ScriptValue]) -> Result<(), ScriptConvertError
 type AsyncFn<T> =
     for<'a> fn(haphe::ScriptCow<'a, T>, &'a [ScriptValue]) -> haphe::ScriptCallFuture<'a>;
 type AsyncMutFn<T> = for<'a> fn(&'a mut T, &'a [ScriptValue]) -> haphe::ScriptCallFuture<'a>;
-type CtorFn<T> = fn(&[ScriptValue]) -> Result<T, ScriptConvertError>;
+type CtorFn<T> = fn(&[ScriptValue]) -> Result<T, ScriptCallError>;
 type PropGetFn<T> = fn(&T) -> ScriptValue;
 type PropSetFn<T> = fn(&mut T, ScriptValue) -> Result<(), ScriptConvertError>;
 type PropGetAsyncFn<T> = for<'a> fn(haphe::ScriptCow<'a, T>) -> haphe::ScriptCallFuture<'a>;
 type PropSetAsyncFn<T> = for<'a> fn(&'a mut T, ScriptValue) -> haphe::ScriptCallFuture<'a>;
 type AsyncCtorFn<T> = for<'a> fn(&'a [ScriptValue]) -> haphe::ScriptCtorFuture<'a, T>;
 type CowMethodFn<T> =
-    for<'a> fn(haphe::ScriptCow<'a, T>, &[ScriptValue]) -> Result<ScriptValue, ScriptConvertError>;
+    for<'a> fn(haphe::ScriptCow<'a, T>, &[ScriptValue]) -> Result<ScriptValue, ScriptCallError>;
 
 #[derive(Default)]
 struct MockBinder<T> {
@@ -78,7 +80,7 @@ impl<T> TypeBinder<T> for MockBinder<T> {
         f: for<'a> fn(
             haphe::ScriptCow<'a, T>,
             &[ScriptValue],
-        ) -> Result<ScriptValue, ScriptConvertError>,
+        ) -> Result<ScriptValue, ScriptCallError>,
     ) -> Result<(), NeverError> {
         self.methods.push((name, f));
         Ok(())
@@ -87,7 +89,7 @@ impl<T> TypeBinder<T> for MockBinder<T> {
     fn method_mut(
         &mut self,
         _: &'static str,
-        _: fn(&mut T, &[ScriptValue]) -> Result<ScriptValue, ScriptConvertError>,
+        _: fn(&mut T, &[ScriptValue]) -> Result<ScriptValue, ScriptCallError>,
     ) -> Result<(), NeverError> {
         Ok(())
     }
@@ -113,7 +115,7 @@ impl<T> TypeBinder<T> for MockBinder<T> {
     fn constructor(
         &mut self,
         name: &'static str,
-        f: fn(&[ScriptValue]) -> Result<T, ScriptConvertError>,
+        f: fn(&[ScriptValue]) -> Result<T, ScriptCallError>,
     ) -> Result<(), NeverError> {
         self.constructors.push((name, f));
         Ok(())
@@ -767,7 +769,7 @@ fn transparent_newtype_free_fn_binds() {
 
     type FnEntry = (
         &'static str,
-        fn(&[ScriptValue]) -> Result<ScriptValue, ScriptConvertError>,
+        fn(&[ScriptValue]) -> Result<ScriptValue, ScriptCallError>,
     );
     struct CollectFns(Vec<FnEntry>);
     impl FnBinder for CollectFns {
@@ -776,7 +778,7 @@ fn transparent_newtype_free_fn_binds() {
             &mut self,
             name: &'static str,
             _: &'static [haphe::TypeDescriptor<'static>],
-            f: fn(&[ScriptValue]) -> Result<ScriptValue, ScriptConvertError>,
+            f: fn(&[ScriptValue]) -> Result<ScriptValue, ScriptCallError>,
         ) -> Result<(), NeverError> {
             self.0.push((name, f));
             Ok(())
@@ -830,7 +832,7 @@ impl haphe::ops::AsyncCall<(i64,)> for DeferredDoubler {
     }
 }
 
-fn poll_ready(fut: haphe::ScriptCallFuture<'_>) -> Result<ScriptValue, ScriptConvertError> {
+fn poll_ready(fut: haphe::ScriptCallFuture<'_>) -> Result<ScriptValue, ScriptCallError> {
     use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
     fn noop(_: *const ()) {}
     fn clone(_: *const ()) -> RawWaker {
@@ -1123,9 +1125,8 @@ fn async_constructor_registers_and_awaits() {
     }
 }
 
-// Fallible constructors (returning `Result`) are excluded from BINDING on
-// both the sync and async channels — they remain described. (Documented
-// exclusion; a fallible-ctor bridge channel is a queued follow-up.)
+// Fallible constructors (returning `Result`) bind on both channels; the
+// wrapper maps `Err` into a Host error (behavior pinned in fallible.rs).
 #[derive(Script, Clone)]
 #[script(thread_safety = send_sync, methods)]
 struct Gauge {
@@ -1152,7 +1153,7 @@ impl Gauge {
 }
 
 #[test]
-fn fallible_constructors_are_described_but_not_bound() {
+fn fallible_constructors_are_described_and_bound() {
     use haphe::ScriptImpl;
     let ctors = <Gauge as ScriptImpl>::CONSTRUCTORS;
     assert_eq!(ctors.len(), 2, "both fallible ctors described");
@@ -1160,6 +1161,6 @@ fn fallible_constructors_are_described_but_not_bound() {
     assert!(ctors.iter().any(|c| c.name == "try_connect" && c.is_async));
 
     let binder = bound::<Gauge>();
-    assert!(binder.constructors.is_empty(), "fallible sync ctor unbound");
-    assert!(binder.async_ctors.is_empty(), "fallible async ctor unbound");
+    assert_eq!(binder.constructors.len(), 1, "fallible sync ctor bound");
+    assert_eq!(binder.async_ctors.len(), 1, "fallible async ctor bound");
 }

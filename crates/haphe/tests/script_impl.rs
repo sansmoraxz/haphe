@@ -106,7 +106,7 @@ static EXPECTED_METHODS: &[FunctionDescriptor<'static>] = &[
         instantiations: &[],
         dispatch: haphe::Dispatch::Static,
         params: &[],
-        return_type: &TypeDescriptor::Result(&TypeDescriptor::String, &TypeDescriptor::String),
+        return_type: &TypeDescriptor::String,
         return_ownership: Ownership::Owned,
         is_async: true,
         error_kind: Some("IOError"),
@@ -317,7 +317,8 @@ impl Port {
 fn fallible_constructor() {
     let ctor = &<Port as ScriptImpl>::CONSTRUCTORS[0];
     assert_eq!(ctor.error_kind, Some("ValueError"));
-    assert!(matches!(*ctor.return_type, TypeDescriptor::Result(..)));
+    // The descriptor sees the ok type; `E` crosses as a Host error.
+    assert!(!matches!(*ctor.return_type, TypeDescriptor::Result(..)));
     assert!(Port::new(70000).is_err());
     assert_eq!(Port::new(80).unwrap().number, 80);
 }

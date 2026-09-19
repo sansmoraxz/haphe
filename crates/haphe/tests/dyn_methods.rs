@@ -7,8 +7,8 @@
 use std::fmt;
 
 use haphe::{
-    Dispatch, FunctionDescriptor, Script, ScriptBind, ScriptConvertError, ScriptIter, ScriptValue,
-    TypeBinder, TypeDescriptor, script,
+    Dispatch, FunctionDescriptor, Script, ScriptBind, ScriptCallError, ScriptConvertError,
+    ScriptIter, ScriptValue, TypeBinder, TypeDescriptor, script,
 };
 
 #[derive(Debug)]
@@ -25,8 +25,8 @@ impl std::error::Error for NeverError {}
 type Desc = &'static FunctionDescriptor<'static>;
 type Args = &'static [TypeDescriptor<'static>];
 type DynFn<T> =
-    for<'a> fn(haphe::ScriptCow<'a, T>, &[ScriptValue]) -> Result<ScriptValue, ScriptConvertError>;
-type DynMutFn<T> = fn(&mut T, &[ScriptValue]) -> Result<ScriptValue, ScriptConvertError>;
+    for<'a> fn(haphe::ScriptCow<'a, T>, &[ScriptValue]) -> Result<ScriptValue, ScriptCallError>;
+type DynMutFn<T> = fn(&mut T, &[ScriptValue]) -> Result<ScriptValue, ScriptCallError>;
 type DynAsyncFn<T> =
     for<'a> fn(haphe::ScriptCow<'a, T>, &'a [ScriptValue]) -> haphe::ScriptCallFuture<'a>;
 
@@ -39,6 +39,7 @@ struct DynBinder<T> {
     generic_methods: Vec<(&'static str, Args, DynFn<T>)>,
     generic_mut_methods: Vec<(&'static str, Args, DynMutFn<T>)>,
     generic_async_methods: Vec<(&'static str, Args, DynAsyncFn<T>)>,
+    self_insts: Vec<haphe::SelfInstantiation>,
     plain_methods: Vec<&'static str>,
 }
 
@@ -107,12 +108,25 @@ impl<T> TypeBinder<T> for DynBinder<T> {
         Ok(())
     }
 
-    fn method_dyn(&mut self, d: Desc, args: Args, f: DynFn<T>) -> Result<(), NeverError> {
+    fn method_dyn(
+        &mut self,
+        d: Desc,
+        args: Args,
+        self_inst: haphe::SelfInstantiation,
+        f: DynFn<T>,
+    ) -> Result<(), NeverError> {
         self.dyn_methods.push((d, args, f));
+        self.self_insts.push(self_inst);
         Ok(())
     }
 
-    fn method_dyn_mut(&mut self, d: Desc, args: Args, f: DynMutFn<T>) -> Result<(), NeverError> {
+    fn method_dyn_mut(
+        &mut self,
+        d: Desc,
+        args: Args,
+        _: haphe::SelfInstantiation,
+        f: DynMutFn<T>,
+    ) -> Result<(), NeverError> {
         self.dyn_mut_methods.push((d, args, f));
         Ok(())
     }
@@ -121,6 +135,7 @@ impl<T> TypeBinder<T> for DynBinder<T> {
         &mut self,
         d: Desc,
         args: Args,
+        _: haphe::SelfInstantiation,
         f: DynAsyncFn<T>,
     ) -> Result<(), NeverError> {
         self.dyn_async_methods.push((d, args, f));
@@ -131,6 +146,7 @@ impl<T> TypeBinder<T> for DynBinder<T> {
         &mut self,
         d: Desc,
         args: Args,
+        _: haphe::SelfInstantiation,
         f: DynAsyncMutFn<T>,
     ) -> Result<(), NeverError> {
         self.dyn_async_mut_methods.push((d, args, f));
@@ -140,7 +156,7 @@ impl<T> TypeBinder<T> for DynBinder<T> {
     fn constructor(
         &mut self,
         _: &'static str,
-        _: fn(&[ScriptValue]) -> Result<T, ScriptConvertError>,
+        _: fn(&[ScriptValue]) -> Result<T, ScriptCallError>,
     ) -> Result<(), NeverError> {
         Ok(())
     }
@@ -277,6 +293,7 @@ fn bound<T: ScriptBind>() -> DynBinder<T> {
         generic_methods: Vec::new(),
         generic_mut_methods: Vec::new(),
         generic_async_methods: Vec::new(),
+        self_insts: Vec::new(),
         plain_methods: Vec::new(),
     };
     T::bind(&mut binder).unwrap();
@@ -591,4 +608,105 @@ fn enum_methods_take_the_dyn_channel_too() {
     )
     .unwrap();
     assert!(matches!(out, ScriptValue::Bool(false)));
+}
+
+// ── Dyn methods on GENERIC self types: candidates carry the self
+// instantiation so the resolver can substitute the type's parameters
+// alongside the method's own.
+
+#[derive(Script, Clone)]
+#[script(methods)]
+struct Pair<T: Clone + 'static> {
+    left: T,
+    right: T,
+}
+
+#[script]
+impl<T: Clone> Pair<T> {
+    #[script(dyn, instantiate(i64), instantiate(String))]
+    fn tag_with<U>(&self, marker: U) -> U {
+        let _ = &self.left;
+        marker
+    }
+
+    /// A parameter referencing the SELF type's parameter: resolvable only
+    /// through the carried self instantiation.
+    #[script(dyn, instantiate(bool))]
+    fn replace_left<U>(&mut self, value: T, flag: U) -> U {
+        self.left = value;
+        flag
+    }
+
+    /// STATIC monomorphs also work on generic self types: the registration
+    /// surface is per-monomorph, so (name, type_args) stays unambiguous.
+    #[script(instantiate(f64))]
+    fn sized<U>(&self, scale: U) -> U {
+        let _ = &self.right;
+        scale
+    }
+}
+
+#[test]
+fn generic_self_dyn_methods_carry_the_self_instantiation() {
+    let binder = bound::<Pair<i64>>();
+    // tag_with: two candidates; replace_left: one (mut channel).
+    assert_eq!(binder.dyn_methods.len(), 2);
+    assert_eq!(binder.dyn_mut_methods.len(), 1);
+    for inst in &binder.self_insts {
+        assert_eq!(inst.params.len(), 1);
+        assert_eq!(inst.params[0].name, "T");
+        assert_eq!(
+            inst.args[0],
+            TypeDescriptor::Primitive(haphe::PrimitiveType::I64)
+        );
+    }
+    // Wrappers are monomorphized over BOTH parameter kinds.
+    let (desc, args, wrapper) = &binder.dyn_methods[1];
+    assert_eq!(desc.name, "tag_with");
+    assert_eq!(args[0], TypeDescriptor::String);
+    let pair = Pair {
+        left: 1i64,
+        right: 2,
+    };
+    let out = wrapper(
+        haphe::ScriptCow::Borrowed(&pair),
+        &[ScriptValue::String("x".into())],
+    )
+    .unwrap();
+    assert!(matches!(out, ScriptValue::String(s) if s == "x"));
+    // The T-typed parameter converts through the monomorph's concrete type.
+    let (desc, _, wrapper) = &binder.dyn_mut_methods[0];
+    assert_eq!(desc.name, "replace_left");
+    let mut pair = Pair {
+        left: 1i64,
+        right: 2,
+    };
+    let out = wrapper(&mut pair, &[ScriptValue::I64(9), ScriptValue::Bool(true)]).unwrap();
+    assert!(matches!(out, ScriptValue::Bool(true)));
+    assert_eq!(pair.left, 9);
+    // The descriptor references BOTH generic params for the resolver.
+    assert!(
+        desc.params
+            .iter()
+            .any(|p| matches!(*p.ty, TypeDescriptor::GenericParam("T")))
+    );
+}
+
+#[test]
+fn static_generic_methods_work_on_generic_self_types() {
+    let binder = bound::<Pair<i64>>();
+    // sized<f64> is a static monomorph on Pair<i64>: (name, type_args) is
+    // unambiguous because the registration surface is per-monomorph.
+    let (name, args, wrapper) = &binder.generic_methods[0];
+    assert_eq!(*name, "sized");
+    assert_eq!(
+        args[0],
+        TypeDescriptor::Primitive(haphe::PrimitiveType::F64)
+    );
+    let pair = Pair {
+        left: 3i64,
+        right: 4,
+    };
+    let out = wrapper(haphe::ScriptCow::Borrowed(&pair), &[ScriptValue::F64(0.5)]).unwrap();
+    assert!(matches!(out, ScriptValue::F64(v) if v == 0.5));
 }

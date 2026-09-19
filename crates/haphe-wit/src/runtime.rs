@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use haphe::{
     BackendCapabilities, BindingGenerator, ConstantDescriptor, FnBinder, ForeignCaller,
     ForeignError, ForeignErrorKind, ForeignHandle, ForeignInterfaceDescriptor, FromScript,
-    IntoScript, PrimitiveType, Receiver, RuntimeBinder, ScriptBind, ScriptBindFn,
+    IntoScript, PrimitiveType, Receiver, RuntimeBinder, ScriptBind, ScriptBindFn, ScriptCallError,
     ScriptConvertError, ScriptForeign, ScriptStruct, ScriptValue, ThreadSafety, TypeDescriptor,
     TypeKind, ValidatedRegistry,
 };
@@ -18,7 +18,8 @@ use wasmtime::{AsContextMut, Store};
 
 use crate::host::{
     AnyBox, CowAny, EMethod, GuestResource, HostRep, HostResState, HostResource, HostTable,
-    RawTable, ResourceEntry, ValueEntry, block_on, erase_resource, erase_value, trap_convert,
+    RawTable, ResourceEntry, ValueEntry, block_on, erase_resource, erase_value, trap_call,
+    trap_convert,
 };
 use crate::model::{Direction, Plan, ProjKind, Projected, projected_trait_members};
 use crate::names::{NameMap, to_kebab};
@@ -66,7 +67,7 @@ struct Registrations {
     dyn_async_fns: Vec<(crate::host::DynKey, AsyncProvidedFn)>,
 }
 
-type ProvidedFn = fn(&[ScriptValue]) -> Result<ScriptValue, ScriptConvertError>;
+type ProvidedFn = fn(&[ScriptValue]) -> Result<ScriptValue, ScriptCallError>;
 type AsyncProvidedFn = for<'a> fn(&'a [ScriptValue]) -> haphe::ScriptCallFuture<'a>;
 
 /// Collects `ScriptBindFn` registrations.
@@ -124,7 +125,8 @@ impl FnBinder for FnCollector {
         type_args: &'static [TypeDescriptor<'static>],
         f: ProvidedFn,
     ) -> Result<(), Self::Error> {
-        self.dyn_entries.push(((descriptor, type_args), f));
+        self.dyn_entries
+            .push(((descriptor, type_args, haphe::SelfInstantiation::NONE), f));
         Ok(())
     }
 
@@ -135,7 +137,8 @@ impl FnBinder for FnCollector {
         type_args: &'static [TypeDescriptor<'static>],
         f: AsyncProvidedFn,
     ) -> Result<(), Self::Error> {
-        self.dyn_async_entries.push(((descriptor, type_args), f));
+        self.dyn_async_entries
+            .push(((descriptor, type_args, haphe::SelfInstantiation::NONE), f));
         Ok(())
     }
 }
@@ -355,7 +358,7 @@ impl<T> WasmBinder<T> {
                 .regs
                 .dyn_fns
                 .iter()
-                .any(|((d, a), _)| d.name == key.0.name && *a == key.1)
+                .any(|((d, a, _), _)| d.name == key.0.name && *a == key.1)
             {
                 return Err(WasmBindError::DuplicateRegistration {
                     name: key.0.name.to_string(),
@@ -369,7 +372,7 @@ impl<T> WasmBinder<T> {
                 .regs
                 .dyn_async_fns
                 .iter()
-                .any(|((d, a), _)| d.name == key.0.name && *a == key.1)
+                .any(|((d, a, _), _)| d.name == key.0.name && *a == key.1)
             {
                 return Err(WasmBindError::DuplicateRegistration {
                     name: key.0.name.to_string(),
@@ -663,6 +666,14 @@ impl<T: 'static> RuntimeBinder for WasmBinder<T> {
                             None => stub_func(&mut inst, &name)?,
                         }
                     }
+                    bind_record_properties(
+                        &mut inst,
+                        s,
+                        &format!("{}-", s.name),
+                        value.as_ref(),
+                        &mut member_names,
+                        &cx,
+                    )?;
                 }
             }
             for &i in &iface.instance_indices {
@@ -692,6 +703,14 @@ impl<T: 'static> RuntimeBinder for WasmBinder<T> {
                             None => stub_func(&mut inst, &name)?,
                         }
                     }
+                    bind_record_properties(
+                        &mut inst,
+                        s,
+                        &format!("{}-", planned.wit_name),
+                        value.as_ref(),
+                        &mut member_names,
+                        &cx,
+                    )?;
                 }
             }
 
@@ -748,10 +767,13 @@ impl<T: 'static> RuntimeBinder for WasmBinder<T> {
                     if func.is_async {
                         let mut cands = Vec::new();
                         let mut desc = None;
-                        for ((d, args), f) in &self.regs.dyn_async_fns {
+                        for ((d, args, _), f) in &self.regs.dyn_async_fns {
                             if d.name == func.name {
                                 desc = Some(*d);
-                                cands.push((DynCand::new(args)?, *f));
+                                cands.push((
+                                    DynCand::new(args, haphe::SelfInstantiation::NONE)?,
+                                    *f,
+                                ));
                             }
                         }
                         match desc {
@@ -767,10 +789,13 @@ impl<T: 'static> RuntimeBinder for WasmBinder<T> {
                     } else {
                         let mut cands = Vec::new();
                         let mut desc = None;
-                        for ((d, args), f) in &self.regs.dyn_fns {
+                        for ((d, args, _), f) in &self.regs.dyn_fns {
                             if d.name == func.name {
                                 desc = Some(*d);
-                                cands.push((DynCand::new(args)?, *f));
+                                cands.push((
+                                    DynCand::new(args, haphe::SelfInstantiation::NONE)?,
+                                    *f,
+                                ));
                             }
                         }
                         match desc {
@@ -814,7 +839,7 @@ impl<T> WasmBinder<T> {
         self.regs
             .dyn_fns
             .iter()
-            .find(|((d, a), _)| d.name == name && *a == args)
+            .find(|((d, a, _), _)| d.name == name && *a == args)
             .map(|(_, f)| *f)
     }
 
@@ -827,7 +852,7 @@ impl<T> WasmBinder<T> {
         self.regs
             .dyn_async_fns
             .iter()
-            .find(|((d, a), _)| d.name == name && *a == args)
+            .find(|((d, a, _), _)| d.name == name && *a == args)
             .map(|(_, f)| *f)
     }
 
@@ -1227,11 +1252,29 @@ struct DynForeignFn {
 type ForeignKey = (&'static str, &'static [TypeDescriptor<'static>]);
 
 /// A declared enum case: exposed name plus the numeric discriminant of
-/// numeric-repr enums (real bit values for flags).
+/// numeric-repr enums (real bit values for flags), and the case's payload
+/// shape — what `ScriptValue::Enum`'s positional payload reassembles
+/// to/from at the wasm boundary.
 #[derive(Clone, PartialEq)]
 struct EnumCase {
     declared: String,
     discriminant: Option<i64>,
+    shape: CaseShape,
+}
+
+/// A declared case's payload shape, from its descriptor `VariantKind`.
+#[derive(Clone, Copy, PartialEq)]
+enum CaseShape {
+    /// No payload.
+    Unit,
+    /// One value, crossing as the wasm payload directly (a single-field
+    /// tuple case — including one whose field is itself a tuple).
+    Single,
+    /// N > 1 positional values, crossing as a wasm `tuple` payload.
+    Tuple(usize),
+    /// N named fields in declaration order, crossing as a wasm `record`
+    /// payload.
+    Struct(usize),
 }
 
 /// Guest (kebab) enum case name -> declared case; `None` marks a kebab
@@ -1247,6 +1290,12 @@ fn declared_enum_cases(registry: &ValidatedRegistry<'_>) -> EnumNames {
             let case = EnumCase {
                 declared: v.name.to_string(),
                 discriminant: v.discriminant,
+                shape: match &v.kind {
+                    haphe::VariantKind::Unit => CaseShape::Unit,
+                    haphe::VariantKind::Tuple(elems) if elems.len() == 1 => CaseShape::Single,
+                    haphe::VariantKind::Tuple(elems) => CaseShape::Tuple(elems.len()),
+                    haphe::VariantKind::Struct(fields) => CaseShape::Struct(fields.len()),
+                },
             };
             map.entry(to_kebab(v.name))
                 .and_modify(|existing| {
@@ -1403,25 +1452,30 @@ impl<T: 'static> CallerInner<T> {
         expected: &str,
         value: ScriptValue,
     ) -> Result<ScriptValue, ForeignError> {
-        match value {
-            ScriptValue::Map(mut pairs) if pairs.len() == 1 => {
-                let (case, payload) = pairs.remove(0);
-                if case == expected {
-                    Ok(payload)
-                } else {
-                    Err(call_error(
-                        function,
-                        format!("guest returned case `{case}`, expected `{expected}`"),
-                    ))
-                }
+        // The return lifts as a single-pair map — or as `ScriptValue::Enum`
+        // when the case tag translates as a declared enum case.
+        let (case, payload) = match value {
+            ScriptValue::Map(mut pairs) if pairs.len() == 1 => pairs.remove(0),
+            ScriptValue::Enum {
+                case, mut payload, ..
+            } if payload.len() <= 1 => (case, payload.pop().unwrap_or(ScriptValue::Unit)),
+            other => {
+                return Err(call_error(
+                    function,
+                    format!(
+                        "guest returned {}, expected a variant under case `{expected}`",
+                        other.variant_name()
+                    ),
+                ));
             }
-            other => Err(call_error(
+        };
+        if case == expected {
+            Ok(payload)
+        } else {
+            Err(call_error(
                 function,
-                format!(
-                    "guest returned {}, expected a variant under case `{expected}`",
-                    other.variant_name()
-                ),
-            )),
+                format!("guest returned case `{case}`, expected `{expected}`"),
+            ))
         }
     }
 
@@ -1885,7 +1939,73 @@ fn script_to_val(
                 };
                 Val::Variant(case.clone(), lowered)
             }
-            _ => return Err(err("a single-case variant map")),
+            // A declared payload enum crosses as `ScriptValue::Enum`: the
+            // guest case is the declared name's kebab spelling (an exact
+            // guest spelling is also accepted), the positional payload
+            // reassembled into the case's wasm payload — one value directly,
+            // several as the case's `tuple` elements or `record` fields (in
+            // declaration order).
+            ScriptValue::Enum { case, payload, .. } => {
+                let kebab = to_kebab(case);
+                let Some(case_decl) = var.cases().find(|c| c.name == case || c.name == kebab)
+                else {
+                    return Err(err("a declared variant case"));
+                };
+                let lowered = match &case_decl.ty {
+                    None => {
+                        if !payload.is_empty() {
+                            return Err(err("no payload on a unit case"));
+                        }
+                        None
+                    }
+                    Some(ty) => {
+                        if payload.is_empty() {
+                            return Err(err("a payload for a payload case"));
+                        }
+                        let val = if payload.len() == 1 {
+                            script_to_val(&payload[0], ty, enums, &mut *res)?
+                        } else {
+                            match ty {
+                                Type::Tuple(t) => {
+                                    let elems: Vec<Type> = t.types().collect();
+                                    if elems.len() != payload.len() {
+                                        return Err(err("a payload of the declared arity"));
+                                    }
+                                    Val::Tuple(
+                                        payload
+                                            .iter()
+                                            .zip(&elems)
+                                            .map(|(p, ty)| script_to_val(p, ty, enums, &mut *res))
+                                            .collect::<Result<_, _>>()?,
+                                    )
+                                }
+                                Type::Record(r) => {
+                                    let fields: Vec<_> = r.fields().collect();
+                                    if fields.len() != payload.len() {
+                                        return Err(err("a payload of the declared shape"));
+                                    }
+                                    Val::Record(
+                                        payload
+                                            .iter()
+                                            .zip(&fields)
+                                            .map(|(p, f)| {
+                                                Ok((
+                                                    f.name.to_string(),
+                                                    script_to_val(p, &f.ty, enums, &mut *res)?,
+                                                ))
+                                            })
+                                            .collect::<Result<_, ScriptConvertError>>()?,
+                                    )
+                                }
+                                _ => return Err(err("a single-value payload")),
+                            }
+                        };
+                        Some(Box::new(val))
+                    }
+                };
+                Val::Variant(case_decl.name.to_string(), lowered)
+            }
+            _ => return Err(err("a variant case (enum value or single-case map)")),
         },
         Type::Map(m) => match v {
             ScriptValue::Map(pairs) => Val::Map(
@@ -2001,6 +2121,7 @@ fn val_to_script(
             Some(Some(case)) => ScriptValue::Enum {
                 case: case.declared.clone(),
                 discriminant: case.discriminant,
+                payload: Vec::new(),
             },
             Some(None) => {
                 return Err(ScriptConvertError {
@@ -2021,13 +2142,60 @@ fn val_to_script(
                 .map(|n| ScriptValue::String(n.clone()))
                 .collect(),
         ),
-        Val::Variant(case, payload) => ScriptValue::Map(vec![(
-            case.clone(),
-            match payload {
-                Some(p) => val_to_script(p, enum_cases, &mut *res)?,
-                None => ScriptValue::Unit,
-            },
-        )]),
+        // A variant case that translates through the registry's enum table
+        // AND matches the declared case's payload shape is a declared
+        // payload enum: it lifts as `ScriptValue::Enum`, the payload
+        // reassembled positionally. Any other variant (hand-built
+        // descriptors, dyn dispatchers — including a dispatcher case that
+        // merely shares a declared case's name) keeps the single-pair map
+        // convention `{ case: payload }`.
+        Val::Variant(case, payload) => {
+            let declared = match enum_cases.get(case) {
+                Some(Some(decl)) => {
+                    let reassembled = match (decl.shape, payload) {
+                        (CaseShape::Unit, None) => Some(Vec::new()),
+                        (CaseShape::Single, Some(p)) => {
+                            Some(vec![val_to_script(p, enum_cases, &mut *res)?])
+                        }
+                        (CaseShape::Tuple(n), Some(p)) => match p.as_ref() {
+                            Val::Tuple(items) if items.len() == n => Some(
+                                items
+                                    .iter()
+                                    .map(|item| val_to_script(item, enum_cases, &mut *res))
+                                    .collect::<Result<_, _>>()?,
+                            ),
+                            _ => None,
+                        },
+                        (CaseShape::Struct(n), Some(p)) => match p.as_ref() {
+                            Val::Record(fields) if fields.len() == n => Some(
+                                fields
+                                    .iter()
+                                    .map(|(_, v)| val_to_script(v, enum_cases, &mut *res))
+                                    .collect::<Result<_, _>>()?,
+                            ),
+                            _ => None,
+                        },
+                        _ => None,
+                    };
+                    reassembled.map(|payload| ScriptValue::Enum {
+                        case: decl.declared.clone(),
+                        discriminant: decl.discriminant,
+                        payload,
+                    })
+                }
+                _ => None,
+            };
+            match declared {
+                Some(value) => value,
+                None => ScriptValue::Map(vec![(
+                    case.clone(),
+                    match payload {
+                        Some(p) => val_to_script(p, enum_cases, &mut *res)?,
+                        None => ScriptValue::Unit,
+                    },
+                )]),
+            }
+        }
         Val::Resource(any) => res(*any)?,
         _ => return Err(err),
     })
@@ -2217,19 +2385,27 @@ fn trap(name: &str, detail: &str) -> wasmtime::Error {
 
 /// One bind-time-resolved dyn candidate: its case tag (the instantiation's
 /// plan-independent mangled key, which is also the resolved variant case
-/// name) plus its type arguments for the core resolver.
+/// name — the METHOD's own type arguments only), its type arguments for the
+/// core resolver, and the SELF type's instantiation for methods on generic
+/// self types (self parameters substitute concretely — fixed per monomorph,
+/// never dispatcher cases).
 #[cfg(feature = "dyn-generics")]
 struct DynCand {
     key: String,
     type_args: &'static [TypeDescriptor<'static>],
+    self_inst: haphe::SelfInstantiation,
 }
 
 #[cfg(feature = "dyn-generics")]
 impl DynCand {
-    fn new(type_args: &'static [TypeDescriptor<'static>]) -> Result<Self, WitGenError> {
+    fn new(
+        type_args: &'static [TypeDescriptor<'static>],
+        self_inst: haphe::SelfInstantiation,
+    ) -> Result<Self, WitGenError> {
         Ok(Self {
             key: crate::dyn_gen::case_key_plain(type_args)?,
             type_args,
+            self_inst,
         })
     }
 }
@@ -2247,17 +2423,20 @@ fn unwrap_dyn_args(
     let mut tag: Option<String> = None;
     let mut values = Vec::with_capacity(args.len());
     for (param, v) in desc.params.iter().zip(args) {
-        if !crate::dyn_gen::mentions_generic(param.ty) {
+        if !crate::dyn_gen::mentions_named_generic(param.ty, desc.generic_params) {
             values.push(v);
             continue;
         }
-        let ScriptValue::Map(mut pairs) = v else {
-            return Err(trap(msg, "expected a dispatcher variant argument"));
+        // The wrapped position lifts as a single-pair map — or, when the
+        // case tag happens to translate as a declared enum case, as
+        // `ScriptValue::Enum`; both carry one payload value.
+        let (case, payload) = match v {
+            ScriptValue::Map(mut pairs) if pairs.len() == 1 => pairs.pop().expect("length checked"),
+            ScriptValue::Enum {
+                case, mut payload, ..
+            } if payload.len() <= 1 => (case, payload.pop().unwrap_or(ScriptValue::Unit)),
+            _ => return Err(trap(msg, "expected a single-case dispatcher variant")),
         };
-        if pairs.len() != 1 {
-            return Err(trap(msg, "expected a single-case dispatcher variant"));
-        }
-        let (case, payload) = pairs.pop().expect("length checked");
         match &tag {
             None => tag = Some(case),
             Some(t) if *t == case => {}
@@ -2308,14 +2487,27 @@ fn dyn_attempt_order<F>(
             ),
         ));
     }
-    let resolver_cands: Vec<DynCandidate<'_>> = filtered
+    // Non-generic self types rank through the shared core resolver; a
+    // generic self type merges its instantiation with each candidate's own
+    // parameters first (the resolver substitutes only the descriptor's
+    // fn-level parameters), running the same two-pass policy over the same
+    // core matcher.
+    let resolution = if filtered
         .iter()
-        .map(|&i| DynCandidate {
-            type_args: cands[i].0.type_args,
-            descriptor: desc,
-        })
-        .collect();
-    Ok(match resolve_dyn_candidate(values, &resolver_cands) {
+        .all(|&i| cands[i].0.self_inst.params.is_empty())
+    {
+        let resolver_cands: Vec<DynCandidate<'_>> = filtered
+            .iter()
+            .map(|&i| DynCandidate {
+                type_args: cands[i].0.type_args,
+                descriptor: desc,
+            })
+            .collect();
+        resolve_dyn_candidate(values, &resolver_cands)
+    } else {
+        resolve_with_self_inst(desc, cands, &filtered, values)
+    };
+    Ok(match resolution {
         Resolution::Ranked(r) => {
             let winner = filtered[r];
             let mut order = vec![winner];
@@ -2324,6 +2516,54 @@ fn dyn_attempt_order<F>(
         }
         Resolution::TryCallOrder => filtered,
     })
+}
+
+/// The core resolver's two-pass scan with the SELF type's parameters merged
+/// into the substitution — the ranking policy itself stays
+/// [`value_matches_descriptor`], shared with every backend.
+#[cfg(feature = "dyn-generics")]
+fn resolve_with_self_inst<F>(
+    desc: &'static haphe::FunctionDescriptor<'static>,
+    cands: &[(DynCand, F)],
+    filtered: &[usize],
+    values: &[ScriptValue],
+) -> haphe::dispatch::Resolution {
+    use haphe::dispatch::{GenericSubst, MatchQuality, Resolution, value_matches_descriptor};
+
+    for minimum in [MatchQuality::Exact, MatchQuality::Coercible] {
+        for (pos, &i) in filtered.iter().enumerate() {
+            let cand = &cands[i].0;
+            if desc.params.len() != values.len() {
+                continue;
+            }
+            let params: Vec<haphe::GenericParam<'static>> = cand
+                .self_inst
+                .params
+                .iter()
+                .chain(desc.generic_params.iter())
+                .copied()
+                .collect();
+            let args: Vec<TypeDescriptor<'static>> = cand
+                .self_inst
+                .args
+                .iter()
+                .chain(cand.type_args.iter())
+                .copied()
+                .collect();
+            let subst = GenericSubst {
+                params: &params,
+                args: &args,
+            };
+            let all_fit =
+                desc.params.iter().zip(values.iter()).all(|(param, value)| {
+                    value_matches_descriptor(value, param.ty, &subst) >= minimum
+                });
+            if all_fit {
+                return Resolution::Ranked(pos);
+            }
+        }
+    }
+    Resolution::TryCallOrder
 }
 
 /// Wraps a dispatcher result back under the winning candidate's case when
@@ -2336,7 +2576,9 @@ fn wrap_dyn_result(
     out: ScriptValue,
 ) -> ScriptValue {
     let ret = crate::types::peel_borrowed(desc.return_type);
-    if crate::dyn_gen::mentions_generic(ret) && !matches!(ret, TypeDescriptor::Unit) {
+    if crate::dyn_gen::mentions_named_generic(ret, desc.generic_params)
+        && !matches!(ret, TypeDescriptor::Unit)
+    {
         ScriptValue::Map(vec![(key.to_string(), out)])
     } else {
         out
@@ -2373,7 +2615,11 @@ fn define_dyn_value_fn<T: 'static>(
                     let out = wrap_dyn_result(desc, &cands[i].0.key, out);
                     return lower_result(&cx, &mut store, fty.results(), out, results, &msg);
                 }
-                Err(e) => last = Some(e),
+                // A convert error means the candidate rejected the
+                // arguments — fall through. A Host error is the matched
+                // implementation's own failure: propagate it.
+                Err(ScriptCallError::Convert(e)) => last = Some(e),
+                Err(host) => return Err(trap_call(&msg, host)),
             }
         }
         Err(no_candidate_trap(&msg, last))
@@ -2404,7 +2650,11 @@ fn define_dyn_value_fn_async<T: 'static>(
                     let out = wrap_dyn_result(desc, &cands[i].0.key, out);
                     return lower_result(&cx, &mut store, fty.results(), out, results, &msg);
                 }
-                Err(e) => last = Some(e),
+                // A convert error means the candidate rejected the
+                // arguments — fall through. A Host error is the matched
+                // implementation's own failure: propagate it.
+                Err(ScriptCallError::Convert(e)) => last = Some(e),
+                Err(host) => return Err(trap_call(&msg, host)),
             }
         }
         Err(no_candidate_trap(&msg, last))
@@ -2477,7 +2727,11 @@ fn define_dyn_method<T: 'static>(
                     let out = wrap_dyn_result(desc, &cands[i].0.key, out);
                     return lower_result(&cx, &mut store, fty.results(), out, results, &msg);
                 }
-                Err(e) => last = Some(e),
+                // A convert error means the candidate rejected the
+                // arguments — fall through. A Host error is the matched
+                // implementation's own failure: propagate it.
+                Err(ScriptCallError::Convert(e)) => last = Some(e),
+                Err(host) => return Err(trap_call(&msg, host)),
             }
         }
         Err(no_candidate_trap(&msg, last))
@@ -2515,7 +2769,11 @@ fn define_enum_dyn_companion<T: 'static>(
                     let out = wrap_dyn_result(desc, &cands[i].0.key, out);
                     return lower_result(&cx, &mut store, fty.results(), out, results, &msg);
                 }
-                Err(e) => last = Some(e),
+                // A convert error means the candidate rejected the
+                // arguments — fall through. A Host error is the matched
+                // implementation's own failure: propagate it.
+                Err(ScriptCallError::Convert(e)) => last = Some(e),
+                Err(host) => return Err(trap_call(&msg, host)),
             }
         }
         Err(no_candidate_trap(&msg, last))
@@ -2534,7 +2792,7 @@ fn define_value_fn<T: 'static>(
     let msg_name = name.to_string();
     inst.func_new(name, move |mut store, fty, params, results| {
         let args = lift_args(&cx, &mut store, params, 0, &msg_name)?;
-        let out = f(&args).map_err(|e| trap_convert(&msg_name, e))?;
+        let out = f(&args).map_err(|e| trap_call(&msg_name, e))?;
         lower_result(&cx, &mut store, fty.results(), out, results, &msg_name)
     })?;
     Ok(())
@@ -2554,7 +2812,7 @@ fn define_value_fn_async<T: 'static>(
     let msg_name = name.to_string();
     inst.func_new(name, move |mut store, fty, params, results| {
         let args = lift_args(&cx, &mut store, params, 0, &msg_name)?;
-        let out = block_on(f(&args)).map_err(|e| trap_convert(&msg_name, e))?;
+        let out = block_on(f(&args)).map_err(|e| trap_call(&msg_name, e))?;
         lower_result(&cx, &mut store, fty.results(), out, results, &msg_name)
     })?;
     Ok(())
@@ -2562,6 +2820,71 @@ fn define_value_fn_async<T: 'static>(
 
 /// Defines a live record trait projection (`{type}-{op}`): the receiver and
 /// arguments round-trip through `ScriptValue`.
+/// Binds a record's computed-property accessors — live where the value
+/// entry carries the channel, descriptive stubs otherwise. Names mirror the
+/// generator: `{owner}-{prop}` and `{owner}-set-{prop}`.
+fn bind_record_properties<T: 'static>(
+    inst: &mut LinkerInstance<'_, T>,
+    s: &haphe::StructDescriptor<'_>,
+    owner_prefix: &str,
+    value: Option<&Arc<ValueEntry>>,
+    member_names: &mut NameMap,
+    cx: &DispatchCx,
+) -> Result<(), WasmBindError> {
+    for prop in s.properties {
+        let getter_raw = format!("{owner_prefix}{}", prop.name);
+        let name =
+            member_names.insert_as(&getter_raw, &format!("property accessor `{getter_raw}`"))?;
+        match value.filter(|v| v.props_get.contains_key(prop.name)) {
+            Some(v) => {
+                define_record_property(inst, &name, v.clone(), prop.name.to_string(), false, cx)?
+            }
+            None => stub_func(inst, &name)?,
+        }
+        if !prop.readonly {
+            let setter_raw = format!("{owner_prefix}set-{}", prop.name);
+            let name = member_names
+                .insert_as(&setter_raw, &format!("property accessor `{setter_raw}`"))?;
+            match value.filter(|v| v.props_set.contains_key(prop.name)) {
+                Some(v) => {
+                    define_record_property(inst, &name, v.clone(), prop.name.to_string(), true, cx)?
+                }
+                None => stub_func(inst, &name)?,
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Dispatches one record property accessor with value semantics: `args[0]`
+/// is the receiver; a setter additionally takes the value and returns the
+/// updated record.
+fn define_record_property<T: 'static>(
+    inst: &mut LinkerInstance<'_, T>,
+    name: &str,
+    entry: Arc<ValueEntry>,
+    member: String,
+    is_set: bool,
+    cx: &DispatchCx,
+) -> Result<(), WasmBindError> {
+    let cx = cx.clone();
+    let msg_name = name.to_string();
+    inst.func_new(name, move |mut store, fty, params, results| {
+        let args = lift_args(&cx, &mut store, params, 0, &msg_name)?;
+        let table = if is_set {
+            &entry.props_set
+        } else {
+            &entry.props_get
+        };
+        let f = table
+            .get(member.as_str())
+            .ok_or_else(|| trap(&msg_name, "property has no dispatch channel"))?;
+        let out = f(&args).map_err(|e| trap_call(&msg_name, e))?;
+        lower_result(&cx, &mut store, fty.results(), out, results, &msg_name)
+    })?;
+    Ok(())
+}
+
 fn define_record_projection<T: 'static>(
     inst: &mut LinkerInstance<'_, T>,
     name: &str,
@@ -2577,7 +2900,7 @@ fn define_record_projection<T: 'static>(
             .projections
             .get(member)
             .ok_or_else(|| trap(&msg_name, "trait projection has no dispatch channel"))?;
-        let out = proj(&args).map_err(|e| trap_convert(&msg_name, e))?;
+        let out = proj(&args).map_err(|e| trap_call(&msg_name, e))?;
         lower_result(&cx, &mut store, fty.results(), out, results, &msg_name)
     })?;
     Ok(())
@@ -2629,7 +2952,7 @@ fn enum_companion_defs(
             let key = key.or_else(|| {
                 v.dyn_methods
                     .iter()
-                    .position(|((d, a), _)| d.name == m.name && a[..] == args[..])
+                    .position(|((d, a, _), _)| d.name == m.name && a[..] == args[..])
                     .map(ValueMethodKey::Dyn)
             });
             key
@@ -2660,10 +2983,10 @@ fn bind_enum_dyn_companion<T: 'static>(
     if let Some(v) = value {
         let mut cands = Vec::new();
         let mut desc = None;
-        for (i, ((d, args), _)) in v.dyn_methods.iter().enumerate() {
+        for (i, ((d, args, si), _)) in v.dyn_methods.iter().enumerate() {
             if d.name == m.name {
                 desc = Some(*d);
-                cands.push((DynCand::new(args)?, i));
+                cands.push((DynCand::new(args, *si)?, i));
             }
         }
         if let Some(desc) = desc {
@@ -2703,7 +3026,7 @@ fn define_enum_companion<T: 'static>(
         let (this, rest) = args
             .split_first()
             .ok_or_else(|| trap(&msg_name, "companion call is missing its receiver"))?;
-        let out = m(this.clone(), rest).map_err(|e| trap_convert(&msg_name, e))?;
+        let out = m(this.clone(), rest).map_err(|e| trap_call(&msg_name, e))?;
         lower_result(&cx, &mut store, fty.results(), out, results, &msg_name)
     })?;
     Ok(())
@@ -2823,7 +3146,7 @@ fn bind_resource_live<T: 'static>(
                         entry
                             .dyn_methods
                             .iter()
-                            .position(|((d, a), _)| d.name == m.name && a[..] == args[..])
+                            .position(|((d, a, _), _)| d.name == m.name && a[..] == args[..])
                             .map(MethodKey::Dyn)
                     });
                     key
@@ -2867,10 +3190,10 @@ fn bind_resource_live<T: 'static>(
             } else {
                 let mut cands = Vec::new();
                 let mut desc = None;
-                for (i, ((d, args), _)) in entry.dyn_methods.iter().enumerate() {
+                for (i, ((d, args, si), _)) in entry.dyn_methods.iter().enumerate() {
                     if d.name == m.name {
                         desc = Some(*d);
-                        cands.push((DynCand::new(args)?, i));
+                        cands.push((DynCand::new(args, *si)?, i));
                     }
                 }
                 match desc {
@@ -2993,7 +3316,7 @@ fn define_prop_get<T: 'static>(
             } else if let Some(get) = &acc.get_async {
                 // Driven on-thread; the table lock is held across awaits
                 // (same re-entrancy caveat as async methods).
-                block_on(get(CowAny::Borrowed(&*e.value))).map_err(|e| trap_convert(&msg, e))?
+                block_on(get(CowAny::Borrowed(&*e.value))).map_err(|e| trap_call(&msg, e))?
             } else {
                 return Err(trap(&msg, "property has no getter channel"));
             }
@@ -3035,7 +3358,7 @@ fn define_prop_set<T: 'static>(
         } else if let Some(set) = &acc.set_async {
             // In-place mutation under the held lock (method_async_mut
             // precedent); same re-entrancy caveat.
-            block_on(set(&mut *e.value, value)).map_err(|e| trap_convert(&msg, e))?;
+            block_on(set(&mut *e.value, value)).map_err(|e| trap_call(&msg, e))?;
         } else {
             return Err(trap(&msg, "property is readonly"));
         }
@@ -3059,7 +3382,7 @@ fn define_ctor_async<T: 'static>(
             .ctors_async
             .get(ctor_key.as_str())
             .ok_or_else(|| trap(&msg, "constructor has no bridge channel"))?;
-        let value = block_on(ctor(&args)).map_err(|e| trap_convert(&msg, e))?;
+        let value = block_on(ctor(&args)).map_err(|e| trap_call(&msg, e))?;
         results[0] = cx.own_handle(&mut store, entry.type_name, value)?;
         Ok(())
     })?;
@@ -3092,7 +3415,7 @@ fn define_ctor<T: 'static>(
             .ctors
             .get(ctor_key.as_str())
             .ok_or_else(|| trap(&msg, "constructor has no bridge channel"))?;
-        let value = ctor(&args).map_err(|e| trap_convert(&msg, e))?;
+        let value = ctor(&args).map_err(|e| trap_call(&msg, e))?;
         results[0] = cx.own_handle(&mut store, entry.type_name, value)?;
         Ok(())
     })?;
@@ -3140,7 +3463,7 @@ fn define_method<T: 'static>(
                     .remove(rep)
                     .ok_or_else(|| trap(&msg, "stale or already-consumed resource handle"))?;
                 check_type(&msg, e.type_name, entry.type_name)?;
-                f(CowAny::Owned(e.value), &args).map_err(|e| trap_convert(&msg, e))?
+                f(CowAny::Owned(e.value), &args).map_err(|e| trap_call(&msg, e))?
             }
             (EMethod::Cow(f), _) => {
                 let guard = cx.table.lock();
@@ -3148,7 +3471,7 @@ fn define_method<T: 'static>(
                     .get(&rep)
                     .ok_or_else(|| trap(&msg, "stale resource handle"))?;
                 check_type(&msg, e.type_name, entry.type_name)?;
-                f(CowAny::Borrowed(&*e.value), &args).map_err(|e| trap_convert(&msg, e))?
+                f(CowAny::Borrowed(&*e.value), &args).map_err(|e| trap_call(&msg, e))?
             }
             (EMethod::Mut(f), _) => {
                 let mut guard = cx.table.lock();
@@ -3156,7 +3479,7 @@ fn define_method<T: 'static>(
                     .get_mut(&rep)
                     .ok_or_else(|| trap(&msg, "stale resource handle"))?;
                 check_type(&msg, e.type_name, entry.type_name)?;
-                f(&mut *e.value, &args).map_err(|e| trap_convert(&msg, e))?
+                f(&mut *e.value, &args).map_err(|e| trap_call(&msg, e))?
             }
             // Async dispatch: wasmtime's dynamic host functions are
             // synchronous, so the bridge future is driven to completion on
@@ -3169,7 +3492,7 @@ fn define_method<T: 'static>(
                     .remove(rep)
                     .ok_or_else(|| trap(&msg, "stale or already-consumed resource handle"))?;
                 check_type(&msg, e.type_name, entry.type_name)?;
-                block_on(f(CowAny::Owned(e.value), &args)).map_err(|e| trap_convert(&msg, e))?
+                block_on(f(CowAny::Owned(e.value), &args)).map_err(|e| trap_call(&msg, e))?
             }
             (EMethod::AsyncCow(f), _) => {
                 let guard = cx.table.lock();
@@ -3177,8 +3500,7 @@ fn define_method<T: 'static>(
                     .get(&rep)
                     .ok_or_else(|| trap(&msg, "stale resource handle"))?;
                 check_type(&msg, e.type_name, entry.type_name)?;
-                block_on(f(CowAny::Borrowed(&*e.value), &args))
-                    .map_err(|e| trap_convert(&msg, e))?
+                block_on(f(CowAny::Borrowed(&*e.value), &args)).map_err(|e| trap_call(&msg, e))?
             }
             (EMethod::AsyncMut(f), _) => {
                 let mut guard = cx.table.lock();
@@ -3186,7 +3508,7 @@ fn define_method<T: 'static>(
                     .get_mut(&rep)
                     .ok_or_else(|| trap(&msg, "stale resource handle"))?;
                 check_type(&msg, e.type_name, entry.type_name)?;
-                block_on(f(&mut *e.value, &args)).map_err(|e| trap_convert(&msg, e))?
+                block_on(f(&mut *e.value, &args)).map_err(|e| trap_call(&msg, e))?
             }
         };
         lower_result(&cx, &mut store, fty.results(), out, results, &msg)
@@ -3343,7 +3665,7 @@ fn define_projection<T: 'static>(
                 if is_async {
                     let f = entry.metas.call_async.as_ref().ok_or_else(missing)?;
                     block_on(f(CowAny::Borrowed(&*e.value), &args))
-                        .map_err(|e| trap_convert(&msg, e))?
+                        .map_err(|e| trap_call(&msg, e))?
                 } else {
                     let f = entry.metas.call.as_ref().ok_or_else(missing)?;
                     f(&*e.value, &args).map_err(|e| trap_convert(&msg, e))?
@@ -3586,6 +3908,13 @@ fn constant_to_val(c: &ConstantDescriptor<'_>) -> Result<Val, WasmBindError> {
             PrimitiveType::Char => v.parse().map(Val::Char).map_err(|_| err("not a char")),
             _ => Err(err("unsupported primitive constant type")),
         },
+        // User types (enums included) are unreachable from `registry!`
+        // constants — those take literals only — and a hand-built descriptor
+        // has no literal form for cases or payloads; reject descriptively.
+        TypeDescriptor::Ref(_) | TypeDescriptor::Instance { .. } => Err(err(
+            "user-type constants (enum cases and payloads have no literal form) \
+             cannot be bound; expose a function returning the value instead",
+        )),
         _ => Err(err("only primitive and string constants can be bound")),
     }
 }

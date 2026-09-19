@@ -15,14 +15,6 @@ enum Color {
     Gray,
 }
 
-/// Payload variants keep opaque behavior: no generated conversions.
-#[allow(dead_code)]
-#[derive(Script)]
-enum Shape {
-    Circle(f64),
-    Point,
-}
-
 #[test]
 fn into_script_emits_exposed_case_names() {
     assert!(matches!(
@@ -44,6 +36,7 @@ fn from_script_matches_declared_names_exactly() {
     let v = ScriptValue::Enum {
         discriminant: None,
         case: "DarkBlue".to_string(),
+        payload: vec![],
     };
     assert_eq!(Color::from_script(v).unwrap(), Color::DarkBlue);
     // Plain strings work too (dynamic backends deliver declared names).
@@ -101,7 +94,7 @@ fn numeric_enum_descriptor_and_roundtrip() {
     // Outbound carries the discriminant.
     assert!(matches!(
         ScriptValue::from(Level::Mid),
-        ScriptValue::Enum { ref case, discriminant: Some(2) } if case == "Mid"
+        ScriptValue::Enum { ref case, discriminant: Some(2), .. } if case == "Mid"
     ));
     // Inbound accepts name, Enum, and plain integer.
     assert_eq!(
@@ -131,4 +124,91 @@ fn string_enum_carries_no_discriminant() {
     ));
     // Plain integers do NOT convert for string enums.
     assert!(Color::from_script(ScriptValue::I64(0)).is_err());
+}
+
+// ── Payload enums: cases cross with their carried values — tuple variants
+// positionally, struct variants' fields in declaration order.
+
+#[derive(Script, Debug, PartialEq, Clone)]
+enum Shape {
+    Empty,
+    Circle(f64),
+    Rect { width: f64, height: f64 },
+    Label(String, i64),
+}
+
+#[test]
+fn payload_cases_cross_with_their_values() {
+    match ScriptValue::from(Shape::Circle(2.5)) {
+        ScriptValue::Enum {
+            case,
+            discriminant,
+            payload,
+        } => {
+            assert_eq!(case, "Circle");
+            assert_eq!(discriminant, None);
+            assert!(matches!(payload[..], [ScriptValue::F64(v)] if v == 2.5));
+        }
+        other => panic!("expected enum, got {other:?}"),
+    }
+    match ScriptValue::from(Shape::Rect {
+        width: 3.0,
+        height: 4.0,
+    }) {
+        ScriptValue::Enum { case, payload, .. } => {
+            assert_eq!(case, "Rect");
+            assert!(matches!(
+                payload[..],
+                [ScriptValue::F64(w), ScriptValue::F64(h)] if w == 3.0 && h == 4.0
+            ));
+        }
+        other => panic!("expected enum, got {other:?}"),
+    }
+}
+
+#[test]
+fn payload_cases_roundtrip() {
+    for shape in [
+        Shape::Empty,
+        Shape::Circle(1.5),
+        Shape::Rect {
+            width: 2.0,
+            height: 3.0,
+        },
+        Shape::Label("tag".into(), 7),
+    ] {
+        let back = Shape::from_script(ScriptValue::from(shape.clone())).unwrap();
+        assert_eq!(back, shape);
+    }
+}
+
+#[test]
+fn payload_conversion_errors_are_descriptive() {
+    // Unit case with a payload.
+    let err = Shape::from_script(ScriptValue::Enum {
+        case: "Empty".into(),
+        discriminant: None,
+        payload: vec![ScriptValue::I64(1)],
+    })
+    .unwrap_err();
+    assert_eq!(err.got, "payload on a unit case");
+    // Payload case with the wrong arity.
+    let err = Shape::from_script(ScriptValue::Enum {
+        case: "Rect".into(),
+        discriminant: None,
+        payload: vec![ScriptValue::F64(1.0)],
+    })
+    .unwrap_err();
+    assert_eq!(err.got, "payload of mismatched length");
+    // A payload case named as a plain string has no payload.
+    let err = Shape::from_script(ScriptValue::String("Circle".into())).unwrap_err();
+    assert_eq!(err.got, "payload of mismatched length");
+    // Field conversion failures surface.
+    let err = Shape::from_script(ScriptValue::Enum {
+        case: "Circle".into(),
+        discriminant: None,
+        payload: vec![ScriptValue::String("no".into())],
+    })
+    .unwrap_err();
+    assert_eq!(err.expected, "f64");
 }

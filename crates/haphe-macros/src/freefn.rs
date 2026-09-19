@@ -48,8 +48,33 @@ pub fn expand(mut item: ItemFn) -> TokenStream {
         generic_params: &fn_generic_names,
         self_ty: None,
     };
+    // A `Result<T, E>` return is fallible: the descriptor and the bridge see
+    // `T`; the wrapper maps `Err` into a Host error (rendered via `Display`,
+    // tagged with `error_kind`), so `E` needs no bridge representation.
+    let fallible = matches!(
+        &item.sig.output,
+        syn::ReturnType::Type(_, ret) if crate::fn_desc::result_types(ret).is_some()
+    );
     // Strips parameter attrs even on error paths.
-    let info = build_fn_info(&mut item.sig, &fn_args, &item.attrs, &ctx, &mut errors);
+    let info = if fallible {
+        let mut desc_sig = item.sig.clone();
+        if let syn::ReturnType::Type(_, ret) = &item.sig.output
+            && let Some((ok, _)) = crate::fn_desc::result_types(ret)
+        {
+            let ok = ok.clone();
+            // `Result<(), E>` is a unit return on the ok path.
+            desc_sig.output = if matches!(&ok, syn::Type::Tuple(t) if t.elems.is_empty()) {
+                syn::ReturnType::Default
+            } else {
+                syn::parse_quote! { -> #ok }
+            };
+        }
+        let info = build_fn_info(&mut desc_sig, &fn_args, &item.attrs, &ctx, &mut errors);
+        crate::fn_desc::strip_param_script_attrs(&mut item.sig);
+        info
+    } else {
+        build_fn_info(&mut item.sig, &fn_args, &item.attrs, &ctx, &mut errors)
+    };
     if let Some(info) = &info
         && info.receiver != ReceiverShape::None
     {
@@ -131,6 +156,32 @@ pub fn expand(mut item: ItemFn) -> TokenStream {
         .collect();
     let has_type_params = !type_params.is_empty();
 
+    let error_kind_tokens = match &fn_args.error_kind {
+        Some(kind) => quote! { ::core::option::Option::Some(#kind) },
+        None => quote! { ::core::option::Option::None },
+    };
+    // The wrapper expression producing the call's ScriptValue result; a
+    // fallible call's `Err` maps into a Host error.
+    let wrap_return = |call: TokenStream| -> TokenStream {
+        if fallible {
+            quote! {
+                match #call {
+                    ::core::result::Result::Ok(__v) => ::haphe::IntoScript::into_script(__v),
+                    ::core::result::Result::Err(__e) => {
+                        return ::core::result::Result::Err(::haphe::ScriptCallError::Host {
+                            message: ::std::string::ToString::to_string(&__e),
+                            kind: #error_kind_tokens,
+                        });
+                    }
+                }
+            }
+        } else if info.return_ty.is_some() {
+            quote! { ::haphe::IntoScript::into_script(#call) }
+        } else {
+            quote! { { #call; ::haphe::ScriptValue::Unit } }
+        }
+    };
+
     let make_wrapper = |subst: &std::collections::HashMap<String, Type>| -> TokenStream {
         let conversions: Vec<TokenStream> = param_info
             .iter()
@@ -156,13 +207,9 @@ pub fn expand(mut item: ItemFn) -> TokenStream {
                 .collect();
             quote! { ::<#(#args),*> }
         };
-        let return_conversion = if info.return_ty.is_some() {
-            quote! { ::haphe::IntoScript::into_script(#fn_ident #turbofish (#(#call_args),*)) }
-        } else {
-            quote! { { #fn_ident #turbofish (#(#call_args),*); ::haphe::ScriptValue::Unit } }
-        };
+        let return_conversion = wrap_return(quote! { #fn_ident #turbofish (#(#call_args),*) });
         quote! {
-            |__args: &[::haphe::ScriptValue]| -> ::core::result::Result<::haphe::ScriptValue, ::haphe::ScriptConvertError> {
+            |__args: &[::haphe::ScriptValue]| -> ::core::result::Result<::haphe::ScriptValue, ::haphe::ScriptCallError> {
                 #(#conversions)*
                 ::core::result::Result::Ok(#return_conversion)
             }
@@ -191,11 +238,8 @@ pub fn expand(mut item: ItemFn) -> TokenStream {
                 .collect();
             quote! { ::<#(#args),*> }
         };
-        let return_conversion = if info.return_ty.is_some() {
-            quote! { ::haphe::IntoScript::into_script(#fn_ident #turbofish (#(#call_args),*).await) }
-        } else {
-            quote! { { #fn_ident #turbofish (#(#call_args),*).await; ::haphe::ScriptValue::Unit } }
-        };
+        let return_conversion =
+            wrap_return(quote! { #fn_ident #turbofish (#(#call_args),*).await });
         quote! {
             (|__args: &[::haphe::ScriptValue]| -> ::haphe::ScriptCallFuture<'_> {
                 ::std::boxed::Box::pin(async move {
@@ -283,6 +327,7 @@ pub fn expand(mut item: ItemFn) -> TokenStream {
     } else {
         let whitelisted = compatible(&empty_subst);
         let dispatch_eligible = !whitelisted
+            && !fallible
             && param_info.iter().all(|(_, ty)| {
                 crate::bind::is_bridge_compatible_type(ty) || crate::bind::is_dispatchable_path(ty)
             })
@@ -306,11 +351,7 @@ pub fn expand(mut item: ItemFn) -> TokenStream {
                     }
                 })
                 .collect();
-            let return_conversion = if info.return_ty.is_some() {
-                quote! { ::haphe::IntoScript::into_script(#fn_ident(#(#call_args),*).await) }
-            } else {
-                quote! { { #fn_ident(#(#call_args),*).await; ::haphe::ScriptValue::Unit } }
-            };
+            let return_conversion = wrap_return(quote! { #fn_ident(#(#call_args),*).await });
             quote! {
                 __binder.function_async(
                     #exposed_name,
@@ -465,7 +506,7 @@ fn gen_dispatched_fn_registration(
                         #exposed_name,
                         &[],
                         (|__args: &[::haphe::ScriptValue]|
-                            -> ::core::result::Result<::haphe::ScriptValue, ::haphe::ScriptConvertError> {
+                            -> ::core::result::Result<::haphe::ScriptValue, ::haphe::ScriptCallError> {
                             #(
                                 let #p_vars = <__T::#p_assoc as ::haphe::FromScript>::from_script(
                                     __args.get(#idx).cloned().unwrap_or(::haphe::ScriptValue::Unit)
@@ -475,7 +516,7 @@ fn gen_dispatched_fn_registration(
                                 __T::__invoke(#( #p_vars ),*)
                             ))
                         }) as fn(&[::haphe::ScriptValue])
-                            -> ::core::result::Result<::haphe::ScriptValue, ::haphe::ScriptConvertError>,
+                            -> ::core::result::Result<::haphe::ScriptValue, ::haphe::ScriptCallError>,
                     )
                 }
             }

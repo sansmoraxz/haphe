@@ -44,6 +44,41 @@ pub(crate) fn mentions_generic(ty: &TypeDescriptor<'_>) -> bool {
     }
 }
 
+/// Whether `ty` mentions one of `params` by name — the check dispatcher
+/// machinery uses so that only the METHOD's own generic parameters become
+/// variant cases; a generic SELF type's parameters render concretely per
+/// monomorph and pass through.
+#[cfg_attr(not(feature = "dyn-generics"), allow(dead_code))]
+pub(crate) fn mentions_named_generic(
+    ty: &TypeDescriptor<'_>,
+    params: &[haphe::GenericParam<'_>],
+) -> bool {
+    match ty {
+        TypeDescriptor::GenericParam(name) => params.iter().any(|p| p.name == *name),
+        TypeDescriptor::Option(inner)
+        | TypeDescriptor::List(inner)
+        | TypeDescriptor::Stream(inner)
+        | TypeDescriptor::Future(inner)
+        | TypeDescriptor::Borrowed { inner, .. } => mentions_named_generic(inner, params),
+        TypeDescriptor::Array(inner, _) => mentions_named_generic(inner, params),
+        TypeDescriptor::Map(k, v) | TypeDescriptor::Result(k, v) => {
+            mentions_named_generic(k, params) || mentions_named_generic(v, params)
+        }
+        TypeDescriptor::Tuple(elems) => elems.iter().any(|e| mentions_named_generic(e, params)),
+        TypeDescriptor::Callback {
+            params: cb_params,
+            return_type,
+        } => {
+            cb_params.iter().any(|p| mentions_named_generic(p, params))
+                || mentions_named_generic(return_type, params)
+        }
+        TypeDescriptor::Instance { args, .. } => {
+            args.iter().any(|a| mentions_named_generic(a, params))
+        }
+        _ => false,
+    }
+}
+
 /// Where a type appears; determines resource handle rendering and whether
 /// Unit is allowed.
 #[derive(Clone, Copy)]
