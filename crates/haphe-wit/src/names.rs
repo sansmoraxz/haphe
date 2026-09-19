@@ -46,7 +46,7 @@ const KEYWORDS: &[&str] = &[
     "world",
 ];
 
-/// Converts a Rust identifier (snake_case, CamelCase, or SCREAMING_CASE) to
+/// Converts a Rust identifier (`snake_case`, CamelCase, or `SCREAMING_CASE`) to
 /// WIT kebab-case, `%`-escaping WIT keywords.
 pub fn to_kebab(name: &str) -> String {
     let mut out = String::with_capacity(name.len() + 4);

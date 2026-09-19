@@ -1,6 +1,14 @@
 //! Enum exposure: populated case tables, repr-driven value boundary, and
 //! methods-bearing enums as userdata.
 
+#![allow(
+    clippy::needless_pass_by_value,
+    clippy::unused_self,
+    clippy::doc_markdown,
+    clippy::trivially_copy_pass_by_ref,
+    reason = "fixture shapes are dictated by the bridge surface under test: `#[script]` functions receive OWNED values (the boundary contract), methods keep their declared receivers (`&self` on Copy enums included), and docs name fixture idents verbatim"
+)]
+
 use haphe::{RuntimeBinder, Script, script};
 use haphe_lua::{LuaBinder, bind_fn};
 use mlua::Lua;

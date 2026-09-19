@@ -3,6 +3,12 @@
 //! channels, on structs and enums alike.
 
 #![cfg(feature = "macros")]
+#![allow(
+    clippy::needless_pass_by_value,
+    clippy::unused_self,
+    clippy::doc_markdown,
+    reason = "fixture shapes are dictated by the bridge surface under test: `#[script]` functions receive OWNED values (the boundary contract), methods keep unused receivers, and docs name fixture idents verbatim"
+)]
 
 use std::fmt;
 

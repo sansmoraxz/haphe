@@ -13,7 +13,14 @@
 //! 4. `canon lift` — re-export core `run` as the component-level `run` that
 //!    the test invokes.
 
-#![allow(dead_code, clippy::approx_constant)]
+#![allow(
+    dead_code,
+    clippy::approx_constant,
+    clippy::needless_pass_by_value,
+    clippy::unused_self,
+    clippy::trivially_copy_pass_by_ref,
+    reason = "fixture shapes are dictated by the bridge surface under test: receivers and owned parameters mirror the declared script signatures, not local call ergonomics"
+)]
 
 use haphe::{RuntimeBinder, Script, script};
 use haphe_wit::{WasmBindError, WasmBinder, WitGenerator};
@@ -172,15 +179,15 @@ fn add(a: i32, b: i32) -> i32 {
 #[script]
 fn midpoint(a: &Point, b: &Point) -> Point {
     Point {
-        x: (a.x + b.x) / 2.0,
-        y: (a.y + b.y) / 2.0,
+        x: f64::midpoint(a.x, b.x),
+        y: f64::midpoint(a.y, b.y),
     }
 }
 
 /// Fetches a rate asynchronously.
 #[script]
 async fn fetch_rate(id: i32) -> f64 {
-    id as f64
+    f64::from(id)
 }
 
 struct Empty;
@@ -229,7 +236,7 @@ haphe::registry! {
                 types: [Point, Counter],
                 constants: [
                     /// Circle constant.
-                    PI: f64 = 3.141592653589793,
+                    PI: f64 = 3.141_592_653_589_793,
                 ],
             },
         ],
@@ -361,7 +368,7 @@ fn guest_receives_bound_constant_value() {
 
     let result = run_guest(&engine, &linker, (), PI_GUEST).expect("guest runs");
     match result {
-        Val::Float64(pi) => assert!((pi - 3.141592653589793).abs() < 1e-15),
+        Val::Float64(pi) => assert!((pi - 3.141_592_653_589_793).abs() < 1e-15),
         other => panic!("expected f64, got: {other:?}"),
     }
 }
@@ -615,7 +622,7 @@ fn wasi_interfaces_compose_with_binder_in_one_linker() {
 
     let result = run_guest(&engine, &linker, host(), WASI_GUEST).expect("guest runs");
     match result {
-        Val::Float64(pi) => assert!((pi - 3.141592653589793).abs() < 1e-15, "got: {pi}"),
+        Val::Float64(pi) => assert!((pi - 3.141_592_653_589_793).abs() < 1e-15, "got: {pi}"),
         other => panic!("expected f64, got: {other:?}"),
     }
 }
@@ -1220,8 +1227,8 @@ trait AsyncMath {
     async fn add(&self, a: i32, b: i32) -> i32;
 }
 
-fn block_on<F: Future>(mut fut: F) -> F::Output {
-    let mut fut = unsafe { std::pin::Pin::new_unchecked(&mut fut) };
+fn block_on<F: Future>(fut: F) -> F::Output {
+    let mut fut = std::pin::pin!(fut);
     let waker = std::task::Waker::noop();
     let mut cx = std::task::Context::from_waker(waker);
     loop {
@@ -1639,7 +1646,7 @@ fn async_methods_dispatch_and_mutate_in_place() {
 }
 
 /// Trait projections on a resource: `default` static ctor and `eq`.
-/// default() == point(0, 0) -> 1.0.
+/// `default()` == point(0, 0) -> 1.0.
 const PROJECTION_GUEST: &str = r#"
 (component
   (import "haphe:demo/geometry" (instance $geo

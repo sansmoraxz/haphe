@@ -4,6 +4,12 @@
 //! declared `error_kind`).
 
 #![cfg(feature = "macros")]
+#![allow(
+    clippy::needless_pass_by_value,
+    clippy::unused_self,
+    clippy::doc_markdown,
+    reason = "fixture shapes are dictated by the bridge surface under test: `#[script]` functions receive OWNED values (the boundary contract), methods keep unused receivers, and docs name fixture idents verbatim"
+)]
 
 use std::fmt;
 
@@ -306,7 +312,7 @@ fn fallible_constructor_maps_err_to_host() {
             assert_eq!(kind, Some("ValueError"));
             assert!(message.contains("negative level -1"));
         }
-        other => panic!("expected Host error, got {other:?}"),
+        ScriptCallError::Convert(other) => panic!("expected Host error, got {other:?}"),
     }
 }
 
@@ -343,7 +349,7 @@ fn fallible_methods_map_err_to_host() {
             assert_eq!(kind, Some("RangeError"));
             assert_eq!(message, "overflow");
         }
-        other => panic!("expected Host error, got {other:?}"),
+        ScriptCallError::Convert(other) => panic!("expected Host error, got {other:?}"),
     }
 }
 
@@ -371,7 +377,7 @@ fn fallible_async_methods_map_err_to_host() {
     let args: [ScriptValue; 0] = [];
     match poll_ready(f(haphe::ScriptCow::Borrowed(&gauge), &args)).unwrap_err() {
         ScriptCallError::Host { message, .. } => assert_eq!(message, "empty"),
-        other => panic!("expected Host error, got {other:?}"),
+        ScriptCallError::Convert(other) => panic!("expected Host error, got {other:?}"),
     }
 }
 
@@ -418,7 +424,7 @@ fn fallible_free_fns_map_err_to_host() {
     assert!(matches!(out, ScriptValue::I64(42)));
     match f(&[ScriptValue::String("nope".into())]).unwrap_err() {
         ScriptCallError::Host { kind, .. } => assert_eq!(kind, Some("ParseError")),
-        other => panic!("expected Host error, got {other:?}"),
+        ScriptCallError::Convert(other) => panic!("expected Host error, got {other:?}"),
     }
 }
 
@@ -431,7 +437,10 @@ struct Reading {
 }
 
 #[script]
-#[allow(dead_code)]
+#[allow(
+    dead_code,
+    reason = "fixtures are exercised through their generated descriptors and bridge wrappers, not direct calls"
+)]
 fn parse_reading(raw: String) -> Result<Reading, String> {
     raw.parse()
         .map(|value| Reading { value })

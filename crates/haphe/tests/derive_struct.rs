@@ -21,7 +21,10 @@ struct Point {
     #[script(readonly, rename = "why")]
     y: f64,
     #[script(skip)]
-    #[allow(dead_code)]
+    #[allow(
+        dead_code,
+        reason = "fixtures are exercised through their generated descriptors and bridge wrappers, not direct calls"
+    )]
     cache: Option<f64>,
 }
 
@@ -109,7 +112,10 @@ fn haphe_type_resolves_to_ref() {
 /// Renaming changes `name` but never the `TypeId`.
 #[derive(Script)]
 #[script(rename = "Vec2", thread_safety = none)]
-#[allow(dead_code)]
+#[allow(
+    dead_code,
+    reason = "fixtures are exercised through their generated descriptors and bridge wrappers, not direct calls"
+)]
 struct Vector2 {
     x: f64,
     y: f64,
@@ -125,7 +131,10 @@ fn rename_keeps_type_id() {
 
 /// Default thread safety is `none` — the claim-nothing default.
 #[derive(Script)]
-#[allow(dead_code)]
+#[allow(
+    dead_code,
+    reason = "fixtures are exercised through their generated descriptors and bridge wrappers, not direct calls"
+)]
 struct Untouched {
     n: i32,
 }
@@ -140,7 +149,10 @@ fn default_thread_safety_is_none() {
 
 /// `#[script(bytes)]` overrides `Vec<u8>` to the compact encoding.
 #[derive(Script)]
-#[allow(dead_code)]
+#[allow(
+    dead_code,
+    reason = "fixtures are exercised through their generated descriptors and bridge wrappers, not direct calls"
+)]
 struct Packet {
     #[script(bytes)]
     payload: Vec<u8>,
@@ -160,11 +172,17 @@ fn bytes_override() {
 
 /// A `!Sync` type can still be exposed with the default claim.
 #[derive(Script)]
-#[allow(dead_code)]
+#[allow(
+    dead_code,
+    reason = "fixtures are exercised through their generated descriptors and bridge wrappers, not direct calls"
+)]
 struct NotSync {
     counter: i32,
     #[script(skip)]
-    #[allow(dead_code)]
+    #[allow(
+        dead_code,
+        reason = "fixtures are exercised through their generated descriptors and bridge wrappers, not direct calls"
+    )]
     inner: Cell<i32>,
 }
 

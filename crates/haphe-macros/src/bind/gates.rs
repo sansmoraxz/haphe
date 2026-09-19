@@ -82,28 +82,18 @@ pub(crate) fn mentions_path_lifetime(ty: &Type) -> bool {
 /// blanket impls in the bridge module.
 pub(crate) fn is_bridge_primitive(ty: &Type) -> bool {
     let stripped = strip_carriers(ty);
-    let Type::Path(p) = &stripped else {
-        return false;
-    };
-    if p.qself.is_some() {
-        return false;
-    }
-    let Some(ident) = p.path.get_ident() else {
+    let Some(ident) = crate::std_types::std_ident(&stripped) else {
         return false;
     };
     crate::std_types::BRIDGE_PRIMITIVES.contains(&ident.to_string().as_str())
 }
 
-/// Bare-ident std types with string/tuple bridge representations
-/// (see [`crate::std_types::SEMANTIC_VALUE_TYPES`]). Recognized only by
-/// their unqualified spelling — fully qualified paths go through
-/// trait-presence dispatch instead.
+/// Std types with string/tuple bridge representations (see
+/// [`crate::std_types::SEMANTIC_VALUE_TYPES`]), spelled bare or through an
+/// explicit `std`/`core` path (`std::path::PathBuf`). Other crates' paths
+/// never match.
 pub(crate) fn is_bridge_std_semantic(ty: &Type) -> bool {
-    let Type::Path(p) = ty else { return false };
-    if p.qself.is_some() {
-        return false;
-    }
-    let Some(ident) = p.path.get_ident() else {
+    let Some(ident) = crate::std_types::std_ident(ty) else {
         return false;
     };
     crate::std_types::SEMANTIC_VALUE_TYPES.contains(&ident.to_string().as_str())
@@ -132,9 +122,10 @@ pub(crate) fn needs_bridge_dispatch(ty: &Type, generic_params: &[String]) -> boo
     !is_reference(ty) && is_dispatchable_path(ty)
 }
 
-/// A type whose VALUES cross the bridge: a bridge primitive, a bare-ident
-/// std semantic type, or a standard container (`Vec`, `Option`, sets,
-/// deques, string-keyed maps, tuples) of such types — mirroring the blanket
+/// A type whose VALUES cross the bridge: a bridge primitive, a std semantic
+/// type, or a standard container (`Vec`, `Option`, sets, deques,
+/// string-keyed maps, tuples) of such types — each spelled bare or through
+/// an explicit `std`/`alloc`/`core` path — mirroring the blanket
 /// `FromScript`/`IntoScript` impls. Used to gate free function wrapper
 /// emission (methods keep the narrower primitive whitelist plus
 /// trait-presence dispatch).
@@ -151,6 +142,9 @@ pub fn is_bridge_value_type(ty: &Type) -> bool {
         Type::Tuple(tuple) => tuple.elems.iter().all(is_bridge_value_type),
         Type::Array(array) => is_bridge_value_type(&array.elem),
         Type::Path(p) => {
+            if p.qself.is_some() || !crate::std_types::is_std_path(&p.path) {
+                return false;
+            }
             let Some(last) = p.path.segments.last() else {
                 return false;
             };

@@ -62,6 +62,10 @@ pub(crate) fn strip_impl_script_attrs(item: &mut ItemImpl) {
     }
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "expansion drivers assemble one `quote!` output from many interdependent pieces; splitting them hurts locality more than length hurts readability"
+)]
 pub fn expand(mut item: ItemImpl) -> TokenStream {
     let mut errors = Errors::default();
 
@@ -175,7 +179,7 @@ pub fn expand(mut item: ItemImpl) -> TokenStream {
         let fn_generic_names: Vec<String> = impl_generic_names
             .iter()
             .cloned()
-            .chain(fn_type_params.iter().map(|i| i.to_string()))
+            .chain(fn_type_params.iter().map(std::string::ToString::to_string))
             .collect();
         let fn_ctx = TyCtx {
             generic_params: &fn_generic_names,
@@ -337,16 +341,17 @@ pub fn expand(mut item: ItemImpl) -> TokenStream {
             };
             let prop_name = match rename {
                 Some(name) => name.value(),
-                None => match info.name.strip_prefix("set_") {
-                    Some(stripped) => stripped.to_string(),
-                    None => {
+                None => {
+                    if let Some(stripped) = info.name.strip_prefix("set_") {
+                        stripped.to_string()
+                    } else {
                         errors.spanned(
                             *span,
                             "setter names must start with `set_` (or use `setter = \"name\"`)",
                         );
                         continue;
                     }
-                },
+                }
             };
             let descriptor_ty = match crate::ty_map::descriptor_expr(&param_ty, &ctx) {
                 Ok(expr) => expr,
@@ -396,7 +401,7 @@ pub fn expand(mut item: ItemImpl) -> TokenStream {
                     // FromScript/IntoScript bounds on the bind impl).
                     let subst: std::collections::HashMap<String, Type> = fn_type_params
                         .iter()
-                        .map(|i| i.to_string())
+                        .map(std::string::ToString::to_string)
                         .zip(types.iter().cloned())
                         .collect();
                     for (_, ty) in &method.params {
@@ -493,7 +498,7 @@ pub fn expand(mut item: ItemImpl) -> TokenStream {
             property_regs.push(crate::bind::gen_property_registration(
                 &self_ty,
                 name,
-                getter.ident.clone(),
+                &getter.ident,
                 getter.is_async,
                 &getter.ret_ty,
                 setter
@@ -512,10 +517,10 @@ pub fn expand(mut item: ItemImpl) -> TokenStream {
         // The getter's doc names the property; a doc on the setter is the
         // fallback when the getter has none.
         let doc = option_str_tokens(
-            &getter
+            getter
                 .doc
-                .clone()
-                .or_else(|| setter.as_ref().and_then(|s| s.doc.clone())),
+                .as_deref()
+                .or_else(|| setter.as_ref().and_then(|s| s.doc.as_deref())),
         );
         let ty = &getter.descriptor_ty;
         properties.push(quote! {
@@ -585,7 +590,7 @@ pub fn expand(mut item: ItemImpl) -> TokenStream {
     let bind_codegen = if let Type::Path(p) = &self_ty
         && let Some(seg) = p.path.segments.last()
     {
-        crate::bind::gen_impl_bind_methods(crate::bind::BindImplInput {
+        crate::bind::gen_impl_bind_methods(&crate::bind::BindImplInput {
             ident: &seg.ident,
             self_ty: &self_ty,
             methods: &bind_methods,
@@ -702,7 +707,7 @@ fn extract_bind_method(
         has_return: info.return_ty.is_some(),
         return_ty: info.return_ty.clone(),
         fallible,
-        error_kind: fn_args.error_kind.as_ref().map(|k| k.value()),
+        error_kind: fn_args.error_kind.as_ref().map(syn::LitStr::value),
     }
 }
 

@@ -126,8 +126,8 @@ impl ForeignCaller for MapCaller {
     }
 }
 
-fn block_on<F: Future>(mut fut: F) -> F::Output {
-    let mut fut = unsafe { std::pin::Pin::new_unchecked(&mut fut) };
+fn block_on<F: Future>(fut: F) -> F::Output {
+    let mut fut = std::pin::pin!(fut);
     let waker = std::task::Waker::noop();
     let mut cx = std::task::Context::from_waker(waker);
     loop {

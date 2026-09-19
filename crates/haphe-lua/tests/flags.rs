@@ -2,7 +2,10 @@
 //! pass through the Lua binder unchanged: the binder is agnostic to
 //! `is_flags` and binds the usual type stubs.
 
-#![allow(dead_code)]
+#![allow(
+    dead_code,
+    reason = "fixtures are exercised through their generated descriptors and bridge wrappers, not direct calls"
+)]
 
 use haphe::{RuntimeBinder, Script};
 use haphe_lua::LuaBinder;

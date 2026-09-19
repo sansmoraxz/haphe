@@ -2,7 +2,17 @@
 //! `traits(Iterator)` drive `pairs`, Luau `for-in`, and the portable
 //! `obj:iter()` method; `traits(Index/IndexMut)` drive `obj[key]` access.
 
-#![allow(dead_code)]
+#![allow(
+    clippy::needless_pass_by_value,
+    clippy::unused_self,
+    clippy::doc_markdown,
+    clippy::trivially_copy_pass_by_ref,
+    reason = "fixture shapes are dictated by the bridge surface under test: `#[script]` functions receive OWNED values (the boundary contract), methods keep their declared receivers (`&self` on Copy enums included), and docs name fixture idents verbatim"
+)]
+#![allow(
+    dead_code,
+    reason = "fixtures are exercised through their generated descriptors and bridge wrappers, not direct calls"
+)]
 
 use haphe::Script;
 use haphe_lua::bind_type;
@@ -135,7 +145,7 @@ fn iter_method_yields_one_based_pairs() {
 // exercised in each configuration alongside these direct-path tests.
 // ---------------------------------------------------------------------------
 
-/// `pairs(obj)` consults `__pairs` on 5.2+ and LuaJIT with 5.2 compat.
+/// `pairs(obj)` consults `__pairs` on 5.2+ and `LuaJIT` with 5.2 compat.
 #[cfg(any(
     feature = "lua55",
     feature = "lua54",
@@ -342,11 +352,11 @@ fn empty_collection_iterates_zero_times() {
     set_global(&lua, "seq", Sequence { values: vec![] });
     let n: i64 = lua
         .load(
-            r#"
+            r"
             local n = 0
             for _ in seq:iter() do n = n + 1 end
             return n
-            "#,
+            ",
         )
         .eval()
         .unwrap();
@@ -359,7 +369,7 @@ fn concurrent_iterations_are_independent() {
     set_global(&lua, "seq", Sequence { values: vec![1, 2] });
     let out: String = lua
         .load(
-            r#"
+            r"
             local a = seq:iter()
             local b = seq:iter()
             local _, a1 = a()
@@ -367,7 +377,7 @@ fn concurrent_iterations_are_independent() {
             local _, a2 = a()
             local _, b2 = b()
             return a1 .. b1 .. a2 .. b2
-            "#,
+            ",
         )
         .eval()
         .unwrap();
@@ -487,6 +497,10 @@ impl IntoIterator for Clashing {
 
 #[haphe::script]
 impl Clashing {
+    #[allow(
+        clippy::iter_not_returning_iterator,
+        reason = "the clash with the reserved `iter` name IS the surface under test"
+    )]
     fn iter(&self) -> i64 {
         0
     }

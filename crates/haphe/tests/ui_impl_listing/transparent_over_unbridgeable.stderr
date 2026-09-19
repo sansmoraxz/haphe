@@ -1,5 +1,5 @@
 error[E0277]: the trait bound `ScriptValue: From<Point>` is not satisfied
-  --> tests/ui/transparent_over_unbridgeable.rs:10:10
+  --> tests/ui_impl_listing/transparent_over_unbridgeable.rs:10:10
    |
 10 | #[derive(Script)]
    |          ^^^^^^ the trait `From<Point>` is not implemented for `ScriptValue`
@@ -27,8 +27,8 @@ error[E0277]: the trait bound `ScriptValue: From<Point>` is not satisfied
              From<Box<T>>
              From<Cow<'_, T>>
              From<Duration>
-             From<HashMap<std::string::String, V>>
-             From<HashSet<T>>
+             From<HashMap<std::string::String, V, S>>
+             From<HashSet<T, S>>
              From<IpAddr>
              From<Ipv4Addr>
              From<Ipv6Addr>
@@ -71,13 +71,13 @@ error[E0277]: the trait bound `ScriptValue: From<Point>` is not satisfied
    = note: this error originates in the derive macro `Script` (in Nightly builds, run with -Z macro-backtrace for more info)
 
 error[E0277]: the trait bound `Point: FromScript` is not satisfied
-  --> tests/ui/transparent_over_unbridgeable.rs:12:20
+  --> tests/ui_impl_listing/transparent_over_unbridgeable.rs:12:20
    |
 12 | pub struct Wrapped(Point);
    |                    ^^^^^ unsatisfied trait bound
    |
 help: the trait `FromScript` is not implemented for `Point`
-  --> tests/ui/transparent_over_unbridgeable.rs:4:1
+  --> tests/ui_impl_listing/transparent_over_unbridgeable.rs:4:1
    |
  4 | pub struct Point {
    | ^^^^^^^^^^^^^^^^

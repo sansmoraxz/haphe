@@ -10,7 +10,10 @@
 //! cargo test -p haphe-lua --test features --features "send,error-send"
 //! ```
 
-#![allow(dead_code)]
+#![allow(
+    dead_code,
+    reason = "fixtures are exercised through their generated descriptors and bridge wrappers, not direct calls"
+)]
 
 use haphe::{RuntimeBinder, Script, script};
 use haphe_lua::LuaBinder;

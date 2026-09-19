@@ -2,7 +2,10 @@
 //! the bitwise metamethods exist only on Lua 5.3+ and registration is
 //! rejected descriptively elsewhere.
 
-#![allow(dead_code)]
+#![allow(
+    dead_code,
+    reason = "fixtures are exercised through their generated descriptors and bridge wrappers, not direct calls"
+)]
 
 use haphe::Script;
 use haphe_lua::bind_type;

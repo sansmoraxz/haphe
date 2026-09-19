@@ -38,21 +38,26 @@ impl<V: FromScript> FromScript for BTreeMap<String, V> {
 }
 
 /// Described as a list; iteration order (and thus list order) is the set's
-/// own — unspecified for `HashSet`.
-impl<T: HapheType> HapheType for HashSet<T> {
+/// own — unspecified for `HashSet`. Generic over the hasher, like the std
+/// collection itself.
+impl<T: HapheType, S> HapheType for HashSet<T, S> {
     const DESCRIPTOR: TypeDescriptor<'static> = TypeDescriptor::List(&T::DESCRIPTOR);
 }
 
-impl<T> From<HashSet<T>> for ScriptValue
+impl<T, S> From<HashSet<T, S>> for ScriptValue
 where
     ScriptValue: From<T>,
 {
-    fn from(set: HashSet<T>) -> Self {
+    fn from(set: HashSet<T, S>) -> Self {
         Self::List(set.into_iter().map(ScriptValue::from).collect())
     }
 }
 
-impl<T: FromScript + Eq + std::hash::Hash> FromScript for HashSet<T> {
+impl<T, S> FromScript for HashSet<T, S>
+where
+    T: FromScript + Eq + std::hash::Hash,
+    S: std::hash::BuildHasher + Default,
+{
     fn from_script(v: ScriptValue) -> Result<Self, ScriptConvertError> {
         match v {
             ScriptValue::List(items) => items.into_iter().map(T::from_script).collect(),

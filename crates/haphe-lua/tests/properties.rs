@@ -1,7 +1,10 @@
 //! Computed properties (`#[script(getter)]`/`#[script(setter)]`) bound as
 //! Lua field accessors, and async constructors on the type table.
 
-#![allow(dead_code)]
+#![allow(
+    dead_code,
+    reason = "fixtures are exercised through their generated descriptors and bridge wrappers, not direct calls"
+)]
 
 use haphe::{Script, script};
 use haphe_lua::bind_type;

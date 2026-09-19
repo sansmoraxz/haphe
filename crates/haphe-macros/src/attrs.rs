@@ -156,7 +156,7 @@ pub fn extract_doc(attrs: &[Attribute]) -> Option<String> {
     if lines.is_empty() {
         None
     } else {
-        while lines.last().is_some_and(|l| l.is_empty()) {
+        while lines.last().is_some_and(std::string::String::is_empty) {
             lines.pop();
         }
         Some(lines.join("\n"))
@@ -164,10 +164,11 @@ pub fn extract_doc(attrs: &[Attribute]) -> Option<String> {
 }
 
 /// `Option<String>` → `Some("...")` / `None` tokens.
-pub fn option_str_tokens(value: &Option<String>) -> TokenStream {
-    match value {
-        Some(text) => quote! { ::core::option::Option::Some(#text) },
-        None => quote! { ::core::option::Option::None },
+pub fn option_str_tokens(value: Option<&str>) -> TokenStream {
+    if let Some(text) = value {
+        quote! { ::core::option::Option::Some(#text) }
+    } else {
+        quote! { ::core::option::Option::None }
     }
 }
 
@@ -284,6 +285,10 @@ macro_rules! set_once {
     };
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "one dispatch arm per accepted key; length tracks the attribute surface"
+)]
 pub fn parse_container_args(attrs: &[Attribute], errors: &mut Errors) -> ContainerArgs {
     const ALLOWED: &[&str] = &[
         "rename",
@@ -423,7 +428,7 @@ pub fn parse_field_args(attrs: &[Attribute], errors: &mut Errors) -> FieldArgs {
     }
     if args.skip.is_some() {
         let others = [
-            (args.rename.as_ref().map(|r| r.span()), "rename"),
+            (args.rename.as_ref().map(syn::LitStr::span), "rename"),
             (args.readonly, "readonly"),
             (args.bytes, "bytes"),
         ];

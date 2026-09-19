@@ -100,7 +100,7 @@ mod verify;
 #[proc_macro_derive(Script, attributes(script))]
 pub fn derive_script(input: TokenStream) -> TokenStream {
     let input = syn::parse_macro_input!(input as syn::DeriveInput);
-    derive::expand(input).into()
+    derive::expand(&input).into()
 }
 
 /// Attribute macro exposing an `impl` block or a free function to scripting
@@ -368,7 +368,7 @@ pub fn script(args: TokenStream, item: TokenStream) -> TokenStream {
 #[proc_macro]
 pub fn registry(input: TokenStream) -> TokenStream {
     let input = syn::parse_macro_input!(input as registry::RegistryInput);
-    registry::expand(input).into()
+    registry::expand(&input).into()
 }
 mod attrs;
 mod fn_desc;

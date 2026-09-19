@@ -25,7 +25,11 @@ mod dyn_gen;
 /// emission machinery compiles.
 #[cfg(not(feature = "dyn-generics"))]
 mod dyn_gen {
-    #![allow(dead_code)]
+    #![allow(
+        dead_code,
+        clippy::unused_self,
+        reason = "without the feature every stand-in below is intentionally uncalled, and the stubs keep the real module's method signatures (`&self`)"
+    )]
 
     use crate::WitGenError;
     use crate::emit::Printer;
@@ -427,6 +431,10 @@ impl BindingGenerator for WitGenerator {
 }
 
 impl WitGenerator {
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one exhaustive pass per descriptor/channel shape; splitting the walk would scatter the per-shape rules"
+    )]
     fn emit_interface(
         &self,
         p: &mut Printer,
@@ -437,7 +445,7 @@ impl WitGenerator {
         let iface = &plan.interfaces[index];
         let base_env = iface
             .foreign_instance
-            .map(|i| plan.env_for(registry, &plan.instances[i]));
+            .map(|i| Plan::env_for(registry, &plan.instances[i]));
         p.doc(iface.doc);
         if let Some(i) = iface.foreign_instance {
             let marker = plan.instance_marker(&plan.instances[i])?;
@@ -478,7 +486,7 @@ impl WitGenerator {
         // deterministic `haphe:generic-instance` doc line.
         for &i in &iface.instance_indices {
             let inst = &plan.instances[i];
-            let env = plan.env_for(registry, inst);
+            let env = Plan::env_for(registry, inst);
             let marker = plan.instance_marker(inst)?;
             p.doc(Some(&format!("haphe:generic-instance = {marker}")));
             match registry
@@ -516,7 +524,7 @@ impl WitGenerator {
                     for args in m.instantiations {
                         let mangled = plan.mangle_fn_instance(m.name, args, None)?;
                         let fn_name = member_names.insert(&format!("{}_{}", e.name, mangled))?;
-                        let fenv = plan.fn_env(m, args, None);
+                        let fenv = Plan::fn_env(m, args, None);
                         emit_function(p, m, Some(&enum_name), &fn_name, plan, Some(&fenv))?;
                     }
                     if dyn_gen::is_dyn(m) {
@@ -532,7 +540,7 @@ impl WitGenerator {
             let inst = &plan.instances[i];
             if let Some(TypeKind::Enum(e)) = registry.get_type(&haphe::TypeId::new(inst.erased_id))
             {
-                let env = plan.env_for(registry, inst);
+                let env = Plan::env_for(registry, inst);
                 for m in e.methods {
                     if m.generic_params.is_empty() {
                         let fn_name =
@@ -544,7 +552,7 @@ impl WitGenerator {
                         let mangled = plan.mangle_fn_instance(m.name, args, Some(&env))?;
                         let fn_name =
                             member_names.insert(&format!("{}-{}", inst.wit_name, mangled))?;
-                        let fenv = plan.fn_env(m, args, Some(&env));
+                        let fenv = Plan::fn_env(m, args, Some(&env));
                         emit_function(p, m, Some(&inst.wit_name), &fn_name, plan, Some(&fenv))?;
                     }
                     if dyn_gen::is_dyn(m) {
@@ -581,7 +589,7 @@ impl WitGenerator {
                 registry.get_type(&haphe::TypeId::new(inst.erased_id))
                 && !plan.is_resource(inst.erased_id)
             {
-                let env = plan.env_for(registry, inst);
+                let env = Plan::env_for(registry, inst);
                 for proj in projected_trait_members(s)? {
                     let raw = format!("{}-{}", inst.wit_name, proj.source_name);
                     let fn_name =
@@ -639,7 +647,7 @@ impl WitGenerator {
             for args in haphe::union_instantiations(func, iface.fn_instantiations) {
                 let mangled = plan.mangle_fn_instance(func.name, args, base_env.as_ref())?;
                 let name = member_names.insert(&mangled)?;
-                let env = plan.fn_env(func, args, base_env.as_ref());
+                let env = Plan::fn_env(func, args, base_env.as_ref());
                 let arg_names: Vec<String> = args
                     .iter()
                     .map(|a| plan.mangle_type(a, base_env.as_ref()))
@@ -877,7 +885,7 @@ fn emit_resource(
                 m.name,
                 arg_names.join(", ")
             )));
-            let fenv = plan.fn_env(m, args, env);
+            let fenv = Plan::fn_env(m, args, env);
             emit_resource_method(p, m, &name, wit_name, plan, Some(&fenv), &context)?;
         }
         if dyn_gen::is_dyn(m)
@@ -957,7 +965,11 @@ fn emit_resource_method(
 /// resources (`as_resource`) members are methods/statics on the resource,
 /// for records they are interface-level functions taking `this` by value
 /// (mutating projections then return the updated record).
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "one rendering arm per projection kind; the parameters name each rendering input explicitly rather than bundling an ad-hoc struct"
+)]
 fn emit_projection(
     p: &mut Printer,
     proj: &Projected<'_>,
@@ -1021,7 +1033,7 @@ fn emit_projection(
         ProjKind::ToString | ProjKind::DebugString => {
             p.line(&format!("{name}: func({}) -> string;", this_param(true)));
         }
-        ProjKind::Hash => {
+        ProjKind::Hash | ProjKind::Length => {
             p.line(&format!("{name}: func({}) -> u64;", this_param(true)));
         }
         ProjKind::Call {
@@ -1075,9 +1087,6 @@ fn emit_projection(
                 "{name}: func({}) -> list<{item}>;",
                 this_param(true)
             ));
-        }
-        ProjKind::Length => {
-            p.line(&format!("{name}: func({}) -> u64;", this_param(true)));
         }
         ProjKind::Default => {
             if as_resource {

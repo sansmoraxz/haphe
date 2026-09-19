@@ -33,7 +33,10 @@ use math::mul;
 use math::mul as multiply;
 
 /// A function with explicit (but monomorphic) lifetimes is exposable.
-#[allow(clippy::needless_lifetimes)]
+#[allow(
+    clippy::needless_lifetimes,
+    reason = "the explicit lifetimes are the surface under test"
+)]
 #[script]
 pub fn first_word<'a>(s: &'a str) -> &'a str {
     s.split_whitespace().next().unwrap_or("")
@@ -128,7 +131,7 @@ async fn delayed_sum(a: i64, b: i64) -> i64 {
 #[test]
 fn async_free_fn_binds_and_awaits() {
     use haphe::{FnBinder, ScriptBindFn, ScriptCallFuture, ScriptValue, TypeDescriptor};
-    use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+    use std::task::{Context, Poll, Waker};
 
     type AsyncWrapper = for<'a> fn(&'a [ScriptValue]) -> ScriptCallFuture<'a>;
     #[derive(Default)]
@@ -159,13 +162,7 @@ fn async_free_fn_binds_and_awaits() {
     let (name, f) = binder.0[0];
     assert_eq!(name, "delayed_sum");
 
-    fn noop(_: *const ()) {}
-    fn clone(_: *const ()) -> RawWaker {
-        RawWaker::new(std::ptr::null(), &VTABLE)
-    }
-    static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, noop, noop, noop);
-    let waker = unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &VTABLE)) };
-    let mut cx = Context::from_waker(&waker);
+    let mut cx = Context::from_waker(Waker::noop());
     let args = [ScriptValue::I64(20), ScriptValue::I64(22)];
     let mut fut = f(&args);
     match fut.as_mut().poll(&mut cx) {

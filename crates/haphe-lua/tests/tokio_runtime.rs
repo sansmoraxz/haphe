@@ -6,7 +6,10 @@
 //! - Multi-thread tests are gated on `feature = "send"` — without it `Lua`
 //!   is `!Send` and cannot cross a `tokio::spawn` boundary.
 
-#![allow(dead_code)]
+#![allow(
+    dead_code,
+    reason = "fixtures are exercised through their generated descriptors and bridge wrappers, not direct calls"
+)]
 
 use haphe::{RuntimeBinder, Script, script};
 use haphe_lua::LuaBinder;
@@ -94,7 +97,7 @@ async fn single_thread_multiple_eval_rounds() {
             .load(format!("return vectors.ORIGIN_X + {i}"))
             .eval()
             .unwrap();
-        assert!((result - i as f64).abs() < 1e-12);
+        assert!((result - f64::from(i)).abs() < 1e-12);
     }
 }
 

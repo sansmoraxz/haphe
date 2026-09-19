@@ -23,7 +23,6 @@ pub struct BindField {
 }
 
 /// A method or constructor to register via the bridge.
-#[allow(dead_code)]
 pub struct BindMethod {
     pub ident: Ident,
     pub name: String,
@@ -80,6 +79,10 @@ pub fn hidden_mod_ident(ident: &Ident) -> Ident {
 
 /// Generates the hidden module with field and metamethod registration,
 /// and optionally the full `impl ScriptBind` (when no `#[script(methods)]`).
+#[allow(
+    clippy::too_many_lines,
+    reason = "expansion drivers assemble one `quote!` output from many interdependent pieces; splitting them hurts locality more than length hurts readability"
+)]
 pub fn gen_derive_bind(
     ident: &Ident,
     self_ty: &Type,
@@ -244,7 +247,7 @@ pub struct BindImplInput<'a> {
     pub generics: &'a Generics,
 }
 
-pub fn gen_impl_bind_methods(input: BindImplInput<'_>) -> TokenStream {
+pub fn gen_impl_bind_methods(input: &BindImplInput<'_>) -> TokenStream {
     let BindImplInput {
         ident,
         self_ty,
@@ -278,7 +281,7 @@ pub fn gen_impl_bind_methods(input: BindImplInput<'_>) -> TokenStream {
     // For generic impls, add FromScript + IntoScript + HapheType bounds on
     // type params (the last so dyn methods can materialize the self type's
     // instantiation descriptors; every bridgeable type is describable).
-    let mut bind_generics = generics.clone();
+    let mut bind_generics = (*generics).clone();
     for param in &mut bind_generics.params {
         if let syn::GenericParam::Type(tp) = param {
             tp.bounds.push(syn::parse_quote!(::haphe::FromScript));

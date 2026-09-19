@@ -64,7 +64,7 @@ return {
 
 fn hooks_from(lua: &Lua, script: &str) -> Result<HooksHandle, LuaBindError> {
     let table: mlua::Table = lua.load(script).eval().unwrap();
-    foreign_handle(lua, table)
+    foreign_handle(lua, &table)
 }
 
 #[test]
@@ -221,7 +221,7 @@ return {
 fn generic_foreign_interface_rejected_without_feature() {
     let lua = Lua::new();
     let table: mlua::Table = lua.load(DYNAMIC_CALLBACKS).eval().unwrap();
-    let Err(err) = foreign_handle::<StoreHandle<i64>>(&lua, table) else {
+    let Err(err) = foreign_handle::<StoreHandle<i64>>(&lua, &table) else {
         panic!("expected an error");
     };
     assert!(
@@ -235,7 +235,7 @@ fn generic_foreign_interface_rejected_without_feature() {
 fn generic_foreign_method_rejected_without_feature() {
     let lua = Lua::new();
     let table: mlua::Table = lua.load(DYNAMIC_CALLBACKS).eval().unwrap();
-    let Err(err) = foreign_handle::<ConvHandle>(&lua, table) else {
+    let Err(err) = foreign_handle::<ConvHandle>(&lua, &table) else {
         panic!("expected an error");
     };
     assert!(
@@ -251,8 +251,8 @@ fn generic_foreign_method_rejected_without_feature() {
 fn generic_interfaces_dispatch_dynamically() {
     let lua = Lua::new();
     let table: mlua::Table = lua.load(DYNAMIC_CALLBACKS).eval().unwrap();
-    let ints: StoreHandle<i64> = foreign_handle(&lua, table.clone()).unwrap();
-    let strings: StoreHandle<String> = foreign_handle(&lua, table).unwrap();
+    let ints: StoreHandle<i64> = foreign_handle(&lua, &table).unwrap();
+    let strings: StoreHandle<String> = foreign_handle(&lua, &table).unwrap();
     assert_eq!(ints.get("n".to_string()), Some(7));
     assert_eq!(strings.get("s".to_string()), Some("seven".to_string()));
     assert_eq!(ints.get("missing".to_string()), None);
@@ -264,7 +264,7 @@ fn generic_interfaces_dispatch_dynamically() {
 fn static_generic_methods_route_to_mangled_handlers() {
     let lua = Lua::new();
     let table: mlua::Table = lua.load(DYNAMIC_CALLBACKS).eval().unwrap();
-    let conv: ConvHandle = foreign_handle(&lua, table).unwrap();
+    let conv: ConvHandle = foreign_handle(&lua, &table).unwrap();
     let n: i64 = conv.convert("41".to_string());
     assert_eq!(n, 41);
     let s: String = conv.convert("x".to_string());
@@ -278,7 +278,7 @@ fn static_generic_methods_route_to_mangled_handlers() {
 fn undeclared_static_instantiation_errors_with_declared_set() {
     let lua = Lua::new();
     let table: mlua::Table = lua.load(DYNAMIC_CALLBACKS).eval().unwrap();
-    let conv: ConvHandle = foreign_handle(&lua, table).unwrap();
+    let conv: ConvHandle = foreign_handle(&lua, &table).unwrap();
     let HookError(message) = conv.parse::<bool>("true".to_string()).unwrap_err();
     assert!(
         message.contains("no handler for instantiation `parse__bool`"),
@@ -298,17 +298,17 @@ fn missing_mangled_handler_is_a_build_time_error() {
     let lua = Lua::new();
     let table: mlua::Table = lua
         .load(
-            r#"
+            r"
             return {
                 convert__i64 = function(raw) return tonumber(raw) end,
                 parse__i64 = function(raw) return tonumber(raw) end,
                 show = function(value) return tostring(value) end,
             }
-            "#,
+            ",
         )
         .eval()
         .unwrap();
-    let Err(err) = foreign_handle::<ConvHandle>(&lua, table) else {
+    let Err(err) = foreign_handle::<ConvHandle>(&lua, &table) else {
         panic!("expected an error");
     };
     match err {
@@ -331,7 +331,7 @@ fn missing_mangled_handler_is_a_build_time_error() {
 fn dyn_generic_methods_dispatch_through_one_handler() {
     let lua = Lua::new();
     let table: mlua::Table = lua.load(DYNAMIC_CALLBACKS).eval().unwrap();
-    let render: RenderHandle = foreign_handle(&lua, table).unwrap();
+    let render: RenderHandle = foreign_handle(&lua, &table).unwrap();
     assert_eq!(render.show(7i64), "7");
     assert_eq!(render.show("x".to_string()), "x");
 }
@@ -360,7 +360,7 @@ mod async_dispatch {
                     .load(r#"return { fetch = function(url) return "body of " .. url end }"#)
                     .eval()
                     .unwrap();
-                let hooks: AsyncHooksHandle = foreign_handle(&lua, table).unwrap();
+                let hooks: AsyncHooksHandle = foreign_handle(&lua, &table).unwrap();
                 let body = hooks.fetch("http://example".to_string()).await.unwrap();
                 assert_eq!(body, "body of http://example");
             })
@@ -383,10 +383,10 @@ mod async_dispatch {
             .run_until(async {
                 let lua = Lua::new();
                 let table: mlua::Table = lua
-                    .load(r#"return { fetch__i64 = function(key) return #key end }"#)
+                    .load(r"return { fetch__i64 = function(key) return #key end }")
                     .eval()
                     .unwrap();
-                let conv: AsyncConvHandle = foreign_handle(&lua, table).unwrap();
+                let conv: AsyncConvHandle = foreign_handle(&lua, &table).unwrap();
                 let n: i64 = conv.fetch("abcd".to_string()).await.unwrap();
                 assert_eq!(n, 4);
             })
@@ -403,7 +403,7 @@ mod async_dispatch {
                     .load(r#"return { fetch = function() error("offline") end }"#)
                     .eval()
                     .unwrap();
-                let hooks: AsyncHooksHandle = foreign_handle(&lua, table).unwrap();
+                let hooks: AsyncHooksHandle = foreign_handle(&lua, &table).unwrap();
                 let HookError(message) =
                     hooks.fetch("http://example".to_string()).await.unwrap_err();
                 assert!(message.contains("offline"), "got: {message}");

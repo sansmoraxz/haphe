@@ -7,6 +7,17 @@
 fn ui() {
     let t = trybuild::TestCases::new();
     t.compile_fail("tests/ui/*.rs");
+    // These fixtures pin stderr that embeds rustc's exhaustive impl listing,
+    // which grows when optional integration features add bridge impls — so
+    // they only run against the default impl set.
+    #[cfg(not(any(
+        feature = "bitflags",
+        feature = "streams",
+        feature = "futures",
+        feature = "chrono",
+        feature = "jiff"
+    )))]
+    t.compile_fail("tests/ui_impl_listing/*.rs");
     #[cfg(feature = "bitflags")]
     t.compile_fail("tests/ui_bitflags/*.rs");
 }

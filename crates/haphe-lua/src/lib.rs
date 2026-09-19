@@ -2,7 +2,7 @@
 //!
 //! Implements [`RuntimeBinder`] to register haphe-described modules and
 //! constants into a live [`mlua::Lua`] runtime, and [`bind_type`] to
-//! register haphe-described types as Lua UserData — with fields, methods,
+//! register haphe-described types as Lua `UserData` — with fields, methods,
 //! constructors, and metamethods generated from `#[derive(Script)]` +
 //! `#[script] impl`.
 //!
@@ -11,11 +11,11 @@
 //! - **Module tables**: nested Lua tables mirroring the module hierarchy.
 //! - **Constants**: module constants converted to Lua values.
 //! - **Type binding**: [`bind_type`] registers a type's fields, methods,
-//!   constructors, and trait metamethods (Display → `tostring`, ToString →
+//!   constructors, and trait metamethods (Display → `tostring`, `ToString` →
 //!   `..` concatenation with string-like operands, PartialEq/Eq → `==`,
-//!   PartialOrd/Ord → `<`/`<=`, arithmetic operators, ...) as Lua UserData —
+//!   PartialOrd/Ord → `<`/`<=`, arithmetic operators, ...) as Lua `UserData` —
 //!   no hand-written mlua code required.
-//! - **Declaration stubs**: [`LuaDeclGenerator`] emits a LuaLS `---@meta`
+//! - **Declaration stubs**: [`LuaDeclGenerator`] emits a `LuaLS` `---@meta`
 //!   definition file so editors see the bound surface with full types.
 //! - **Foreign interfaces**: [`foreign_handle`] builds the handle for a
 //!   `#[script(foreign)]` trait from a table of Lua callbacks, so Rust calls
@@ -143,7 +143,7 @@ impl RuntimeBinder for LuaBinder {
     type Runtime = mlua::Lua;
     type Error = LuaBindError;
 
-    fn language_name(&self) -> &str {
+    fn language_name(&self) -> &'static str {
         "lua"
     }
 
@@ -171,7 +171,7 @@ impl RuntimeBinder for LuaBinder {
 /// the Lua state. The type's `#[derive(Script)]` + `#[script] impl`
 /// provides the `ScriptBind` implementation automatically.
 ///
-/// Call this for each type that should be usable as UserData in Lua.
+/// Call this for each type that should be usable as `UserData` in Lua.
 /// After registration, Lua code can construct, access fields, and call
 /// methods on the type.
 ///
@@ -181,17 +181,17 @@ impl RuntimeBinder for LuaBinder {
 /// # Iteration
 ///
 /// A type declaring `traits(IntoIterator(item = ...))` (or `Iterator`)
-/// iterates with the built-in `pairs(obj)` on Lua 5.2+ and LuaJIT with 5.2
+/// iterates with the built-in `pairs(obj)` on Lua 5.2+ and `LuaJIT` with 5.2
 /// compatibility, with Luau's native `for ... in obj do`, and with a
 /// portable implicit `obj:iter()` method on every version (the only option
-/// on 5.1 and plain LuaJIT, which have no `__pairs`). A declared 2-tuple
+/// on 5.1 and plain `LuaJIT`, which have no `__pairs`). A declared 2-tuple
 /// item iterates as `(k, v)`; any other item as 1-based `(i, item)` — this
 /// pairing is decided here, statically, from the declared item type. `#obj`
 /// reports the iterator's size hint. Note that built-in containers
 /// (`Vec`, arrays, maps) already cross as native Lua tables and iterate
 /// with plain `pairs`/`ipairs`; this covers opaque userdata types.
 ///
-/// `ipairs(obj)` works only on Lua 5.2 and LuaJIT with 5.2 compatibility,
+/// `ipairs(obj)` works only on Lua 5.2 and `LuaJIT` with 5.2 compatibility,
 /// where the `__ipairs` metamethod exists: always 1-based sequential
 /// `(i, item)` (the array protocol), regardless of a kv item's pairing. Lua
 /// 5.3 deprecated and 5.4+ removed `__ipairs` — there `ipairs(obj)` performs

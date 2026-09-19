@@ -166,6 +166,10 @@ pub fn descriptor_expr(ty: &Type, ctx: &TyCtx) -> syn::Result<TokenStream> {
 }
 
 /// Syntactic fold for types that mention a declared generic parameter.
+#[allow(
+    clippy::too_many_lines,
+    reason = "expansion drivers assemble one `quote!` output from many interdependent pieces; splitting them hurts locality more than length hurts readability"
+)]
 fn generic_fold(ty: &Type, ctx: &TyCtx) -> syn::Result<TokenStream> {
     // Anything not mentioning a declared parameter or a named lifetime
     // resolves through the trait, at any nesting depth (e.g. the `i32` in

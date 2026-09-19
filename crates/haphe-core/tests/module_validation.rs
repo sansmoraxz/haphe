@@ -391,12 +391,12 @@ fn capability_passes_with_registry_only_instantiations() {
     }];
     static MODULES: [ModuleDescriptor<'static>; 1] = [module_with_insts(&FNS, &INSTS)];
     static REGISTRY: TypeRegistry<'static> = TypeRegistry::new(&[], &[], &[], &MODULES, &[], &[]);
-    let validated = REGISTRY.validate().unwrap();
-    BackendCapabilities::ALL.check(&validated).unwrap();
-
     static BARE_MODULES: [ModuleDescriptor<'static>; 1] = [module_with_insts(&FNS, &[])];
     static BARE_REGISTRY: TypeRegistry<'static> =
         TypeRegistry::new(&[], &[], &[], &BARE_MODULES, &[], &[]);
+    let validated = REGISTRY.validate().unwrap();
+    BackendCapabilities::ALL.check(&validated).unwrap();
+
     let validated = BARE_REGISTRY.validate().unwrap();
     let errors = BackendCapabilities::ALL.check(&validated).unwrap_err();
     assert!(

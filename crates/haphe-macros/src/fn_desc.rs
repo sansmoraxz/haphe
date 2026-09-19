@@ -99,6 +99,10 @@ pub fn strip_param_script_attrs(sig: &mut Signature) {
 /// Builds a descriptor from a signature, stripping parameter-level
 /// `#[script(...)]` attrs as it goes. Returns `None` (with errors recorded)
 /// for unsupported shapes — parameter attrs are stripped even then.
+#[allow(
+    clippy::too_many_lines,
+    reason = "expansion drivers assemble one `quote!` output from many interdependent pieces; splitting them hurts locality more than length hurts readability"
+)]
 pub fn build_fn_info(
     sig: &mut Signature,
     fn_args: &FnArgs,
@@ -249,7 +253,7 @@ pub fn build_fn_info(
             .bounds
             .iter()
             .filter_map(|b| match b {
-                syn::TypeParamBound::Trait(t) => Some(crate::derive::stringify_bound(quote!(#t))),
+                syn::TypeParamBound::Trait(t) => Some(crate::derive::stringify_bound(&quote!(#t))),
                 _ => None,
             })
             .collect();
@@ -303,13 +307,13 @@ pub fn build_fn_info(
     let name = fn_args
         .rename
         .as_ref()
-        .map(|r| r.value())
-        .unwrap_or_else(|| sig.ident.unraw().to_string());
+        .map_or_else(|| sig.ident.unraw().to_string(), syn::LitStr::value);
     let doc = extract_doc(attrs);
-    let doc_tokens = option_str_tokens(&doc);
-    let error_kind = match &fn_args.error_kind {
-        Some(kind) => quote! { ::core::option::Option::Some(#kind) },
-        None => quote! { ::core::option::Option::None },
+    let doc_tokens = option_str_tokens(doc.as_deref());
+    let error_kind = if let Some(kind) = &fn_args.error_kind {
+        quote! { ::core::option::Option::Some(#kind) }
+    } else {
+        quote! { ::core::option::Option::None }
     };
     let is_async = sig.asyncness.is_some();
     let receiver_tokens = receiver.tokens();

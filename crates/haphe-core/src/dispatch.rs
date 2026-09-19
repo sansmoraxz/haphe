@@ -51,6 +51,10 @@ impl<'a> GenericSubst<'a> {
 /// judge their first element (empty containers are `Coercible` — unknown,
 /// ranking below an exact competitor), and userdata matches exactly only
 /// when its [type tag](crate::OpaqueUserData::type_tag) names the same type.
+#[allow(
+    clippy::match_same_arms,
+    reason = "the matcher is a POLICY TABLE — one documented rule per arm; merging same-bodied arms would obscure which rule grants which quality"
+)]
 pub fn value_matches_descriptor(
     value: &ScriptValue,
     desc: &TypeDescriptor<'_>,

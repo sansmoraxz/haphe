@@ -1,7 +1,10 @@
 //! Callable userdata: `traits(Call)` / `traits(AsyncCall)` drive Lua's
 //! `__call` metamethod (sync everywhere; async behind the `async` feature).
 
-#![allow(dead_code)]
+#![allow(
+    dead_code,
+    reason = "fixtures are exercised through their generated descriptors and bridge wrappers, not direct calls"
+)]
 
 use haphe::Script;
 use haphe_lua::bind_type;

@@ -34,11 +34,12 @@ pub(crate) fn gen_param_extractions(params: &[(Ident, Type)]) -> Vec<TokenStream
 /// infallible calls convert directly; fallible ones (`Result<T, E>` in the
 /// declared signature) map `Err` into [`ScriptCallError::Host`], rendering
 /// `E` via `Display` and tagging the declared `error_kind`.
-pub(crate) fn gen_result_expr(method: &BindMethod, call: TokenStream) -> TokenStream {
+pub(crate) fn gen_result_expr(method: &BindMethod, call: &TokenStream) -> TokenStream {
     if method.fallible {
-        let kind = match &method.error_kind {
-            Some(kind) => quote! { ::core::option::Option::Some(#kind) },
-            None => quote! { ::core::option::Option::None },
+        let kind = if let Some(kind) = &method.error_kind {
+            quote! { ::core::option::Option::Some(#kind) }
+        } else {
+            quote! { ::core::option::Option::None }
         };
         return quote! {
             match #call {
@@ -77,6 +78,10 @@ pub(crate) fn gen_call_args(params: &[(Ident, Type)]) -> Vec<TokenStream> {
 /// implements `IntoScript` (e.g. transparent primitive newtypes), and to a
 /// no-op otherwise — compile-time autoref-specialization dispatch, mirroring
 /// [`gen_dispatched_field_registration`]. Non-generic self types only.
+#[allow(
+    clippy::too_many_lines,
+    reason = "expansion drivers assemble one `quote!` output from many interdependent pieces; splitting them hurts locality more than length hurts readability"
+)]
 pub fn gen_dispatched_method_registration(self_ty: &Type, method: &BindMethod) -> TokenStream {
     let name = &method.name;
     let ident = &method.ident;
@@ -100,12 +105,17 @@ pub fn gen_dispatched_method_registration(self_ty: &Type, method: &BindMethod) -
             }
         })
         .collect();
-    let ret_ty: TokenStream = match (&method.return_ty, method.has_return) {
-        (Some(t), true) => quote! { #t },
-        _ => quote! { () },
+    let ret_ty: TokenStream = if let (Some(t), true) = (&method.return_ty, method.has_return) {
+        quote! { #t }
+    } else {
+        quote! { () }
     };
     let idx: Vec<usize> = (0..stripped.len()).collect();
 
+    #[allow(
+        clippy::items_after_statements,
+        reason = "used only by the match below"
+    )]
     struct DispatchShape {
         recv_decl: TokenStream,
         recv_call: TokenStream,
@@ -227,7 +237,7 @@ pub(crate) fn gen_async_method_registration(self_ty: &Type, method: &BindMethod)
     let extractions = gen_param_extractions(&method.params);
     let call_args = gen_call_args(&method.params);
 
-    let result_expr = gen_result_expr(method, quote! { __t.#ident(#(#call_args),*).await });
+    let result_expr = gen_result_expr(method, &quote! { __t.#ident(#(#call_args),*).await });
 
     if matches!(method.receiver, ReceiverShape::RefMut) {
         return quote! {
@@ -243,9 +253,10 @@ pub(crate) fn gen_async_method_registration(self_ty: &Type, method: &BindMethod)
         };
     }
 
-    let recv_prep = match method.receiver {
-        ReceiverShape::Owned => quote! { let __t: #self_ty = __recv.into_owned(); },
-        _ => quote! { let __t: &#self_ty = &__recv; },
+    let recv_prep = if method.receiver == ReceiverShape::Owned {
+        quote! { let __t: #self_ty = __recv.into_owned(); }
+    } else {
+        quote! { let __t: &#self_ty = &__recv; }
     };
 
     quote! {
@@ -263,13 +274,13 @@ pub(crate) fn gen_async_method_registration(self_ty: &Type, method: &BindMethod)
 }
 
 /// Registration for a computed property: sync accessors go through
-/// `property_get`/`property_set`; async ones through the ScriptCow /
+/// `property_get`/`property_set`; async ones through the `ScriptCow` /
 /// borrowed-mutable future channels (`property_get_async` /
 /// `property_set_async`), mirroring the async-method receiver rules.
 pub fn gen_property_registration(
     self_ty: &Type,
     name: &str,
-    get_ident: Ident,
+    get_ident: &Ident,
     get_async: bool,
     get_ret: &Type,
     setter: Option<(Ident, bool, Type)>,
@@ -374,9 +385,10 @@ fn gen_ctor_expr(ctor: &BindMethod, call: TokenStream) -> TokenStream {
     if !ctor.fallible {
         return call;
     }
-    let kind = match &ctor.error_kind {
-        Some(kind) => quote! { ::core::option::Option::Some(#kind) },
-        None => quote! { ::core::option::Option::None },
+    let kind = if let Some(kind) = &ctor.error_kind {
+        quote! { ::core::option::Option::Some(#kind) }
+    } else {
+        quote! { ::core::option::Option::None }
     };
     quote! {
         match #call {
@@ -398,7 +410,7 @@ pub(crate) fn gen_method_registration(self_ty: &Type, method: &BindMethod) -> To
     let extractions = gen_param_extractions(&method.params);
     let call_args = gen_call_args(&method.params);
 
-    let result_expr = gen_result_expr(method, quote! { __t.#ident(#(#call_args),*) });
+    let result_expr = gen_result_expr(method, &quote! { __t.#ident(#(#call_args),*) });
 
     match method.receiver {
         ReceiverShape::Ref => {
@@ -440,7 +452,7 @@ pub(crate) fn gen_method_registration(self_ty: &Type, method: &BindMethod) -> To
         }
         ReceiverShape::None => {
             let result_expr =
-                gen_result_expr(method, quote! { <#self_ty>::#ident(#(#call_args),*) });
+                gen_result_expr(method, &quote! { <#self_ty>::#ident(#(#call_args),*) });
             quote! {
                 __b.method(
                     #name,
@@ -460,6 +472,10 @@ pub(crate) fn gen_method_registration(self_ty: &Type, method: &BindMethod) -> To
 /// asyncness (the descriptor is materialized as a block-local `static` so
 /// candidates share one `&'static` ranking source); static dispatch hands
 /// the same wrappers to `method_generic*`, keyed on `(name, type_args)`.
+#[allow(
+    clippy::too_many_lines,
+    reason = "expansion drivers assemble one `quote!` output from many interdependent pieces; splitting them hurts locality more than length hurts readability"
+)]
 pub fn gen_generic_method_registration(self_ty: &Type, dm: &GenericBindMethod) -> TokenStream {
     let descriptor = &dm.descriptor;
     let ident = &dm.method.ident;
@@ -469,7 +485,11 @@ pub fn gen_generic_method_registration(self_ty: &Type, dm: &GenericBindMethod) -
     let self_inst = if dm.self_params.is_empty() {
         quote! { ::haphe::SelfInstantiation::NONE }
     } else {
-        let names: Vec<String> = dm.self_params.iter().map(|i| i.to_string()).collect();
+        let names: Vec<String> = dm
+            .self_params
+            .iter()
+            .map(std::string::ToString::to_string)
+            .collect();
         let params = &dm.self_params;
         quote! {
             ::haphe::SelfInstantiation {
@@ -491,7 +511,7 @@ pub fn gen_generic_method_registration(self_ty: &Type, dm: &GenericBindMethod) -
             let subst: std::collections::HashMap<String, Type> = dm
                 .type_params
                 .iter()
-                .map(|p| p.to_string())
+                .map(std::string::ToString::to_string)
                 .zip(types.iter().cloned())
                 .collect();
             let params: Vec<(Ident, Type)> = dm
@@ -504,12 +524,9 @@ pub fn gen_generic_method_registration(self_ty: &Type, dm: &GenericBindMethod) -
             let call_args = gen_call_args(&params);
             let type_args =
                 quote! { &[#( <#types as ::haphe::HapheType>::DESCRIPTOR ),*] };
-            let call = match dm.method.receiver {
-                ReceiverShape::None => quote! { <#self_ty>::#ident::<#(#types),*>(#(#call_args),*) },
-                _ => quote! { __t.#ident::<#(#types),*>(#(#call_args),*) },
-            };
-            let sync_result = gen_result_expr(&dm.method, call.clone());
-            let async_result = gen_result_expr(&dm.method, quote! { #call.await });
+            let call = if dm.method.receiver == ReceiverShape::None { quote! { <#self_ty>::#ident::<#(#types),*>(#(#call_args),*) } } else { quote! { __t.#ident::<#(#types),*>(#(#call_args),*) } };
+            let sync_result = gen_result_expr(&dm.method, &call);
+            let async_result = gen_result_expr(&dm.method, &quote! { #call.await });
             let recv_prep = match dm.method.receiver {
                 ReceiverShape::Owned => quote! { let __t: #self_ty = __recv.into_owned(); },
                 ReceiverShape::Ref => quote! { let __t: &#self_ty = &__recv; },

@@ -1,7 +1,13 @@
-//! Full integration test: derive macros → registry! → haphe::generate →
+//! Full integration test: derive macros → registry! → `haphe::generate` →
 //! WIT text assertions.
 
-#![allow(dead_code, clippy::approx_constant)]
+#![allow(
+    dead_code,
+    clippy::approx_constant,
+    clippy::needless_pass_by_value,
+    clippy::unused_self,
+    reason = "fixture shapes are dictated by the bridge surface under test: receivers and owned parameters mirror the declared script signatures, not local call ergonomics"
+)]
 
 use haphe::{BindingGenerator, Script, script};
 use haphe_wit::{ConstantMode, WitGenerator};
@@ -166,7 +172,7 @@ fn greet(name: String) -> String {
 /// Uppercases text, borrowing when it can. The `Borrowed` descriptor lowers
 /// as its inner type: WIT values cross by copy, so the lifetime vanishes.
 #[script]
-fn shout<'a>(text: std::borrow::Cow<'a, str>) -> std::borrow::Cow<'a, str> {
+fn shout(text: std::borrow::Cow<'_, str>) -> std::borrow::Cow<'_, str> {
     std::borrow::Cow::Owned(text.to_uppercase())
 }
 
@@ -174,8 +180,8 @@ fn shout<'a>(text: std::borrow::Cow<'a, str>) -> std::borrow::Cow<'a, str> {
 #[script]
 fn midpoint(a: &Point, b: &Point) -> Point {
     Point {
-        x: (a.x + b.x) / 2.0,
-        y: (a.y + b.y) / 2.0,
+        x: f64::midpoint(a.x, b.x),
+        y: f64::midpoint(a.y, b.y),
     }
 }
 
@@ -188,7 +194,7 @@ async fn fetch_data(url: String) -> String {
 /// Sums a fixed block of four samples.
 #[script]
 fn sum_block(samples: [u8; 4]) -> u32 {
-    samples.iter().map(|&s| s as u32).sum()
+    samples.iter().map(|&s| u32::from(s)).sum()
 }
 
 /// Parses a point from text.
@@ -248,7 +254,7 @@ haphe::registry! {
                 types: [Point, Color],
                 constants: [
                     /// The ratio of a circle's circumference to its diameter.
-                    PI: f64 = 3.141592653589793,
+                    PI: f64 = 3.141_592_653_589_793,
                     /// Maximum number of vertices.
                     MAX_VERTICES: i32 = 1024,
                 ],

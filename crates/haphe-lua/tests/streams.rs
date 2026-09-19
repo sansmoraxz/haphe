@@ -1,7 +1,17 @@
 //! Stream/future types pass through the Lua binder at stub level: functions
 //! carrying them bind as stubs and the binder stays capability-compatible.
 
-#![allow(dead_code)]
+#![allow(
+    clippy::needless_pass_by_value,
+    clippy::unused_self,
+    clippy::doc_markdown,
+    clippy::trivially_copy_pass_by_ref,
+    reason = "fixture shapes are dictated by the bridge surface under test: `#[script]` functions receive OWNED values (the boundary contract), methods keep their declared receivers (`&self` on Copy enums included), and docs name fixture idents verbatim"
+)]
+#![allow(
+    dead_code,
+    reason = "fixtures are exercised through their generated descriptors and bridge wrappers, not direct calls"
+)]
 
 use haphe::{RuntimeBinder, script};
 use haphe_lua::LuaBinder;

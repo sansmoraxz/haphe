@@ -602,15 +602,33 @@ fn foreign_interface_name_collision_with_module() {
     );
 }
 
-#[cfg_attr(feature = "generics", allow(dead_code))]
+#[cfg_attr(
+    feature = "generics",
+    allow(
+        dead_code,
+        reason = "these fixtures feed only the feature-OFF rejection test"
+    )
+)]
 static FGN_T_PARAM: [haphe::GenericParam<'static>; 1] = [haphe::GenericParam {
     name: "T",
     bounds: &[],
     default: None,
 }];
-#[cfg_attr(feature = "generics", allow(dead_code))]
+#[cfg_attr(
+    feature = "generics",
+    allow(
+        dead_code,
+        reason = "these fixtures feed only the feature-OFF rejection test"
+    )
+)]
 static FGN_T_TYPE: TypeDescriptor = TypeDescriptor::GenericParam("T");
-#[cfg_attr(feature = "generics", allow(dead_code))]
+#[cfg_attr(
+    feature = "generics",
+    allow(
+        dead_code,
+        reason = "these fixtures feed only the feature-OFF rejection test"
+    )
+)]
 static S64_ARGS: [TypeDescriptor; 1] = [TypeDescriptor::Primitive(PrimitiveType::I64)];
 
 /// Without the `generics` feature, generic foreign interfaces and generic
@@ -680,7 +698,7 @@ fn registry_instantiated_generic_fn_rejected_without_feature() {
 }
 
 /// A user method named `at` collides with the `Index` trait projection —
-/// same per-resource NameMap, descriptive error.
+/// same per-resource `NameMap`, descriptive error.
 #[test]
 fn projection_name_collision_with_user_method() {
     static AT_METHOD: [FunctionDescriptor; 1] = [FunctionDescriptor {

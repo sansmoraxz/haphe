@@ -654,6 +654,10 @@ fn cow_of<U: 'static>(recv: CowAny<'_>) -> ScriptCow<'_, U> {
 
 /// Erases a collected [`RawTable`] into a [`ResourceEntry`] whose values
 /// live in the host table.
+#[allow(
+    clippy::too_many_lines,
+    reason = "one exhaustive pass per descriptor/channel shape; splitting the walk would scatter the per-shape rules"
+)]
 pub(crate) fn erase_resource<U>(type_name: &'static str, raw: RawTable<U>) -> ResourceEntry
 where
     U: Clone + Send + Sync + 'static,
@@ -918,10 +922,21 @@ fn from_sv<U: FromScript>(v: &Sv) -> Result<U, Sce> {
 /// construction: a struct with any of them classifies as a RESOURCE, and
 /// enums reject constructors/properties at derive time — so a value-erased
 /// type can never carry them.
+#[allow(
+    clippy::too_many_lines,
+    reason = "one exhaustive pass per descriptor/channel shape; splitting the walk would scatter the per-shape rules"
+)]
 pub(crate) fn erase_value<U>(raw: RawTable<U>) -> ValueEntry
 where
     U: FromScript + IntoScript + Clone + Send + 'static,
 {
+    // Projections: receiver is args[0].
+    fn this(args: &[Sv]) -> Result<&Sv, Sce> {
+        args.first().ok_or(Sce {
+            expected: "a receiver argument",
+            got: "no arguments",
+        })
+    }
     let mut entry = ValueEntry::default();
 
     for (name, f) in raw.methods_cow {
@@ -1043,13 +1058,6 @@ where
         );
     }
 
-    // Projections: receiver is args[0].
-    fn this(args: &[Sv]) -> Result<&Sv, Sce> {
-        args.first().ok_or(Sce {
-            expected: "a receiver argument",
-            got: "no arguments",
-        })
-    }
     if let Some(f) = raw.eq {
         entry.projections.insert(
             "eq",
@@ -1194,42 +1202,29 @@ where
 /// call; futures that need a reactor must be driven by a runtime living on
 /// other threads (a tokio `current_thread` runtime would deadlock).
 pub(crate) fn block_on<F: std::future::Future>(fut: F) -> F::Output {
-    use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+    use std::task::{Context, Poll, Wake, Waker};
 
     struct Signal {
         thread: std::thread::Thread,
         notified: AtomicBool,
     }
 
-    fn raw(signal: Arc<Signal>) -> RawWaker {
-        RawWaker::new(Arc::into_raw(signal) as *const (), &VTABLE)
+    impl Wake for Signal {
+        fn wake(self: Arc<Self>) {
+            self.wake_by_ref();
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.notified.store(true, Ordering::SeqCst);
+            self.thread.unpark();
+        }
     }
-    unsafe fn clone(data: *const ()) -> RawWaker {
-        let signal = unsafe { Arc::from_raw(data as *const Signal) };
-        let cloned = Arc::clone(&signal);
-        std::mem::forget(signal);
-        raw(cloned)
-    }
-    unsafe fn wake(data: *const ()) {
-        let signal = unsafe { Arc::from_raw(data as *const Signal) };
-        signal.notified.store(true, Ordering::SeqCst);
-        signal.thread.unpark();
-    }
-    unsafe fn wake_by_ref(data: *const ()) {
-        let signal = unsafe { &*(data as *const Signal) };
-        signal.notified.store(true, Ordering::SeqCst);
-        signal.thread.unpark();
-    }
-    unsafe fn drop_raw(data: *const ()) {
-        drop(unsafe { Arc::from_raw(data as *const Signal) });
-    }
-    static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, wake, wake_by_ref, drop_raw);
 
     let signal = Arc::new(Signal {
         thread: std::thread::current(),
         notified: AtomicBool::new(false),
     });
-    let waker = unsafe { Waker::from_raw(raw(Arc::clone(&signal))) };
+    let waker = Waker::from(Arc::clone(&signal));
     let mut cx = Context::from_waker(&waker);
 
     let mut fut = std::pin::pin!(fut);
@@ -1249,7 +1244,7 @@ pub(crate) fn block_on<F: std::future::Future>(fut: F) -> F::Output {
 /// like [`trap_convert`], Host errors as their kind-prefixed rendering.
 pub(crate) fn trap_call(name: &str, e: Ce) -> wasmtime::Error {
     match e {
-        ScriptCallError::Convert(e) => trap_convert(name, e),
+        ScriptCallError::Convert(e) => trap_convert(name, &e),
         host @ ScriptCallError::Host { .. } => {
             wasmtime::Error::msg(format!("haphe-wit: `{name}`: {host}"))
         }
@@ -1257,7 +1252,7 @@ pub(crate) fn trap_call(name: &str, e: Ce) -> wasmtime::Error {
 }
 
 /// Renders a `ScriptConvertError` chain into a trap message.
-pub(crate) fn trap_convert(name: &str, e: Sce) -> wasmtime::Error {
+pub(crate) fn trap_convert(name: &str, e: &Sce) -> wasmtime::Error {
     let mut msg = format!("haphe-wit: `{name}`: ");
     let _ = write!(msg, "argument/result conversion failed: {e}");
     wasmtime::Error::msg(msg)

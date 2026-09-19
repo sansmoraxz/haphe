@@ -30,7 +30,7 @@ use haphe::{
 
 use crate::LuaBinder;
 
-/// Generates a LuaLS `---@meta` declaration stub from a registry.
+/// Generates a `LuaLS` `---@meta` declaration stub from a registry.
 #[derive(Debug, Clone)]
 pub struct LuaDeclGenerator {
     path: String,
@@ -236,9 +236,9 @@ fn emit_struct(
     // Iterable types: the runtime registers `__pairs`/`__iter` where the
     // version supports it and a portable `iter()` method everywhere.
     for ti in s.trait_impls {
-        let item = match ti {
-            haphe::TraitImpl::IntoIterator { item } | haphe::TraitImpl::Iterator { item } => item,
-            _ => continue,
+        let (haphe::TraitImpl::IntoIterator { item } | haphe::TraitImpl::Iterator { item }) = ti
+        else {
+            continue;
         };
         let context = format!("{} iterator item", s.name);
         let stepper = match item {
@@ -314,6 +314,10 @@ fn emit_struct(
     Ok(())
 }
 
+#[allow(
+    clippy::match_same_arms,
+    reason = "the arm table is a POLICY TABLE — one documented rule per operator, including deliberately suppressed ones (`Rem` beside a declared `Mod`)"
+)]
 fn emit_operators(
     out: &mut String,
     registry: &ValidatedRegistry<'_>,
@@ -595,6 +599,10 @@ fn render_fun_sig(
     Ok(format!("fun({}){ret}", params.join(", ")))
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "one emission arm per module surface; splitting the pass would scatter the per-surface rules"
+)]
 fn emit_module(
     out: &mut String,
     registry: &ValidatedRegistry<'_>,
@@ -823,11 +831,11 @@ fn emit_dyn_signature(
             let ty = render_subst(registry, p.ty, context, Some(&subst))?;
             parts.push(format!("{}: {ty}", p.name));
         }
-        let ret = match f.return_type {
+        let ret_sig = match f.return_type {
             TypeDescriptor::Unit => String::new(),
             ty => format!(": {}", render_subst(registry, ty, context, Some(&subst))?),
         };
-        let _ = writeln!(out, "---@overload fun({}){ret}", parts.join(", "));
+        let _ = writeln!(out, "---@overload fun({}){ret_sig}", parts.join(", "));
     }
     let subst = haphe::dispatch::GenericSubst {
         params: f.generic_params,
@@ -842,8 +850,8 @@ fn emit_dyn_signature(
     match f.return_type {
         TypeDescriptor::Unit => {}
         ty => {
-            let ret = render_subst(registry, ty, context, Some(&subst))?;
-            let _ = writeln!(out, "---@return {ret}");
+            let ret_sig = render_subst(registry, ty, context, Some(&subst))?;
+            let _ = writeln!(out, "---@return {ret_sig}");
         }
     }
     let _ = writeln!(
@@ -904,7 +912,7 @@ fn emit_static_generic_signatures(
     Ok(())
 }
 
-/// Renders a descriptor as a LuaLS type, resolving `Ref`/`Instance` through
+/// Renders a descriptor as a `LuaLS` type, resolving `Ref`/`Instance` through
 /// the registry.
 fn render_type(
     registry: &ValidatedRegistry<'_>,

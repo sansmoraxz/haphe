@@ -11,6 +11,10 @@ use crate::ty_map::substitute_self;
 // Metamethod registration
 // ---------------------------------------------------------------------------
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "expansion drivers assemble one `quote!` output from many interdependent pieces; splitting them hurts locality more than length hurts readability"
+)]
 pub(crate) fn gen_metamethod_registrations(self_ty: &Type, traits: &[TraitDecl]) -> TokenStream {
     let mut tokens = TokenStream::new();
     let has_display = traits.iter().any(|t| t.name == "Display");
@@ -129,8 +133,7 @@ pub(crate) fn gen_metamethod_registrations(self_ty: &Type, traits: &[TraitDecl])
                     .args
                     .iter()
                     .find(|(n, _)| n == "rhs")
-                    .map(|(_, ty)| substitute_self(ty, &ctx))
-                    .unwrap_or_else(|| self_ty.clone());
+                    .map_or_else(|| self_ty.clone(), |(_, ty)| substitute_self(ty, &ctx));
 
                 let op_name_str = name.to_lowercase();
                 // `mod` is a Rust keyword; the trait's method is `modulo`.

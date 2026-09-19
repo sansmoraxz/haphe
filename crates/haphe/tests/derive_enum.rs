@@ -2,7 +2,10 @@
 //! would write by hand.
 
 #![cfg(feature = "macros")]
-#![allow(dead_code)]
+#![allow(
+    dead_code,
+    reason = "fixtures are exercised through their generated descriptors and bridge wrappers, not direct calls"
+)]
 
 use haphe::{
     EnumDescriptor, EnumVariant, FieldDescriptor, PrimitiveType, Script, ScriptEnum, ScriptImpl,

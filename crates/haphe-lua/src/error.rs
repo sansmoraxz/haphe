@@ -74,7 +74,7 @@ pub enum LuaBindError {
     },
     /// An operator was declared that the configured Lua version has no
     /// metamethod for (the bitwise family requires Lua 5.3+; Lua 5.1/5.2,
-    /// LuaJIT, and Luau cannot represent it).
+    /// `LuaJIT`, and Luau cannot represent it).
     UnsupportedOperator {
         /// The operator's Rust trait method name (`bitand`, `shl`, ...).
         op: &'static str,
@@ -119,6 +119,10 @@ pub enum LuaBindError {
 }
 
 impl std::fmt::Display for LuaBindError {
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one rendering arm per error kind; length tracks the error surface"
+    )]
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Lua(e) => write!(f, "lua error: {e}"),
@@ -257,23 +261,7 @@ impl std::error::Error for LuaBindError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Lua(e) => Some(e),
-            Self::InvalidConstant { .. } => None,
-            Self::GenericFunction { .. } => None,
-            Self::MissingForeignFunction { .. } => None,
-            Self::MissingForeignInstantiation { .. } => None,
-            Self::GenericForeignInterface { .. } => None,
-            Self::ReservedMethod { .. } => None,
-            Self::DuplicateConstructor { .. } => None,
-            Self::DuplicateMethod { .. } => None,
-            Self::UnsupportedAsyncProperty { .. } => None,
-            Self::DuplicateField { .. } => None,
-            Self::DuplicateEnumCase { .. } => None,
-            Self::UnsupportedOperator { .. } => None,
-            Self::UnsupportedAsyncCall { .. } => None,
-            Self::AmbiguousCall => None,
-            Self::UnsupportedAsyncMethod { .. } => None,
-            Self::UnsupportedAsyncFunction { .. } => None,
-            Self::UnsupportedDynFunction { .. } => None,
+            _ => None,
         }
     }
 }

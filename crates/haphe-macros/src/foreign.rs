@@ -28,6 +28,10 @@ fn strip_method_attrs(item: &mut ItemTrait) {
     }
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "expansion drivers assemble one `quote!` output from many interdependent pieces; splitting them hurts locality more than length hurts readability"
+)]
 pub fn expand(mut item: ItemTrait) -> TokenStream {
     let mut errors = Errors::default();
     let args = parse_foreign_args(&item.attrs, &mut errors);
@@ -76,7 +80,7 @@ pub fn expand(mut item: ItemTrait) -> TokenStream {
                     .iter()
                     .filter_map(|b| match b {
                         syn::TypeParamBound::Trait(t) => {
-                            Some(crate::derive::stringify_bound(quote!(#t)))
+                            Some(crate::derive::stringify_bound(&quote!(#t)))
                         }
                         _ => None,
                     })
@@ -235,7 +239,11 @@ pub fn expand(mut item: ItemTrait) -> TokenStream {
         }
         // Each method sees the trait's parameters plus its own.
         let mut declared_names = generic_names.clone();
-        declared_names.extend(method_type_params.iter().map(|p| p.to_string()));
+        declared_names.extend(
+            method_type_params
+                .iter()
+                .map(std::string::ToString::to_string),
+        );
         let ctx = TyCtx {
             generic_params: &declared_names,
             self_ty: None,
@@ -300,12 +308,13 @@ pub fn expand(mut item: ItemTrait) -> TokenStream {
         } else {
             quote! { self.0.call(#name, &__type_args, &__args) }
         };
-        let return_ty_tokens = match &return_ty {
-            Some(ty) => quote! { #ty },
-            None => quote! { () },
+        let return_ty_tokens = if let Some(ty) = &return_ty {
+            quote! { #ty }
+        } else {
+            quote! { () }
         };
-        let body = match &err_ty {
-            Some(err_ty) => quote_spanned! {err_ty.span()=>
+        let body = if let Some(err_ty) = &err_ty {
+            quote_spanned! {err_ty.span()=>
                 {
                     #type_args_decl
                     let __args = [#(#arg_exprs),*];
@@ -328,8 +337,9 @@ pub fn expand(mut item: ItemTrait) -> TokenStream {
                         ),
                     }
                 }
-            },
-            None => quote! {
+            }
+        } else {
+            quote! {
                 {
                     #type_args_decl
                     let __args = [#(#arg_exprs),*];
@@ -349,7 +359,7 @@ pub fn expand(mut item: ItemTrait) -> TokenStream {
                         ::core::result::Result::Err(__e) => ::core::panic!("{}", __e),
                     }
                 }
-            },
+            }
         };
 
         let sig = &m.sig;
@@ -376,9 +386,8 @@ pub fn expand(mut item: ItemTrait) -> TokenStream {
     let exposed_name = args
         .rename
         .as_ref()
-        .map(|r| r.value())
-        .unwrap_or_else(|| trait_name.clone());
-    let doc = option_str_tokens(&extract_doc(&item.attrs));
+        .map_or_else(|| trait_name.clone(), syn::LitStr::value);
+    let doc = option_str_tokens(extract_doc(&item.attrs).as_deref());
     let handle_doc = format!("Generated foreign-interface handle for [`{trait_name}`].");
     // Async here is deliberately executor- and `Send`-agnostic; the handle is
     // the only implementor the macro contract requires.

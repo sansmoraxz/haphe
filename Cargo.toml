@@ -1,3 +1,41 @@
 [workspace]
 members = ["crates/*"]
 resolver = "2"
+
+# Lint policy: every `allow` — here or in source — carries its justification.
+# Workspace-level allows are for lints whose findings contradict DECLARED
+# haphe semantics; everything else in `pedantic` stays a warning and is fixed
+# or allowed per site with a comment.
+[workspace.lints.rust]
+unsafe_code = "warn"
+
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+# Every source-level `allow` must carry its justification in the attribute
+# itself (`reason = "..."`), not in a nearby comment.
+allow_attributes_without_reason = "warn"
+# Bridge numeric casts are declared policy, not accidents: values cross as
+# the i64/f64 bit pattern (fixed-width integers `as`-cast, u64/discriminants
+# wrap), documented at the conversion sites in haphe-core.
+cast_possible_truncation = "allow"
+cast_possible_wrap = "allow"
+cast_precision_loss = "allow"
+cast_sign_loss = "allow"
+# Bridge roundtrip tests assert EXACT float identity — no arithmetic happens
+# between the two sides, so epsilon comparison would weaken the test.
+float_cmp = "allow"
+# Pre-1.0 surface: the `# Errors`/`# Panics`/`#[must_use]` sweep lands with
+# the public-API freeze, not while channel signatures are still moving.
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+must_use_candidate = "allow"
+return_self_not_must_use = "allow"
+# `BackendCapabilities` is genuinely N independent booleans (each an
+# orthogonal feature flag), not an encodable state machine.
+struct_excessive_bools = "allow"
+# Async test fixtures and generated async wrappers exercise the async
+# CHANNELS with synchronous bodies — the asyncness is the surface under
+# test, not an accident to remove (the trait-impl variant fires on foreign
+# handle impls, where the trait fixes the asyncness).
+unused_async = "allow"
+unused_async_trait_impl = "allow"

@@ -2,7 +2,12 @@
 //! foreign interfaces, emitted under deterministic descriptor-derived names.
 
 #![cfg(feature = "generics")]
-#![allow(dead_code)]
+#![allow(
+    dead_code,
+    clippy::needless_pass_by_value,
+    clippy::unused_self,
+    reason = "fixture shapes are dictated by the bridge surface under test: receivers and owned parameters mirror the declared script signatures, not local call ergonomics"
+)]
 
 use haphe::{ForeignError, Script, script};
 use haphe_wit::WitGenerator;

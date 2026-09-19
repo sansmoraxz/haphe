@@ -13,6 +13,10 @@ use crate::attrs::{Errors, parse_fn_args, strip_script_attrs};
 use crate::fn_desc::{ReceiverShape, build_fn_info};
 use crate::ty_map::TyCtx;
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "expansion drivers assemble one `quote!` output from many interdependent pieces; splitting them hurts locality more than length hurts readability"
+)]
 pub fn expand(mut item: ItemFn) -> TokenStream {
     let mut errors = Errors::default();
     let mut fn_args = parse_fn_args(&item.attrs, &mut errors, "a free function");
@@ -156,9 +160,10 @@ pub fn expand(mut item: ItemFn) -> TokenStream {
         .collect();
     let has_type_params = !type_params.is_empty();
 
-    let error_kind_tokens = match &fn_args.error_kind {
-        Some(kind) => quote! { ::core::option::Option::Some(#kind) },
-        None => quote! { ::core::option::Option::None },
+    let error_kind_tokens = if let Some(kind) = &fn_args.error_kind {
+        quote! { ::core::option::Option::Some(#kind) }
+    } else {
+        quote! { ::core::option::Option::None }
     };
     // The wrapper expression producing the call's ScriptValue result; a
     // fallible call's `Err` maps into a Host error.
@@ -268,7 +273,7 @@ pub fn expand(mut item: ItemFn) -> TokenStream {
             .map(|(types, _)| {
                 type_params
                     .iter()
-                    .map(|p| p.to_string())
+                    .map(std::string::ToString::to_string)
                     .zip(types.iter().cloned())
                     .collect()
             })
@@ -381,7 +386,7 @@ pub fn expand(mut item: ItemFn) -> TokenStream {
                         syn::FnArg::Typed(pat_ty) => {
                             Some(matches!(pat_ty.ty.as_ref(), Type::Reference(_)))
                         }
-                        _ => None,
+                        syn::FnArg::Receiver(_) => None,
                     })
                     .collect();
                 gen_dispatched_fn_registration(
@@ -463,9 +468,10 @@ fn gen_dispatched_fn_registration(
             }
         })
         .collect();
-    let ret_ty: TokenStream = match &info.return_ty {
-        Some(t) => quote! { #t },
-        None => quote! { () },
+    let ret_ty: TokenStream = if let Some(t) = &info.return_ty {
+        quote! { #t }
+    } else {
+        quote! { () }
     };
     let idx: Vec<usize> = (0..stripped.len()).collect();
 

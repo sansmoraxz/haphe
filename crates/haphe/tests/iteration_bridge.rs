@@ -7,7 +7,8 @@
 use std::fmt;
 
 use haphe::{
-    Script, ScriptBind, ScriptCallError, ScriptConvertError, ScriptIter, ScriptValue, TypeBinder,
+    Script, ScriptBind, ScriptCallError, ScriptConvertError, ScriptCow, ScriptIter, ScriptValue,
+    TypeBinder,
 };
 
 #[derive(Debug)]
@@ -694,6 +695,7 @@ fn mod_registers_with_floor_semantics() {
 
 #[test]
 fn mod_provided_for_std_numerics_floors() {
+    use haphe::ops::IDiv;
     use haphe::ops::Mod;
     assert_eq!(Mod::modulo(-7i64, 2), 1);
     assert_eq!(Mod::modulo(7i64, -2), -1);
@@ -701,7 +703,6 @@ fn mod_provided_for_std_numerics_floors() {
     assert_eq!(Mod::modulo(7u32, 2), 1);
     assert_eq!(Mod::modulo(-7.5f64, 2.0), 0.5);
     // IDiv/Mod invariant: a == a.idiv(b) * b + a.modulo(b)
-    use haphe::ops::IDiv;
     for (a, b) in [(-7i64, 2i64), (7, -2), (-7, -2), (7, 2)] {
         assert_eq!(a, IDiv::idiv(a, b) * b + Mod::modulo(a, b));
     }
@@ -729,8 +730,10 @@ impl Machine {
         Flag(self.powered.0 != next.0)
     }
 
-    // A described struct return: stays descriptor-only (dispatch no-op).
-    #[allow(dead_code)]
+    #[allow(
+        dead_code,
+        reason = "a described struct return stays descriptor-only (dispatch no-op), so the method is never invoked"
+    )]
     fn twin(&self) -> Machine {
         self.clone()
     }
@@ -833,14 +836,8 @@ impl haphe::ops::AsyncCall<(i64,)> for DeferredDoubler {
 }
 
 fn poll_ready(fut: haphe::ScriptCallFuture<'_>) -> Result<ScriptValue, ScriptCallError> {
-    use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
-    fn noop(_: *const ()) {}
-    fn clone(_: *const ()) -> RawWaker {
-        RawWaker::new(std::ptr::null(), &VTABLE)
-    }
-    static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, noop, noop, noop);
-    let waker = unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &VTABLE)) };
-    let mut cx = Context::from_waker(&waker);
+    use std::task::{Context, Poll, Waker};
+    let mut cx = Context::from_waker(Waker::noop());
     let mut fut = fut;
     match fut.as_mut().poll(&mut cx) {
         Poll::Ready(v) => v,
@@ -938,7 +935,6 @@ fn async_methods_register_and_await() {
             .1
     };
 
-    use haphe::ScriptCow;
     // Borrowed receiver: zero-clone shared dispatch.
     let fetcher = Fetcher { base: 40 };
     let out = poll_ready(get("fetch")(
@@ -1098,7 +1094,7 @@ fn async_properties_register_and_await() {
 
 #[test]
 fn async_constructor_registers_and_awaits() {
-    use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+    use std::task::{Context, Poll, Waker};
     let binder = bound::<Meter>();
     // The sync ctor stays on the sync channel.
     assert!(binder.constructors.iter().any(|(n, _)| *n == "new"));
@@ -1109,13 +1105,7 @@ fn async_constructor_registers_and_awaits() {
         .expect("async constructor registered");
     assert_eq!(*name, "connect");
 
-    fn noop(_: *const ()) {}
-    fn clone(_: *const ()) -> RawWaker {
-        RawWaker::new(std::ptr::null(), &VTABLE)
-    }
-    static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, noop, noop, noop);
-    let waker = unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &VTABLE)) };
-    let mut cx = Context::from_waker(&waker);
+    let mut cx = Context::from_waker(Waker::noop());
     let args = [ScriptValue::I64(9)];
     let mut fut = ctor(&args);
     match fut.as_mut().poll(&mut cx) {
@@ -1135,7 +1125,14 @@ struct Gauge {
 }
 
 #[haphe::script]
-#[allow(dead_code)]
+#[allow(
+    dead_code,
+    reason = "fixtures are exercised through their generated descriptors and bridge wrappers, not direct calls"
+)]
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "the `Result` IS the surface under test (fallible-ctor binding)"
+)]
 impl Gauge {
     #[script(constructor)]
     fn try_new(raw: i64) -> Result<Self, String> {

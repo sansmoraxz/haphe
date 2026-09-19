@@ -34,7 +34,7 @@ pub(crate) struct Iface<'a> {
     /// Always consumed unioned with the fn-site declarations.
     pub fn_instantiations: &'a [FnInstantiation<'a>],
     pub constants: &'a [ConstantDescriptor<'a>],
-    /// TypeIds (as strings) of concrete types defined in this interface.
+    /// `TypeIds` (as strings) of concrete types defined in this interface.
     pub type_ids: Vec<&'a str>,
     /// Indices into [`Plan::instances`] of generic instantiations defined in
     /// this interface.
@@ -76,23 +76,27 @@ impl<'p, 'a> Env<'p, 'a> {
 pub(crate) struct Plan<'a> {
     /// Index 0 is the default interface (may own no types, then skipped).
     pub interfaces: Vec<Iface<'a>>,
-    /// TypeId string -> kebab-case WIT type name (concrete types only).
+    /// `TypeId` string -> kebab-case WIT type name (concrete types only).
     pub type_names: HashMap<&'a str, String>,
-    /// Erased TypeId strings of structs that map to WIT resources.
+    /// Erased `TypeId` strings of structs that map to WIT resources.
     pub resources: HashSet<&'a str>,
-    /// TypeId string -> index into `interfaces` of the defining interface.
+    /// `TypeId` string -> index into `interfaces` of the defining interface.
     pub owner_of: HashMap<&'a str, usize>,
     /// Deduplicated generic instantiations, in registry order.
     pub instances: Vec<PlannedInstance<'a>>,
-    /// Erased TypeId strings of generic types (emitted only as instances).
+    /// Erased `TypeId` strings of generic types (emitted only as instances).
     generics: HashSet<&'a str>,
-    /// Erased TypeId string -> kebab of the generic type's name.
+    /// Erased `TypeId` string -> kebab of the generic type's name.
     erased_names: HashMap<&'a str, String>,
     /// Mangled names of all planned instances, for reference validation.
     instance_names: HashSet<String>,
 }
 
 impl<'a> Plan<'a> {
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one exhaustive pass per descriptor/channel shape; splitting the walk would scatter the per-shape rules"
+    )]
     pub fn build(
         registry: &'a ValidatedRegistry<'a>,
         default_interface: &str,
@@ -299,7 +303,6 @@ impl<'a> Plan<'a> {
 
     /// Builds the substitution environment for a planned instance.
     pub fn env_for<'p>(
-        &'p self,
         registry: &'a ValidatedRegistry<'a>,
         inst: &'p PlannedInstance<'a>,
     ) -> Env<'p, 'a> {
@@ -327,7 +330,6 @@ impl<'a> Plan<'a> {
     /// Extends `base` with a generic function's own parameter bindings for
     /// one instantiation.
     pub fn fn_env<'p>(
-        &'p self,
         f: &'a FunctionDescriptor<'a>,
         args: &'a [TypeDescriptor<'a>],
         base: Option<&Env<'p, 'a>>,
@@ -337,8 +339,8 @@ impl<'a> Plan<'a> {
         bindings.extend(f.generic_params.iter().map(|p| p.name).zip(args.iter()));
         Env {
             bindings,
-            self_id: base.map(|e| e.self_id).unwrap_or(""),
-            self_name: base.map(|e| e.self_name).unwrap_or(""),
+            self_id: base.map_or("", |e| e.self_id),
+            self_name: base.map_or("", |e| e.self_name),
         }
     }
 
@@ -499,13 +501,13 @@ impl<'a> Plan<'a> {
 
         let base_env = iface
             .foreign_instance
-            .map(|i| self.env_for(registry, &self.instances[i]));
+            .map(|i| Self::env_for(registry, &self.instances[i]));
         for f in iface.functions {
             if f.generic_params.is_empty() {
                 self.collect_fn_uses(f, base_env.as_ref(), &mut refs)?;
             } else {
                 for args in haphe::union_instantiations(f, iface.fn_instantiations) {
-                    let env = self.fn_env(f, args, base_env.as_ref());
+                    let env = Self::fn_env(f, args, base_env.as_ref());
                     self.collect_fn_uses(f, Some(&env), &mut refs)?;
                 }
             }
@@ -518,7 +520,7 @@ impl<'a> Plan<'a> {
         }
         for &i in &iface.instance_indices {
             let inst = &self.instances[i];
-            let env = self.env_for(registry, inst);
+            let env = Self::env_for(registry, inst);
             self.collect_type_uses(registry, inst.erased_id, Some(&env), &mut refs)?;
         }
 
@@ -603,7 +605,7 @@ impl<'a> Plan<'a> {
             return self.collect_fn_uses(f, env, refs);
         }
         for args in f.instantiations {
-            let fenv = self.fn_env(f, args, env);
+            let fenv = Self::fn_env(f, args, env);
             self.collect_fn_uses(f, Some(&fenv), refs)?;
         }
         Ok(())
@@ -668,7 +670,10 @@ impl<'a> Plan<'a> {
 /// [`Plan::mangle_type`] that never touches registered type names. Used by
 /// the runtime foreign caller, which has no plan; `Ref`, `Instance`, and
 /// `GenericParam` arguments error. KEEP IN SYNC with [`Plan::mangle_type`].
-#[cfg_attr(not(feature = "runtime"), allow(dead_code))]
+#[cfg_attr(
+    not(feature = "runtime"),
+    allow(dead_code, reason = "only the runtime foreign caller consumes it")
+)]
 pub(crate) fn mangle_plain_type(ty: &TypeDescriptor<'_>) -> Result<String, WitGenError> {
     let err = |detail: &str| WitGenError::UnrepresentableType {
         context: "generic instantiation argument".to_string(),
@@ -726,7 +731,10 @@ pub(crate) fn mangle_plain_type(ty: &TypeDescriptor<'_>) -> Result<String, WitGe
     })
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "recursive walk threading every accumulator explicitly; bundling them into an ad-hoc struct would obscure the call sites"
+)]
 fn flatten_module<'a>(
     module: &'a ModuleDescriptor<'a>,
     prefix: &str,
@@ -780,13 +788,19 @@ pub(crate) enum ProjKind<'a> {
     /// Binary operator whose rhs is the type itself (`meta_arith_self`).
     /// `op` keys the runtime dispatch table (`runtime` feature).
     ArithSelf {
-        #[cfg_attr(not(feature = "runtime"), allow(dead_code))]
+        #[cfg_attr(
+            not(feature = "runtime"),
+            allow(dead_code, reason = "only the runtime dispatch table reads the op key")
+        )]
         op: &'static str,
         output: &'a TypeDescriptor<'a>,
     },
     /// Binary operator with a non-self rhs (`meta_arith_scalar`).
     ArithScalar {
-        #[cfg_attr(not(feature = "runtime"), allow(dead_code))]
+        #[cfg_attr(
+            not(feature = "runtime"),
+            allow(dead_code, reason = "only the runtime dispatch table reads the op key")
+        )]
         op: &'static str,
         rhs: &'a TypeDescriptor<'a>,
         output: &'a TypeDescriptor<'a>,
@@ -848,8 +862,7 @@ pub(crate) struct Projected<'a> {
 /// Whether a trait operand descriptor denotes the type itself.
 fn is_self_ty(ty: &TypeDescriptor<'_>, self_id: &str) -> bool {
     match crate::types::peel_borrowed(ty) {
-        TypeDescriptor::Ref(id) => id.as_str() == self_id,
-        TypeDescriptor::Instance { id, .. } => id.as_str() == self_id,
+        TypeDescriptor::Ref(id) | TypeDescriptor::Instance { id, .. } => id.as_str() == self_id,
         _ => false,
     }
 }
@@ -858,6 +871,10 @@ fn is_self_ty(ty: &TypeDescriptor<'_>, self_id: &str) -> bool {
 /// WIT members (documented in the crate README). Errors on shapes that
 /// cannot project uniquely: multiple overloads of one operator, or both
 /// `Call` and `AsyncCall` (one `call` member can exist).
+#[allow(
+    clippy::too_many_lines,
+    reason = "one exhaustive pass per descriptor/channel shape; splitting the walk would scatter the per-shape rules"
+)]
 pub(crate) fn projected_trait_members<'a>(
     s: &StructDescriptor<'a>,
 ) -> Result<Vec<Projected<'a>>, WitGenError> {
@@ -967,7 +984,7 @@ pub(crate) fn projected_trait_members<'a>(
             }
             TraitImpl::Index { index, output } => push("at", ProjKind::IndexGet { index, output })?,
             TraitImpl::IndexMut { index, output } => {
-                push("set_at", ProjKind::IndexSet { index, output })?
+                push("set_at", ProjKind::IndexSet { index, output })?;
             }
             TraitImpl::Iterator { item } | TraitImpl::IntoIterator { item } => {
                 if !has_iter {

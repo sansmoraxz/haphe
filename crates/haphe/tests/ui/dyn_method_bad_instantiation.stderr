@@ -1,11 +1,11 @@
-error: this instantiation gives parameter type `std::path::PathBuf`, which cannot cross the bridge
-  --> tests/ui/dyn_method_bad_instantiation.rs:11:19
+error: this instantiation gives parameter type `Opaque`, which cannot cross the bridge
+  --> tests/ui/dyn_method_bad_instantiation.rs:13:19
    |
-11 |     #[script(dyn, instantiate(std::path::PathBuf))]
+13 |     #[script(dyn, instantiate(Opaque))]
    |                   ^^^^^^^^^^^
 
-error: this instantiation gives return type `std::path::PathBuf`, which cannot cross the bridge
-  --> tests/ui/dyn_method_bad_instantiation.rs:11:19
+error: this instantiation gives return type `Opaque`, which cannot cross the bridge
+  --> tests/ui/dyn_method_bad_instantiation.rs:13:19
    |
-11 |     #[script(dyn, instantiate(std::path::PathBuf))]
+13 |     #[script(dyn, instantiate(Opaque))]
    |                   ^^^^^^^^^^^

@@ -53,3 +53,6 @@ wasmtime-wasi = { version = "48", features = ["p3"] }
 [[test]]
 name = "runtime"
 required-features = ["runtime"]
+
+[lints]
+workspace = true

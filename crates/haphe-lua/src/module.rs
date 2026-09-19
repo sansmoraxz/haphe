@@ -30,14 +30,11 @@ pub(crate) fn bind_module(
     // payload shape.
     for type_id in module.type_ids {
         let type_kind = registry.get_type(type_id);
-        let name = type_kind
-            .as_ref()
-            .map(|tk| match tk {
-                haphe::TypeKind::Struct(s) => s.name,
-                haphe::TypeKind::Enum(e) => e.name,
-                haphe::TypeKind::TypeAlias(a) => a.name,
-            })
-            .unwrap_or(type_id.as_str());
+        let name = type_kind.as_ref().map_or(type_id.as_str(), |tk| match tk {
+            haphe::TypeKind::Struct(s) => s.name,
+            haphe::TypeKind::Enum(e) => e.name,
+            haphe::TypeKind::TypeAlias(a) => a.name,
+        });
 
         // Only insert if the name isn't already taken by a constant or
         // function with the same name.
@@ -125,9 +122,9 @@ fn constant_to_lua(
         TypeDescriptor::Primitive(p) => {
             primitive_to_lua(lua, module_name, constant.name, *p, value)
         }
-        TypeDescriptor::String => Ok(Value::String(lua.create_string(value)?)),
         TypeDescriptor::Unit => Ok(Value::Nil),
-        // For types we can't yet convert, store as a string representation.
+        // Strings, and types we can't yet convert, store as their string
+        // representation.
         _ => Ok(Value::String(lua.create_string(value)?)),
     }
 }

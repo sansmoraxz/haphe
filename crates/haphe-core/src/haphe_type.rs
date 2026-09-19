@@ -109,7 +109,7 @@ impl<T: HapheType, const N: usize> HapheType for [T; N] {
     const DESCRIPTOR: TypeDescriptor<'static> = TypeDescriptor::Array(&T::DESCRIPTOR, N);
 }
 
-impl<K: HapheType, V: HapheType> HapheType for HashMap<K, V> {
+impl<K: HapheType, V: HapheType, S> HapheType for HashMap<K, V, S> {
     const DESCRIPTOR: TypeDescriptor<'static> = TypeDescriptor::Map(&K::DESCRIPTOR, &V::DESCRIPTOR);
 }
 

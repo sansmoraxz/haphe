@@ -298,6 +298,10 @@ impl<'a> TypeRegistry<'a> {
     ///
     /// Checks that every [`TypeDescriptor::Ref`] points to a registered type
     /// and every [`TypeDescriptor::GenericParam`] names a declared parameter.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one exhaustive validation pass per descriptor kind; splitting the walk would scatter the per-kind rules"
+    )]
     pub fn validate(&'a self) -> Result<ValidatedRegistry<'a>, Vec<RegistryError<'a>>> {
         let mut errors = Vec::new();
         let mut known: HashSet<TypeId<'a>> = HashSet::new();
@@ -813,9 +817,9 @@ where
         TypeDescriptor::Option(inner)
         | TypeDescriptor::List(inner)
         | TypeDescriptor::Stream(inner)
-        | TypeDescriptor::Future(inner) => walk_type_refs(inner, visitor),
-        TypeDescriptor::Array(inner, _) => walk_type_refs(inner, visitor),
-        TypeDescriptor::Borrowed { inner, .. } => walk_type_refs(inner, visitor),
+        | TypeDescriptor::Future(inner)
+        | TypeDescriptor::Array(inner, _)
+        | TypeDescriptor::Borrowed { inner, .. } => walk_type_refs(inner, visitor),
         TypeDescriptor::Map(k, v) | TypeDescriptor::Result(k, v) => {
             walk_type_refs(k, visitor);
             walk_type_refs(v, visitor);
@@ -856,9 +860,9 @@ where
         TypeDescriptor::Option(inner)
         | TypeDescriptor::List(inner)
         | TypeDescriptor::Stream(inner)
-        | TypeDescriptor::Future(inner) => walk_generic_params(inner, visitor),
-        TypeDescriptor::Array(inner, _) => walk_generic_params(inner, visitor),
-        TypeDescriptor::Borrowed { inner, .. } => walk_generic_params(inner, visitor),
+        | TypeDescriptor::Future(inner)
+        | TypeDescriptor::Array(inner, _)
+        | TypeDescriptor::Borrowed { inner, .. } => walk_generic_params(inner, visitor),
         TypeDescriptor::Map(k, v) | TypeDescriptor::Result(k, v) => {
             walk_generic_params(k, visitor);
             walk_generic_params(v, visitor);

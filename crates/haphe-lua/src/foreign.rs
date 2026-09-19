@@ -39,7 +39,7 @@ use crate::binder::{lua_to_script, mangle_generic_name, script_to_lua};
 /// of a generic interface.
 pub fn foreign_caller(
     lua: &Lua,
-    table: Table,
+    table: &Table,
     descriptor: &ForeignInterfaceDescriptor<'static>,
     type_args: &[TypeDescriptor<'static>],
 ) -> Result<Box<dyn ForeignCaller>, LuaBindError> {
@@ -113,7 +113,7 @@ pub fn foreign_caller(
 /// of `table` (see [`foreign_caller`]).
 pub fn foreign_handle<H: ScriptForeign + ForeignHandle>(
     lua: &Lua,
-    table: Table,
+    table: &Table,
 ) -> Result<H, LuaBindError> {
     Ok(H::from_caller(foreign_caller(
         lua,

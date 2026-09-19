@@ -3,6 +3,12 @@
 //! `NonZero*` all compile wrappers and convert at the boundary.
 
 #![cfg(feature = "macros")]
+#![allow(
+    clippy::needless_pass_by_value,
+    clippy::unused_self,
+    clippy::doc_markdown,
+    reason = "fixture shapes are dictated by the bridge surface under test: `#[script]` functions receive OWNED values (the boundary contract), methods keep unused receivers, and docs name fixture idents verbatim"
+)]
 
 use std::collections::{BTreeMap, HashSet};
 use std::net::IpAddr;
@@ -47,11 +53,26 @@ fn relay<T>(value: T) -> T {
     value
 }
 
+// Fully qualified std spellings pass the gates like their bare forms.
+#[script]
+fn qualified(
+    path: std::path::PathBuf,
+    pause: std::time::Duration,
+    seen: std::collections::HashSet<i64>,
+) -> std::path::PathBuf {
+    let _ = (pause, seen);
+    path
+}
+
 #[script]
 fn unbox(value: Box<i64>) -> std::sync::Arc<String> {
     std::sync::Arc::new(value.to_string())
 }
 
+#[allow(
+    clippy::elidable_lifetime_names,
+    reason = "the NAMED lifetime is the surface under test: it must cross into the descriptor as `Borrowed { lifetime: Some(\"a\"), .. }` — eliding it would change what this fixture pins"
+)]
 #[script]
 fn shout<'a>(text: std::borrow::Cow<'a, str>) -> std::borrow::Cow<'a, str> {
     std::borrow::Cow::Owned(text.to_uppercase())
@@ -125,6 +146,18 @@ fn btreemap_params_bind_and_convert() {
 }
 
 #[test]
+fn qualified_std_spellings_bind() {
+    let (_, f) = bind_one::<qualified>();
+    let out = f(&[
+        ScriptValue::String("a/b".into()),
+        ScriptValue::from((1u64, 0u32)),
+        ScriptValue::List(vec![ScriptValue::I64(1)]),
+    ])
+    .unwrap();
+    assert!(matches!(out, ScriptValue::String(s) if s == "a/b"));
+}
+
+#[test]
 fn paths_bind_as_strings() {
     let (_, f) = bind_one::<with_extension>();
     let out = f(&[ScriptValue::String("notes/todo.txt".into())]).unwrap();
@@ -192,7 +225,7 @@ impl Carried {
         std::sync::Arc::new(format!("{prefix}{}", self.boxed))
     }
 
-    fn suffixed<'a>(&self, base: std::borrow::Cow<'a, str>) -> String {
+    fn suffixed(&self, base: std::borrow::Cow<'_, str>) -> String {
         format!("{base}-{}", self.boxed)
     }
 }

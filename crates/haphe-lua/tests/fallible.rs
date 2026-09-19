@@ -1,10 +1,20 @@
 //! Fallible surfaces through the VM: `Result<T, E>` constructors, methods,
 //! and free functions bind; `Ok` crosses as the value, `Err` raises a Lua
 //! error carrying the rendered Host message, prefixed by the declared
-//! `error_kind` ("ValueError: ..."). Conversion errors keep their existing
+//! `error_kind` ("`ValueError`: ..."). Conversion errors keep their existing
 //! text.
 
-#![allow(dead_code)]
+#![allow(
+    clippy::needless_pass_by_value,
+    clippy::unused_self,
+    clippy::doc_markdown,
+    clippy::trivially_copy_pass_by_ref,
+    reason = "fixture shapes are dictated by the bridge surface under test: `#[script]` functions receive OWNED values (the boundary contract), methods keep their declared receivers (`&self` on Copy enums included), and docs name fixture idents verbatim"
+)]
+#![allow(
+    dead_code,
+    reason = "fixtures are exercised through their generated descriptors and bridge wrappers, not direct calls"
+)]
 
 use haphe::{Script, script};
 use haphe_lua::{bind_fn, bind_type};

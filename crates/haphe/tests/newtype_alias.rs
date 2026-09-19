@@ -10,13 +10,19 @@ use haphe::{
 /// A distance in meters.
 #[derive(Script)]
 #[script(transparent)]
-#[allow(dead_code)]
+#[allow(
+    dead_code,
+    reason = "fixtures are exercised through their generated descriptors and bridge wrappers, not direct calls"
+)]
 pub struct Meters(f64);
 
 /// An opaque handle.
 #[derive(Script)]
 #[script(rename = "Handle")]
-#[allow(dead_code)]
+#[allow(
+    dead_code,
+    reason = "fixtures are exercised through their generated descriptors and bridge wrappers, not direct calls"
+)]
 pub struct RawHandle(u64);
 
 static METERS_HAND_WRITTEN: TypeAliasDescriptor<'static> = TypeAliasDescriptor {
@@ -80,7 +86,10 @@ fn registry_with_aliases_validates() {
 /// A single-field named struct marked `transparent` is also an alias…
 #[derive(Script)]
 #[script(transparent)]
-#[allow(dead_code)]
+#[allow(
+    dead_code,
+    reason = "fixtures are exercised through their generated descriptors and bridge wrappers, not direct calls"
+)]
 pub struct Celsius {
     degrees: f64,
 }

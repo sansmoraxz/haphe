@@ -157,12 +157,13 @@ impl TypeDescriptor<'_> {
         match (self, other) {
             (T::Primitive(a), T::Primitive(b)) => *a as u8 == *b as u8,
             (T::String, T::String) | (T::Bytes, T::Bytes) | (T::Unit, T::Unit) => true,
+            // Borrowed compares by inner: lifetime names don't change the
+            // script-visible type.
             (T::Option(a), T::Option(b))
             | (T::List(a), T::List(b))
             | (T::Stream(a), T::Stream(b))
-            | (T::Future(a), T::Future(b)) => a.const_eq(b),
-            // Lifetime names don't change the script-visible type.
-            (T::Borrowed { inner: a, .. }, T::Borrowed { inner: b, .. }) => a.const_eq(b),
+            | (T::Future(a), T::Future(b))
+            | (T::Borrowed { inner: a, .. }, T::Borrowed { inner: b, .. }) => a.const_eq(b),
             (T::Array(a, n), T::Array(b, m)) => *n == *m && a.const_eq(b),
             (T::Map(ka, va), T::Map(kb, vb)) | (T::Result(ka, va), T::Result(kb, vb)) => {
                 ka.const_eq(kb) && va.const_eq(vb)

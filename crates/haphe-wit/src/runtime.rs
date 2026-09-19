@@ -43,10 +43,10 @@ pub struct WasmBinder<T = ()> {
 /// Per-binder dispatch tables collected by the `register_*` calls.
 #[derive(Default)]
 struct Registrations {
-    /// Resource entries keyed by TypeId string (concrete) or
+    /// Resource entries keyed by `TypeId` string (concrete) or
     /// `"{id}|{mangled-args}"` (generic instances).
     resources: HashMap<String, Arc<ResourceEntry>>,
-    /// Value entries (records) keyed by TypeId string.
+    /// Value entries (records) keyed by `TypeId` string.
     values: HashMap<String, Arc<ValueEntry>>,
     /// Free functions keyed by descriptor name + instantiation type args.
     fns: Vec<(
@@ -480,7 +480,7 @@ impl<T: 'static> RuntimeBinder for WasmBinder<T> {
     type Runtime = Linker<T>;
     type Error = WasmBindError;
 
-    fn language_name(&self) -> &str {
+    fn language_name(&self) -> &'static str {
         "wasm"
     }
 
@@ -493,7 +493,10 @@ impl<T: 'static> RuntimeBinder for WasmBinder<T> {
         BindingGenerator::capabilities(&self.config)
             .with_required_thread_safety(Some(ThreadSafety::SEND))
     }
-
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one exhaustive pass per descriptor/channel shape; splitting the walk would scatter the per-shape rules"
+    )]
     fn bind(
         &self,
         registry: &ValidatedRegistry<'_>,
@@ -529,7 +532,7 @@ impl<T: 'static> RuntimeBinder for WasmBinder<T> {
                         let res_name = plan.type_name(id).to_string();
                         match self.regs.resources.get(*id) {
                             Some(entry) => {
-                                bind_resource_live(&mut inst, s, &res_name, entry.clone(), &cx)?
+                                bind_resource_live(&mut inst, s, &res_name, entry, &cx)?;
                             }
                             None => bind_resource_stub(&mut inst, s, &res_name, &self.table)?,
                         }
@@ -553,7 +556,7 @@ impl<T: 'static> RuntimeBinder for WasmBinder<T> {
                         .and_then(|k| self.regs.resources.get(&k).cloned());
                     match entry {
                         Some(entry) => {
-                            bind_resource_live(&mut inst, s, &planned.wit_name, entry, &cx)?
+                            bind_resource_live(&mut inst, s, &planned.wit_name, &entry, &cx)?;
                         }
                         None => bind_resource_stub(&mut inst, s, &planned.wit_name, &self.table)?,
                     }
@@ -577,7 +580,7 @@ impl<T: 'static> RuntimeBinder for WasmBinder<T> {
                         )? {
                             match (key, value.as_ref()) {
                                 (Some(key), Some(v)) => {
-                                    define_enum_companion(&mut inst, &name, v.clone(), key, &cx)?
+                                    define_enum_companion(&mut inst, &name, v.clone(), key, &cx)?;
                                 }
                                 _ => stub_func_msg(
                                     &mut inst,
@@ -617,7 +620,7 @@ impl<T: 'static> RuntimeBinder for WasmBinder<T> {
                         )? {
                             match (key, value.as_ref()) {
                                 (Some(key), Some(v)) => {
-                                    define_enum_companion(&mut inst, &name, v.clone(), key, &cx)?
+                                    define_enum_companion(&mut inst, &name, v.clone(), key, &cx)?;
                                 }
                                 _ => stub_func_msg(
                                     &mut inst,
@@ -778,7 +781,7 @@ impl<T: 'static> RuntimeBinder for WasmBinder<T> {
                         }
                         match desc {
                             Some(desc) => {
-                                define_dyn_value_fn_async(&mut inst, &dname, desc, cands, &cx)?
+                                define_dyn_value_fn_async(&mut inst, &dname, desc, cands, &cx)?;
                             }
                             None => stub_func_msg(
                                 &mut inst,
@@ -874,7 +877,7 @@ fn split_address(package: &str) -> Result<(&str, Option<&str>), WasmBindError> {
     };
     crate::validate_package_name(name)?;
     if let Some(v) = version
-        && (v.is_empty() || v.chars().any(|c| c.is_whitespace()))
+        && (v.is_empty() || v.chars().any(char::is_whitespace))
     {
         return Err(WitGenError::InvalidPackageName(package.to_string()).into());
     }
@@ -1060,6 +1063,10 @@ pub fn foreign_handle_async_in<H: ScriptForeign + ForeignHandle, T: Send + 'stat
 
 /// Resolves the interface's instance export and every function into a
 /// dispatch table keyed by (function name, type arguments).
+#[allow(
+    clippy::too_many_lines,
+    reason = "one exhaustive pass per descriptor/channel shape; splitting the walk would scatter the per-shape rules"
+)]
 fn resolve_foreign<T: 'static>(
     package: &str,
     store: Arc<Mutex<Store<T>>>,
@@ -1499,7 +1506,7 @@ impl<T: 'static> CallerInner<T> {
     /// handle (an `own` position TAKES it — reuse errors), `HostResource`
     /// wrappers re-enter as handles over the host table rep.
     fn lower_resource(
-        _store: &mut Store<T>,
+        store: &mut Store<T>,
         v: &ScriptValue,
         borrow: bool,
     ) -> Result<Val, ScriptConvertError> {
@@ -1529,7 +1536,7 @@ impl<T: 'static> CallerInner<T> {
             // `own` position transfers it.
             if let HostResState::Unminted(rep) = *state {
                 let any = Resource::<HostRep>::new_own(rep)
-                    .try_into_resource_any(&mut *_store)
+                    .try_into_resource_any(&mut *store)
                     .map_err(|_| err("a mintable host resource handle"))?;
                 *state = HostResState::Minted(any);
             }
@@ -1654,10 +1661,10 @@ impl<T: 'static> CallerInner<T> {
 }
 
 impl<T: Send + 'static> CallerInner<T> {
-    // The guard is held across the await deliberately: the guest call needs
-    // exclusive store access for its whole duration, and these futures are
-    // not `Send`, so no executor can move them across threads mid-lock.
-    #[allow(clippy::await_holding_lock)]
+    #[allow(
+        clippy::await_holding_lock,
+        reason = "the guard is held across the await deliberately: the guest call needs exclusive store access for its whole duration, and these futures are not `Send`, so no executor can move them across threads mid-lock"
+    )]
     async fn dispatch_async(
         &self,
         function: &'static str,
@@ -1676,7 +1683,10 @@ impl<T: Send + 'static> CallerInner<T> {
         self.call_async_inner(f, function, args).await
     }
 
-    #[allow(clippy::await_holding_lock)]
+    #[allow(
+        clippy::await_holding_lock,
+        reason = "held across the await deliberately, as in `dispatch_async` above: the guest call needs exclusive store access for its whole duration, and these futures are not `Send`"
+    )]
     async fn call_async_inner(
         &self,
         f: &ForeignFn,
@@ -1768,6 +1778,10 @@ type ResLift<'f> = &'f mut dyn FnMut(ResourceAny) -> Result<ScriptValue, ScriptC
 /// Converts a [`ScriptValue`] argument into the [`Val`] shape the guest's
 /// reflected parameter type expects. Resource-typed positions are delegated
 /// to `res` (the caller's store-aware handle plumbing).
+#[allow(
+    clippy::too_many_lines,
+    reason = "one exhaustive pass per descriptor/channel shape; splitting the walk would scatter the per-shape rules"
+)]
 fn script_to_val(
     v: &ScriptValue,
     ty: &Type,
@@ -2069,6 +2083,10 @@ fn script_to_val(
 /// empty map, so enum returns error there — build the caller with the
 /// registry-aware constructor instead. Resource handles are delegated to
 /// `res` (the caller's store-aware handle plumbing).
+#[allow(
+    clippy::too_many_lines,
+    reason = "one exhaustive pass per descriptor/channel shape; splitting the walk would scatter the per-shape rules"
+)]
 fn val_to_script(
     v: &Val,
     enum_cases: &EnumNames,
@@ -2354,7 +2372,7 @@ fn lift_args<S: AsContextMut>(
 ) -> wasmtime::Result<Vec<ScriptValue>> {
     params[skip..]
         .iter()
-        .map(|v| cx.lift(store, v).map_err(|e| trap_convert(name, e)))
+        .map(|v| cx.lift(store, v).map_err(|e| trap_convert(name, &e)))
         .collect()
 }
 
@@ -2363,14 +2381,14 @@ fn lower_result<S: AsContextMut, I: Iterator<Item = Type>>(
     cx: &DispatchCx,
     store: &mut S,
     mut result_types: I,
-    out: ScriptValue,
+    out: &ScriptValue,
     results: &mut [Val],
     name: &str,
 ) -> wasmtime::Result<()> {
     if let Some(rty) = result_types.next() {
         results[0] = cx
-            .lower(store, &out, &rty)
-            .map_err(|e| trap_convert(name, e))?;
+            .lower(store, out, &rty)
+            .map_err(|e| trap_convert(name, &e))?;
     }
     Ok(())
 }
@@ -2613,7 +2631,7 @@ fn define_dyn_value_fn<T: 'static>(
             match (cands[i].1)(&values) {
                 Ok(out) => {
                     let out = wrap_dyn_result(desc, &cands[i].0.key, out);
-                    return lower_result(&cx, &mut store, fty.results(), out, results, &msg);
+                    return lower_result(&cx, &mut store, fty.results(), &out, results, &msg);
                 }
                 // A convert error means the candidate rejected the
                 // arguments — fall through. A Host error is the matched
@@ -2648,7 +2666,7 @@ fn define_dyn_value_fn_async<T: 'static>(
             match block_on((cands[i].1)(&values)) {
                 Ok(out) => {
                     let out = wrap_dyn_result(desc, &cands[i].0.key, out);
-                    return lower_result(&cx, &mut store, fty.results(), out, results, &msg);
+                    return lower_result(&cx, &mut store, fty.results(), &out, results, &msg);
                 }
                 // A convert error means the candidate rejected the
                 // arguments — fall through. A Host error is the matched
@@ -2725,7 +2743,7 @@ fn define_dyn_method<T: 'static>(
             match attempt {
                 Ok(out) => {
                     let out = wrap_dyn_result(desc, &cands[i].0.key, out);
-                    return lower_result(&cx, &mut store, fty.results(), out, results, &msg);
+                    return lower_result(&cx, &mut store, fty.results(), &out, results, &msg);
                 }
                 // A convert error means the candidate rejected the
                 // arguments — fall through. A Host error is the matched
@@ -2767,7 +2785,7 @@ fn define_enum_dyn_companion<T: 'static>(
             match m(this.clone(), &values) {
                 Ok(out) => {
                     let out = wrap_dyn_result(desc, &cands[i].0.key, out);
-                    return lower_result(&cx, &mut store, fty.results(), out, results, &msg);
+                    return lower_result(&cx, &mut store, fty.results(), &out, results, &msg);
                 }
                 // A convert error means the candidate rejected the
                 // arguments — fall through. A Host error is the matched
@@ -2793,7 +2811,7 @@ fn define_value_fn<T: 'static>(
     inst.func_new(name, move |mut store, fty, params, results| {
         let args = lift_args(&cx, &mut store, params, 0, &msg_name)?;
         let out = f(&args).map_err(|e| trap_call(&msg_name, e))?;
-        lower_result(&cx, &mut store, fty.results(), out, results, &msg_name)
+        lower_result(&cx, &mut store, fty.results(), &out, results, &msg_name)
     })?;
     Ok(())
 }
@@ -2813,7 +2831,7 @@ fn define_value_fn_async<T: 'static>(
     inst.func_new(name, move |mut store, fty, params, results| {
         let args = lift_args(&cx, &mut store, params, 0, &msg_name)?;
         let out = block_on(f(&args)).map_err(|e| trap_call(&msg_name, e))?;
-        lower_result(&cx, &mut store, fty.results(), out, results, &msg_name)
+        lower_result(&cx, &mut store, fty.results(), &out, results, &msg_name)
     })?;
     Ok(())
 }
@@ -2837,7 +2855,7 @@ fn bind_record_properties<T: 'static>(
             member_names.insert_as(&getter_raw, &format!("property accessor `{getter_raw}`"))?;
         match value.filter(|v| v.props_get.contains_key(prop.name)) {
             Some(v) => {
-                define_record_property(inst, &name, v.clone(), prop.name.to_string(), false, cx)?
+                define_record_property(inst, &name, v.clone(), prop.name.to_string(), false, cx)?;
             }
             None => stub_func(inst, &name)?,
         }
@@ -2847,7 +2865,14 @@ fn bind_record_properties<T: 'static>(
                 .insert_as(&setter_raw, &format!("property accessor `{setter_raw}`"))?;
             match value.filter(|v| v.props_set.contains_key(prop.name)) {
                 Some(v) => {
-                    define_record_property(inst, &name, v.clone(), prop.name.to_string(), true, cx)?
+                    define_record_property(
+                        inst,
+                        &name,
+                        v.clone(),
+                        prop.name.to_string(),
+                        true,
+                        cx,
+                    )?;
                 }
                 None => stub_func(inst, &name)?,
             }
@@ -2880,7 +2905,7 @@ fn define_record_property<T: 'static>(
             .get(member.as_str())
             .ok_or_else(|| trap(&msg_name, "property has no dispatch channel"))?;
         let out = f(&args).map_err(|e| trap_call(&msg_name, e))?;
-        lower_result(&cx, &mut store, fty.results(), out, results, &msg_name)
+        lower_result(&cx, &mut store, fty.results(), &out, results, &msg_name)
     })?;
     Ok(())
 }
@@ -2901,7 +2926,7 @@ fn define_record_projection<T: 'static>(
             .get(member)
             .ok_or_else(|| trap(&msg_name, "trait projection has no dispatch channel"))?;
         let out = proj(&args).map_err(|e| trap_call(&msg_name, e))?;
-        lower_result(&cx, &mut store, fty.results(), out, results, &msg_name)
+        lower_result(&cx, &mut store, fty.results(), &out, results, &msg_name)
     })?;
     Ok(())
 }
@@ -3027,7 +3052,7 @@ fn define_enum_companion<T: 'static>(
             .split_first()
             .ok_or_else(|| trap(&msg_name, "companion call is missing its receiver"))?;
         let out = m(this.clone(), rest).map_err(|e| trap_call(&msg_name, e))?;
-        lower_result(&cx, &mut store, fty.results(), out, results, &msg_name)
+        lower_result(&cx, &mut store, fty.results(), &out, results, &msg_name)
     })?;
     Ok(())
 }
@@ -3036,11 +3061,15 @@ fn define_enum_companion<T: 'static>(
 /// accessors, methods (sync and async), and trait projections, dispatching
 /// through the erased entry with values owned by the host table. The
 /// destructor removes the entry.
+#[allow(
+    clippy::too_many_lines,
+    reason = "one exhaustive pass per descriptor/channel shape; splitting the walk would scatter the per-shape rules"
+)]
 fn bind_resource_live<T: 'static>(
     inst: &mut LinkerInstance<'_, T>,
     s: &haphe::StructDescriptor<'_>,
     res: &str,
-    entry: Arc<ResourceEntry>,
+    entry: &Arc<ResourceEntry>,
     cx: &DispatchCx,
 ) -> Result<(), WasmBindError> {
     let dtor_table = cx.table.clone();
@@ -3052,16 +3081,16 @@ fn bind_resource_live<T: 'static>(
 
     for field in s.fields {
         let getter = members.insert(field.name)?;
-        define_field_get(inst, res, &getter, field.name, &entry, cx)?;
+        define_field_get(inst, res, &getter, field.name, entry, cx)?;
         if !field.readonly {
             let setter = members.insert(&format!("set_{}", field.name))?;
-            define_field_set(inst, res, &setter, field.name, &entry, cx)?;
+            define_field_set(inst, res, &setter, field.name, entry, cx)?;
         }
     }
     for prop in s.properties {
         let getter = members.insert(prop.name)?;
         if entry.props.contains_key(prop.name) {
-            define_prop_get(inst, res, &getter, prop.name, &entry, cx)?;
+            define_prop_get(inst, res, &getter, prop.name, entry, cx)?;
         } else {
             // Whitelist-gated out at the macro layer: declared, described,
             // but not bridgeable.
@@ -3074,7 +3103,7 @@ fn bind_resource_live<T: 'static>(
         if !prop.readonly {
             let setter = members.insert(&format!("set_{}", prop.name))?;
             if entry.props.contains_key(prop.name) {
-                define_prop_set(inst, res, &setter, prop.name, &entry, cx)?;
+                define_prop_set(inst, res, &setter, prop.name, entry, cx)?;
             } else {
                 stub_func_msg(
                     inst,
@@ -3095,10 +3124,10 @@ fn bind_resource_live<T: 'static>(
             (format!("[static]{res}.{name}"), ctor.name.to_string())
         };
         if ctor.is_async {
-            define_ctor_async(inst, &linker_name, ctor_key, &entry, cx)?;
+            define_ctor_async(inst, &linker_name, ctor_key, entry, cx)?;
             continue;
         }
-        define_ctor(inst, &linker_name, ctor_key, &entry, cx)?;
+        define_ctor(inst, &linker_name, ctor_key, entry, cx)?;
     }
 
     for m in s.methods {
@@ -3168,7 +3197,7 @@ fn bind_resource_live<T: 'static>(
                 &prefixed,
                 key,
                 m.receiver.expect("checked above"),
-                &entry,
+                entry,
                 cx,
             )?;
         }
@@ -3198,7 +3227,7 @@ fn bind_resource_live<T: 'static>(
                 }
                 match desc {
                     Some(desc) => {
-                        define_dyn_method(inst, &prefixed, desc, cands, entry.clone(), cx)?
+                        define_dyn_method(inst, &prefixed, desc, cands, entry.clone(), cx)?;
                     }
                     None => stub_func_msg(
                         inst,
@@ -3215,7 +3244,7 @@ fn bind_resource_live<T: 'static>(
             proj.source_name,
             &format!("trait projection `{}`", proj.source_name),
         )?;
-        define_projection(inst, res, &name, proj, &entry, cx)?;
+        define_projection(inst, res, &name, &proj, entry, cx)?;
     }
 
     Ok(())
@@ -3244,9 +3273,9 @@ fn define_field_get<T: 'static>(
                 .fields
                 .get(field.as_str())
                 .ok_or_else(|| trap(&msg, "field has no bridge accessor"))?;
-            (acc.get)(&*e.value).map_err(|e| trap_convert(&msg, e))?
+            (acc.get)(&*e.value).map_err(|e| trap_convert(&msg, &e))?
         };
-        lower_result(&cx, &mut store, fty.results(), out, results, &msg)
+        lower_result(&cx, &mut store, fty.results(), &out, results, &msg)
     })?;
     Ok(())
 }
@@ -3282,7 +3311,7 @@ fn define_field_set<T: 'static>(
             .set
             .as_ref()
             .ok_or_else(|| trap(&msg, "field is readonly"))?;
-        set(&mut *e.value, value).map_err(|e| trap_convert(&msg, e))?;
+        set(&mut *e.value, value).map_err(|e| trap_convert(&msg, &e))?;
         Ok(())
     })?;
     Ok(())
@@ -3312,7 +3341,7 @@ fn define_prop_get<T: 'static>(
                 .get(prop.as_str())
                 .ok_or_else(|| trap(&msg, "property has no bridge accessor"))?;
             if let Some(get) = &acc.get {
-                get(&*e.value).map_err(|e| trap_convert(&msg, e))?
+                get(&*e.value).map_err(|e| trap_convert(&msg, &e))?
             } else if let Some(get) = &acc.get_async {
                 // Driven on-thread; the table lock is held across awaits
                 // (same re-entrancy caveat as async methods).
@@ -3321,7 +3350,7 @@ fn define_prop_get<T: 'static>(
                 return Err(trap(&msg, "property has no getter channel"));
             }
         };
-        lower_result(&cx, &mut store, fty.results(), out, results, &msg)
+        lower_result(&cx, &mut store, fty.results(), &out, results, &msg)
     })?;
     Ok(())
 }
@@ -3354,7 +3383,7 @@ fn define_prop_set<T: 'static>(
             .get(prop.as_str())
             .ok_or_else(|| trap(&msg, "property has no bridge accessor"))?;
         if let Some(set) = &acc.set {
-            set(&mut *e.value, value).map_err(|e| trap_convert(&msg, e))?;
+            set(&mut *e.value, value).map_err(|e| trap_convert(&msg, &e))?;
         } else if let Some(set) = &acc.set_async {
             // In-place mutation under the held lock (method_async_mut
             // precedent); same re-entrancy caveat.
@@ -3511,17 +3540,21 @@ fn define_method<T: 'static>(
                 block_on(f(&mut *e.value, &args)).map_err(|e| trap_call(&msg, e))?
             }
         };
-        lower_result(&cx, &mut store, fty.results(), out, results, &msg)
+        lower_result(&cx, &mut store, fty.results(), &out, results, &msg)
     })?;
     Ok(())
 }
 
 /// Defines one live trait projection on a resource.
+#[allow(
+    clippy::too_many_lines,
+    reason = "one exhaustive pass per descriptor/channel shape; splitting the walk would scatter the per-shape rules"
+)]
 fn define_projection<T: 'static>(
     inst: &mut LinkerInstance<'_, T>,
     res: &str,
     name: &str,
-    proj: Projected<'_>,
+    proj: &Projected<'_>,
     entry: &Arc<ResourceEntry>,
     cx: &DispatchCx,
 ) -> Result<(), WasmBindError> {
@@ -3581,7 +3614,7 @@ fn define_projection<T: 'static>(
                     check_type(&msg, e.type_name, entry.type_name)?;
                     (entry.clone_any)(&*e.value)
                 };
-                let value = f(a, &args).map_err(|e| trap_convert(&msg, e))?;
+                let value = f(a, &args).map_err(|e| trap_convert(&msg, &e))?;
                 results[0] = cx.own_handle(&mut store, entry.type_name, value)?;
                 return Ok(());
             }
@@ -3668,7 +3701,7 @@ fn define_projection<T: 'static>(
                         .map_err(|e| trap_call(&msg, e))?
                 } else {
                     let f = entry.metas.call.as_ref().ok_or_else(missing)?;
-                    f(&*e.value, &args).map_err(|e| trap_convert(&msg, e))?
+                    f(&*e.value, &args).map_err(|e| trap_convert(&msg, &e))?
                 }
             }
             ProjDispatch::IndexGet => {
@@ -3679,7 +3712,7 @@ fn define_projection<T: 'static>(
                     .get(&rep)
                     .ok_or_else(|| trap(&msg, "stale resource handle"))?;
                 check_type(&msg, e.type_name, entry.type_name)?;
-                f(&*e.value, &args).map_err(|e| trap_convert(&msg, e))?
+                f(&*e.value, &args).map_err(|e| trap_convert(&msg, &e))?
             }
             ProjDispatch::IndexSet => {
                 let args = lift_args(&cx, &mut store, params, 1, &msg)?;
@@ -3689,7 +3722,7 @@ fn define_projection<T: 'static>(
                     .get_mut(&rep)
                     .ok_or_else(|| trap(&msg, "stale resource handle"))?;
                 check_type(&msg, e.type_name, entry.type_name)?;
-                f(&mut *e.value, &args).map_err(|e| trap_convert(&msg, e))?;
+                f(&mut *e.value, &args).map_err(|e| trap_convert(&msg, &e))?;
                 return Ok(());
             }
             ProjDispatch::Items => {
@@ -3719,7 +3752,7 @@ fn define_projection<T: 'static>(
             }
             ProjDispatch::Default => unreachable!("handled above"),
         };
-        lower_result(&cx, &mut store, fty.results(), out, results, &msg)
+        lower_result(&cx, &mut store, fty.results(), &out, results, &msg)
     })?;
     Ok(())
 }

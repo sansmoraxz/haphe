@@ -1,7 +1,17 @@
 //! Tests that `#[derive(Script)]` + `#[script] impl` automatically produces
-//! working Lua UserData — no hand-written mlua code required.
+//! working Lua `UserData` — no hand-written mlua code required.
 
-#![allow(dead_code)]
+#![allow(
+    clippy::needless_pass_by_value,
+    clippy::unused_self,
+    clippy::doc_markdown,
+    clippy::trivially_copy_pass_by_ref,
+    reason = "fixture shapes are dictated by the bridge surface under test: `#[script]` functions receive OWNED values (the boundary contract), methods keep their declared receivers (`&self` on Copy enums included), and docs name fixture idents verbatim"
+)]
+#![allow(
+    dead_code,
+    reason = "fixtures are exercised through their generated descriptors and bridge wrappers, not direct calls"
+)]
 
 use haphe::{RuntimeBinder, Script, script};
 use haphe_lua::{LuaBinder, bind_fn, bind_type};
@@ -168,11 +178,11 @@ fn field_write() {
     let lua = setup_lua();
     let result: f64 = lua
         .load(
-            r#"
+            r"
             local v = vectors.Vec2.new(1, 2)
             v.x = 99
             return v.x
-            "#,
+            ",
         )
         .eval()
         .unwrap();
@@ -275,12 +285,12 @@ fn chained_arithmetic() {
     // (Vec2(1,2) + Vec2(3,4)) * 2 + 1
     let result: f64 = lua
         .load(
-            r#"
+            r"
             local a = vectors.Vec2.new(1, 2)
             local b = vectors.Vec2.new(3, 4)
             local c = (a + b) * 2 + 1
             return c.x
-            "#,
+            ",
         )
         .eval()
         .unwrap();

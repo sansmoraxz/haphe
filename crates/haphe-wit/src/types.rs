@@ -20,7 +20,7 @@ pub(crate) fn peel_borrowed<'b, 'a>(mut ty: &'b TypeDescriptor<'a>) -> &'b TypeD
 /// erased (`dyn`) foreign imports.
 #[cfg_attr(
     not(any(feature = "runtime", feature = "dyn-generics")),
-    allow(dead_code)
+    allow(dead_code, reason = "only dynamic-dispatch machinery consumes it")
 )]
 pub(crate) fn mentions_generic(ty: &TypeDescriptor<'_>) -> bool {
     match ty {
@@ -29,8 +29,8 @@ pub(crate) fn mentions_generic(ty: &TypeDescriptor<'_>) -> bool {
         | TypeDescriptor::List(inner)
         | TypeDescriptor::Stream(inner)
         | TypeDescriptor::Future(inner)
-        | TypeDescriptor::Borrowed { inner, .. } => mentions_generic(inner),
-        TypeDescriptor::Array(inner, _) => mentions_generic(inner),
+        | TypeDescriptor::Borrowed { inner, .. }
+        | TypeDescriptor::Array(inner, _) => mentions_generic(inner),
         TypeDescriptor::Map(k, v) | TypeDescriptor::Result(k, v) => {
             mentions_generic(k) || mentions_generic(v)
         }
@@ -48,7 +48,10 @@ pub(crate) fn mentions_generic(ty: &TypeDescriptor<'_>) -> bool {
 /// machinery uses so that only the METHOD's own generic parameters become
 /// variant cases; a generic SELF type's parameters render concretely per
 /// monomorph and pass through.
-#[cfg_attr(not(feature = "dyn-generics"), allow(dead_code))]
+#[cfg_attr(
+    not(feature = "dyn-generics"),
+    allow(dead_code, reason = "only synthesized dispatcher emission consumes it")
+)]
 pub(crate) fn mentions_named_generic(
     ty: &TypeDescriptor<'_>,
     params: &[haphe::GenericParam<'_>],
@@ -59,8 +62,8 @@ pub(crate) fn mentions_named_generic(
         | TypeDescriptor::List(inner)
         | TypeDescriptor::Stream(inner)
         | TypeDescriptor::Future(inner)
-        | TypeDescriptor::Borrowed { inner, .. } => mentions_named_generic(inner, params),
-        TypeDescriptor::Array(inner, _) => mentions_named_generic(inner, params),
+        | TypeDescriptor::Borrowed { inner, .. }
+        | TypeDescriptor::Array(inner, _) => mentions_named_generic(inner, params),
         TypeDescriptor::Map(k, v) | TypeDescriptor::Result(k, v) => {
             mentions_named_generic(k, params) || mentions_named_generic(v, params)
         }
@@ -101,7 +104,10 @@ pub(crate) fn render_return(
     }
     render_type(ty, Pos::Return(ownership), plan, env, context).map(Some)
 }
-
+#[allow(
+    clippy::too_many_lines,
+    reason = "one exhaustive pass per descriptor/channel shape; splitting the walk would scatter the per-shape rules"
+)]
 pub(crate) fn render_type(
     ty: &TypeDescriptor<'_>,
     pos: Pos,
@@ -255,8 +261,7 @@ fn render_named(
     }
     match pos {
         Pos::Param(Ownership::Ref | Ownership::RefMut) => Ok(format!("borrow<{name}>")),
-        Pos::Param(_) | Pos::Field => Ok(name),
-        Pos::Return(Ownership::Owned | Ownership::Clone) => Ok(name),
+        Pos::Param(_) | Pos::Field | Pos::Return(Ownership::Owned | Ownership::Clone) => Ok(name),
         Pos::Return(Ownership::Ref | Ownership::RefMut) => {
             Err(WitGenError::BorrowedResourceReturn {
                 type_id: type_id.to_string(),

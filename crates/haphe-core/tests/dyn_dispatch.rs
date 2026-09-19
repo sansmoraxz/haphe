@@ -18,6 +18,14 @@ fn q(value: &ScriptValue, desc: &TypeDescriptor<'_>) -> MatchQuality {
     value_matches_descriptor(value, desc, &NO_SUBST)
 }
 
+static I64_D: TypeDescriptor<'static> = TypeDescriptor::Primitive(PrimitiveType::I64);
+
+#[derive(Clone)]
+struct Thing;
+impl haphe_core::ScriptType for Thing {
+    const ID: TypeId<'static> = TypeId::new("m::Thing");
+}
+
 #[test]
 fn matcher_policy_table() {
     use MatchQuality::{Coercible, Exact, No};
@@ -44,7 +52,6 @@ fn matcher_policy_table() {
     assert_eq!(q(&ScriptValue::Char('x'), &T::String), Coercible);
 
     // Containers: first-element heuristic; empty is Coercible (unknown).
-    static I64_D: TypeDescriptor<'static> = T::Primitive(P::I64);
     let list = ScriptValue::List(vec![ScriptValue::I64(1)]);
     assert_eq!(q(&list, &T::List(&I64_D)), Exact);
     assert_eq!(q(&ScriptValue::List(vec![]), &T::List(&I64_D)), Coercible);
@@ -81,11 +88,6 @@ fn matcher_policy_table() {
     );
 
     // UserData: tag-exact, tag-mismatch No, untagged Coercible.
-    #[derive(Clone)]
-    struct Thing;
-    impl haphe_core::ScriptType for Thing {
-        const ID: TypeId<'static> = TypeId::new("m::Thing");
-    }
     let tagged = ScriptValue::UserData(OpaqueUserData::new_typed(Thing));
     assert_eq!(q(&tagged, &T::Ref(TypeId::new("m::Thing"))), Exact);
     assert_eq!(q(&tagged, &T::Ref(TypeId::new("m::Other"))), No);

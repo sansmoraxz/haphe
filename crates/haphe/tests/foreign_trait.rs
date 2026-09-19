@@ -74,7 +74,7 @@ static IN_STATIC: ForeignInterfaceDescriptor<'static> =
 #[test]
 fn descriptor_matches_hand_written() {
     let desc = IN_STATIC;
-    assert!(desc.id == TypeId::new(concat!(module_path!(), "::HostHooks")));
+    assert_eq!(desc.id, TypeId::new(concat!(module_path!(), "::HostHooks")));
     assert_eq!(desc.name, "HostHooks");
     assert_eq!(desc.doc, Some("Host-side hooks."));
     assert_eq!(desc.thread_safety, ThreadSafety::NONE);
@@ -144,8 +144,8 @@ fn handle(
     }))
 }
 
-fn block_on<F: Future>(mut fut: F) -> F::Output {
-    let mut fut = unsafe { Pin::new_unchecked(&mut fut) };
+fn block_on<F: Future>(fut: F) -> F::Output {
+    let mut fut = std::pin::pin!(fut);
     let waker = Waker::noop();
     let mut cx = Context::from_waker(waker);
     loop {

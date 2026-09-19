@@ -3,7 +3,17 @@
 //! boundary), decl stubs render the inner type, and dyn candidate listings
 //! show the inner type. The carried lifetime is ignored.
 
-#![allow(dead_code)]
+#![allow(
+    clippy::needless_pass_by_value,
+    clippy::unused_self,
+    clippy::doc_markdown,
+    clippy::trivially_copy_pass_by_ref,
+    reason = "fixture shapes are dictated by the bridge surface under test: `#[script]` functions receive OWNED values (the boundary contract), methods keep their declared receivers (`&self` on Copy enums included), and docs name fixture idents verbatim"
+)]
+#![allow(
+    dead_code,
+    reason = "fixtures are exercised through their generated descriptors and bridge wrappers, not direct calls"
+)]
 
 use std::borrow::Cow;
 
@@ -24,7 +34,7 @@ impl Tag {
     }
 
     /// A `Cow` parameter with a named signature lifetime.
-    fn suffixed<'a>(&self, base: Cow<'a, str>) -> String {
+    fn suffixed(&self, base: Cow<'_, str>) -> String {
         format!("{base}-{}", self.name)
     }
 
@@ -36,7 +46,7 @@ impl Tag {
 
 /// A free function taking and returning `Cow`.
 #[script]
-fn shout<'a>(text: Cow<'a, str>) -> Cow<'a, str> {
+fn shout(text: Cow<'_, str>) -> Cow<'_, str> {
     Cow::Owned(text.to_uppercase())
 }
 

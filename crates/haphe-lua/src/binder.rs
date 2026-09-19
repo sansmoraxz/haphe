@@ -1,7 +1,7 @@
 //! `TypeBinder<T>` implementation for mlua.
 //!
 //! Collects field/method/metamethod registrations from `ScriptBind::bind`,
-//! then applies them to a Lua state by creating UserData + FromLua impls
+//! then applies them to a Lua state by creating `UserData` + `FromLua` impls
 //! at registration time.
 
 use std::sync::Arc;
@@ -75,6 +75,10 @@ fn make_stepper(lua: &Lua, iter: ScriptIter, pairing: IterPairing) -> mlua::Resu
 /// The bitwise metamethods (`__band`, `__bor`, `__bxor`, `__bnot`, `__shl`,
 /// `__shr`) exist only on Lua 5.3+ — not on 5.1/5.2/LuaJIT, and not on Luau,
 /// which has no bitwise operators. `__pow` exists everywhere.
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "returns `Err` only on feature combos without Lua 5.3 bitwise operators; under 5.3+ combos the cfg compiles the check away and the Result looks unnecessary to the lint"
+)]
 fn check_op_supported(op: &'static str) -> Result<(), LuaBindError> {
     #[cfg(not(any(feature = "lua55", feature = "lua54", feature = "lua53")))]
     if matches!(op, "bitand" | "bitor" | "bitxor" | "bnot" | "shl" | "shr") {
@@ -98,7 +102,7 @@ fn check_op_supported(op: &'static str) -> Result<(), LuaBindError> {
 /// Converts a [`ScriptValue`] to an [`mlua::Value`].
 pub(crate) fn script_to_lua(lua: &Lua, v: ScriptValue) -> mlua::Result<mlua::Value> {
     match v {
-        ScriptValue::Unit => Ok(mlua::Value::Nil),
+        ScriptValue::Unit | ScriptValue::Optional(None) => Ok(mlua::Value::Nil),
         ScriptValue::Bool(b) => Ok(mlua::Value::Boolean(b)),
         ScriptValue::I64(n) => Ok(mlua::Value::Integer(n)),
         ScriptValue::F64(n) => Ok(mlua::Value::Number(n)),
@@ -124,7 +128,6 @@ pub(crate) fn script_to_lua(lua: &Lua, v: ScriptValue) -> mlua::Result<mlua::Val
             }
             Ok(mlua::Value::Table(table))
         }
-        ScriptValue::Optional(None) => Ok(mlua::Value::Nil),
         ScriptValue::Optional(Some(inner)) => script_to_lua(lua, *inner),
         ScriptValue::UserData(ud) => lua.create_any_userdata(ud).map(mlua::Value::UserData),
         // Unit-enum cases: NUMERIC enums (a Rust `#[repr]` integer type)
@@ -474,12 +477,19 @@ impl<T: 'static + Clone + mlua::MaybeSend + mlua::MaybeSync> LuaTypeBinder<T> {
     }
 
     /// Apply all collected registrations to the Lua state.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one registration arm per binder channel; splitting the pass would scatter the per-channel rules"
+    )]
     pub fn register(self, lua: &Lua, type_table: &mlua::Table) -> Result<(), LuaBindError> {
         // Some traits register implicit portable methods (`iter` on
         // iterable types, `hash` for `Hash`, `debug` for `Debug`); a
         // user-declared method with one of those names would silently
         // shadow it.
-        #[allow(unused_mut)]
+        #[allow(
+            unused_mut,
+            reason = "mutated only under `feature = \"generics\"`; other combos never push"
+        )]
         let mut dyn_method_names: Vec<&'static str> = Vec::new();
         #[cfg(feature = "generics")]
         {
@@ -1952,28 +1962,27 @@ impl DynMethodScan {
 
     /// Candidate visit order for one call (see [`dyn_call_order`]).
     fn call_order(&self, args: &[ScriptValue]) -> impl Iterator<Item = usize> + use<> {
-        match &self.fast {
-            Some(scan) => dyn_call_order(args, scan),
-            None => {
-                let descs: Vec<haphe::FunctionDescriptor<'_>> = self
-                    .descriptors
-                    .iter()
-                    .zip(&self.merged)
-                    .map(|(d, (params, _))| haphe::FunctionDescriptor {
-                        generic_params: params,
-                        ..**d
-                    })
-                    .collect();
-                let scan: Vec<haphe::dispatch::DynCandidate<'_>> = descs
-                    .iter()
-                    .zip(&self.merged)
-                    .map(|(d, (_, args))| haphe::dispatch::DynCandidate {
-                        type_args: args,
-                        descriptor: d,
-                    })
-                    .collect();
-                dyn_call_order(args, &scan)
-            }
+        if let Some(scan) = &self.fast {
+            dyn_call_order(args, scan)
+        } else {
+            let descs: Vec<haphe::FunctionDescriptor<'_>> = self
+                .descriptors
+                .iter()
+                .zip(&self.merged)
+                .map(|(d, (params, _))| haphe::FunctionDescriptor {
+                    generic_params: params,
+                    ..**d
+                })
+                .collect();
+            let scan: Vec<haphe::dispatch::DynCandidate<'_>> = descs
+                .iter()
+                .zip(&self.merged)
+                .map(|(d, (_, args))| haphe::dispatch::DynCandidate {
+                    type_args: args,
+                    descriptor: d,
+                })
+                .collect();
+            dyn_call_order(args, &scan)
         }
     }
 }
@@ -2059,8 +2068,7 @@ fn render_candidate(
                 .iter()
                 .position(|p| p.name == *name)
                 .and_then(|i| subst.args.get(i))
-                .map(|resolved| render_ty(resolved, subst))
-                .unwrap_or_else(|| name.to_string()),
+                .map_or_else(|| name.to_string(), |resolved| render_ty(resolved, subst)),
             T::Primitive(p) => format!("{p:?}").to_lowercase(),
             T::String => "string".into(),
             T::Bytes => "bytes".into(),
@@ -2124,6 +2132,10 @@ impl LuaFnBinder {
     }
 
     /// Register all collected functions onto the given Lua table.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one registration arm per binder channel; splitting the pass would scatter the per-channel rules"
+    )]
     pub fn apply(self, lua: &Lua, table: &mlua::Table) -> Result<(), LuaBindError> {
         // Static generic monomorphs land under mangled names next to the
         // plain functions; a collision would silently overwrite the earlier

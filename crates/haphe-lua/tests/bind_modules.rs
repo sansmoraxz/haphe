@@ -1,4 +1,4 @@
-//! Integration test: registry → validate → LuaBinder → Lua runtime.
+//! Integration test: registry → validate → `LuaBinder` → Lua runtime.
 
 use haphe::{
     ConstantDescriptor, FieldDescriptor, FunctionDescriptor, ModuleDescriptor, Ownership,

@@ -2,7 +2,10 @@
 //! methods exist on every Lua version, behind this backend's `async`
 //! feature).
 
-#![allow(dead_code)]
+#![allow(
+    dead_code,
+    reason = "fixtures are exercised through their generated descriptors and bridge wrappers, not direct calls"
+)]
 
 use haphe::{Script, script};
 use haphe_lua::bind_type;

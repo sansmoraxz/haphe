@@ -253,7 +253,7 @@ macro_rules! impl_int_bridge {
         $(
             impl From<$ty> for ScriptValue {
                 fn from(n: $ty) -> Self {
-                    Self::I64(n as i64)
+                    Self::I64(i64::from(n))
                 }
             }
             impl FromScript for $ty {
@@ -271,14 +271,34 @@ macro_rules! impl_int_bridge {
     };
 }
 
-impl_int_bridge!(i8, i16, i32, i64, u8, u16, u32, u64);
+impl_int_bridge!(i8, i16, i32, i64, u8, u16, u32);
+
+// `u64` crosses as the `i64` BIT PATTERN (values above `i64::MAX` wrap) —
+// declared bridge policy, hence the deliberate `as` casts.
+impl From<u64> for ScriptValue {
+    fn from(n: u64) -> Self {
+        Self::I64(n as i64)
+    }
+}
+
+impl FromScript for u64 {
+    fn from_script(v: ScriptValue) -> Result<Self, ScriptConvertError> {
+        match v {
+            ScriptValue::I64(n) => Ok(n as u64),
+            other => Err(ScriptConvertError {
+                expected: "u64",
+                got: other.variant_name(),
+            }),
+        }
+    }
+}
 
 macro_rules! impl_float_bridge {
     ($($ty:ty),*) => {
         $(
             impl From<$ty> for ScriptValue {
                 fn from(n: $ty) -> Self {
-                    Self::F64(n as f64)
+                    Self::F64(f64::from(n))
                 }
             }
             impl FromScript for $ty {
@@ -341,7 +361,7 @@ impl FromScript for String {
 }
 
 impl From<()> for ScriptValue {
-    fn from(_: ()) -> Self {
+    fn from((): ()) -> Self {
         Self::Unit
     }
 }
@@ -383,11 +403,11 @@ impl<T: FromScript> FromScript for Vec<T> {
     }
 }
 
-impl<V> From<HashMap<String, V>> for ScriptValue
+impl<V, S> From<HashMap<String, V, S>> for ScriptValue
 where
     ScriptValue: From<V>,
 {
-    fn from(m: HashMap<String, V>) -> Self {
+    fn from(m: HashMap<String, V, S>) -> Self {
         Self::Map(
             m.into_iter()
                 .map(|(k, v)| (k, ScriptValue::from(v)))
@@ -396,7 +416,11 @@ where
     }
 }
 
-impl<V: FromScript> FromScript for HashMap<String, V> {
+impl<V, S> FromScript for HashMap<String, V, S>
+where
+    V: FromScript,
+    S: std::hash::BuildHasher + Default,
+{
     fn from_script(v: ScriptValue) -> Result<Self, ScriptConvertError> {
         match v {
             ScriptValue::Map(pairs) => pairs

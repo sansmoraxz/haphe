@@ -15,3 +15,6 @@ syn = { version = "3", features = ["full", "visit", "visit-mut"] }
 
 [dev-dependencies]
 haphe = { path = "../haphe" }
+
+[lints]
+workspace = true

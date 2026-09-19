@@ -203,7 +203,7 @@ macro_rules! idiv_int_impls {
     ($($t:ty),*) => {$(
         impl IDiv for $t {
             type Output = $t;
-            #[allow(unused_comparisons)]
+            #[allow(unused_comparisons, reason = "the macro instantiates over signed and unsigned widths; the negativity check is trivially false for unsigned")]
             fn idiv(self, rhs: $t) -> $t {
                 let q = self / rhs;
                 let r = self % rhs;
@@ -251,7 +251,7 @@ macro_rules! mod_int_impls {
     ($($t:ty),*) => {$(
         impl Mod for $t {
             type Output = $t;
-            #[allow(unused_comparisons)]
+            #[allow(unused_comparisons, reason = "the macro instantiates over signed and unsigned widths; the negativity check is trivially false for unsigned")]
             fn modulo(self, rhs: $t) -> $t {
                 let r = self % rhs;
                 // Truncated and floor modulo differ when the remainder is

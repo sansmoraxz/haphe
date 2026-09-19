@@ -1,5 +1,7 @@
 use haphe::{Script, script};
 
+struct Opaque;
+
 #[derive(Script)]
 #[script(methods)]
 struct Counter {
@@ -8,7 +10,7 @@ struct Counter {
 
 #[script]
 impl Counter {
-    #[script(dyn, instantiate(std::path::PathBuf))]
+    #[script(dyn, instantiate(Opaque))]
     fn echo<T>(&self, value: T) -> T {
         value
     }

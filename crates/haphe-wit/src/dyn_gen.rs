@@ -173,7 +173,10 @@ impl DynCx {
 
     /// Returns the (possibly shared) variant type name for one generic
     /// position, emitting the definition if its shape is new.
-    #[allow(clippy::too_many_arguments)]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "each parameter names one independent emission input; bundling them into an ad-hoc struct would obscure the call sites"
+    )]
     fn variant_for(
         &mut self,
         p: &mut Printer,
@@ -188,7 +191,7 @@ impl DynCx {
     ) -> Result<String, WitGenError> {
         let mut shape: Vec<(String, Option<String>)> = Vec::new();
         for (key, args) in cases {
-            let fenv = plan.fn_env(f, args, env);
+            let fenv = Plan::fn_env(f, args, env);
             let payload = match crate::types::peel_borrowed(pos_ty) {
                 TypeDescriptor::Unit => None,
                 _ => Some(render_type(pos_ty, pos, plan, Some(&fenv), context)?),
@@ -237,7 +240,10 @@ fn case_key_planned(
 /// Type arguments referencing registered types are not supported here, the
 /// same limitation as runtime instance registration. KEEP IN SYNC with
 /// [`case_key_planned`].
-#[cfg_attr(not(feature = "runtime"), allow(dead_code))]
+#[cfg_attr(
+    not(feature = "runtime"),
+    allow(dead_code, reason = "only the runtime host consumes it")
+)]
 pub(crate) fn case_key_plain(args: &[TypeDescriptor<'_>]) -> Result<String, WitGenError> {
     let fragments: Vec<String> = args
         .iter()

@@ -2,6 +2,12 @@
 //! renames, ownership — matched against hand-written descriptors.
 
 #![cfg(feature = "macros")]
+#![allow(
+    clippy::needless_pass_by_value,
+    clippy::unused_self,
+    clippy::doc_markdown,
+    reason = "fixture shapes are dictated by the bridge surface under test: `#[script]` functions receive OWNED values (the boundary contract), methods keep unused receivers, and docs name fixture idents verbatim"
+)]
 
 use haphe::{
     FunctionDescriptor, Ownership, ParamDescriptor, PrimitiveType, PropertyDescriptor, Receiver,
@@ -36,7 +42,10 @@ impl Point {
     }
 
     #[script(rename = "fetch", error_kind = "IOError")]
-    #[allow(dead_code)]
+    #[allow(
+        dead_code,
+        reason = "fixtures are exercised through their generated descriptors and bridge wrappers, not direct calls"
+    )]
     pub async fn fetch_data(&self) -> Result<String, String> {
         Ok(format!("{},{}", self.x, self.y))
     }
@@ -202,13 +211,19 @@ fn getter_only_property_is_readonly() {
 /// functions may keep parameter attributes.
 #[derive(Script)]
 #[script(methods)]
-#[allow(dead_code)]
+#[allow(
+    dead_code,
+    reason = "fixtures are exercised through their generated descriptors and bridge wrappers, not direct calls"
+)]
 struct Gated {
     n: i64,
 }
 
 #[script]
-#[allow(dead_code)]
+#[allow(
+    dead_code,
+    reason = "fixtures are exercised through their generated descriptors and bridge wrappers, not direct calls"
+)]
 impl Gated {
     fn always(&self) -> i64 {
         self.n
@@ -226,7 +241,10 @@ impl Gated {
     }
 
     #[script(skip)]
-    #[allow(dead_code)]
+    #[allow(
+        dead_code,
+        reason = "fixtures are exercised through their generated descriptors and bridge wrappers, not direct calls"
+    )]
     fn hidden(&self, #[script(clone)] factor: f64) -> f64 {
         factor
     }
@@ -326,13 +344,19 @@ fn fallible_constructor() {
 /// `Self` in accessor signatures is substituted before verification.
 #[derive(Script)]
 #[script(methods)]
-#[allow(dead_code)]
+#[allow(
+    dead_code,
+    reason = "fixtures are exercised through their generated descriptors and bridge wrappers, not direct calls"
+)]
 struct Node {
     twin: Option<Box<Node>>,
 }
 
 #[script]
-#[allow(dead_code)]
+#[allow(
+    dead_code,
+    reason = "fixtures are exercised through their generated descriptors and bridge wrappers, not direct calls"
+)]
 impl Node {
     #[script(getter)]
     fn twin(&self) -> Option<Node> {

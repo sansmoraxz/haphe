@@ -1,7 +1,17 @@
-//! LuaLS declaration-stub generation: text assertions over the `---@meta`
+//! `LuaLS` declaration-stub generation: text assertions over the `---@meta`
 //! file, mirroring what the runtime binder exposes.
 
-#![allow(dead_code)]
+#![allow(
+    clippy::needless_pass_by_value,
+    clippy::unused_self,
+    clippy::doc_markdown,
+    clippy::trivially_copy_pass_by_ref,
+    reason = "fixture shapes are dictated by the bridge surface under test: `#[script]` functions receive OWNED values (the boundary contract), methods keep their declared receivers (`&self` on Copy enums included), and docs name fixture idents verbatim"
+)]
+#![allow(
+    dead_code,
+    reason = "fixtures are exercised through their generated descriptors and bridge wrappers, not direct calls"
+)]
 
 use haphe::{Script, script};
 use haphe_lua::{LuaDeclError, LuaDeclGenerator};
@@ -83,6 +93,10 @@ fn pick(name: String, fallback: Option<i64>) -> Vec<i64> {
 }
 
 /// Tags entries.
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "the `Result` IS the surface under test (fallible stub emission)"
+)]
 #[script(error_kind = "TagError")]
 fn tag(entries: std::collections::HashMap<String, i64>) -> Result<String, String> {
     let _ = entries;
@@ -460,7 +474,7 @@ fn pow_and_bitwise_operators_annotated() {
         type Output = Bits;
         fn pow(self, rhs: f64) -> Bits {
             Bits {
-                raw: (self.raw as f64).powf(rhs) as u32,
+                raw: f64::from(self.raw).powf(rhs) as u32,
             }
         }
     }

@@ -160,6 +160,10 @@ impl BackendCapabilities {
     ///
     /// Returns `Ok(())` if the registry is compatible, or a list of
     /// [`CompatibilityError`]s describing every mismatch.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one exhaustive validation pass per descriptor kind; splitting the walk would scatter the per-kind rules"
+    )]
     pub fn check<'a>(
         &self,
         registry: &ValidatedRegistry<'a>,
@@ -255,7 +259,7 @@ impl BackendCapabilities {
                 errors.push(CompatibilityError::UnsupportedProperties { type_id: s.id });
             }
             if let Some(required) = self.required_thread_safety
-                && !meets_thread_safety(&s.thread_safety, &required)
+                && !meets_thread_safety(s.thread_safety, required)
             {
                 errors.push(CompatibilityError::InsufficientThreadSafety {
                     type_id: s.id,
@@ -308,7 +312,7 @@ impl BackendCapabilities {
                 }
             }
             if let Some(required) = self.required_thread_safety
-                && !meets_thread_safety(&e.thread_safety, &required)
+                && !meets_thread_safety(e.thread_safety, required)
             {
                 errors.push(CompatibilityError::InsufficientThreadSafety {
                     type_id: e.id,
@@ -354,7 +358,7 @@ impl BackendCapabilities {
                 &mut errors,
             );
             if let Some(required) = self.required_thread_safety
-                && !meets_thread_safety(&fi.thread_safety, &required)
+                && !meets_thread_safety(fi.thread_safety, required)
             {
                 errors.push(CompatibilityError::InsufficientThreadSafety {
                     type_id: fi.id,
@@ -587,9 +591,9 @@ fn contains_callback(ty: &TypeDescriptor<'_>) -> bool {
         TypeDescriptor::Option(inner)
         | TypeDescriptor::List(inner)
         | TypeDescriptor::Stream(inner)
-        | TypeDescriptor::Future(inner) => contains_callback(inner),
-        TypeDescriptor::Array(inner, _) => contains_callback(inner),
-        TypeDescriptor::Borrowed { inner, .. } => contains_callback(inner),
+        | TypeDescriptor::Future(inner)
+        | TypeDescriptor::Array(inner, _)
+        | TypeDescriptor::Borrowed { inner, .. } => contains_callback(inner),
         TypeDescriptor::Map(k, v) | TypeDescriptor::Result(k, v) => {
             contains_callback(k) || contains_callback(v)
         }
@@ -642,10 +646,11 @@ fn variant_payload_matches(
 fn contains_future(ty: &TypeDescriptor<'_>) -> bool {
     match ty {
         TypeDescriptor::Future(_) => true,
-        TypeDescriptor::Stream(inner) => contains_future(inner),
-        TypeDescriptor::Option(inner) | TypeDescriptor::List(inner) => contains_future(inner),
-        TypeDescriptor::Array(inner, _) => contains_future(inner),
-        TypeDescriptor::Borrowed { inner, .. } => contains_future(inner),
+        TypeDescriptor::Stream(inner)
+        | TypeDescriptor::Option(inner)
+        | TypeDescriptor::List(inner)
+        | TypeDescriptor::Array(inner, _)
+        | TypeDescriptor::Borrowed { inner, .. } => contains_future(inner),
         TypeDescriptor::Map(k, v) | TypeDescriptor::Result(k, v) => {
             contains_future(k) || contains_future(v)
         }
@@ -667,10 +672,11 @@ fn contains_future(ty: &TypeDescriptor<'_>) -> bool {
 fn contains_stream(ty: &TypeDescriptor<'_>) -> bool {
     match ty {
         TypeDescriptor::Stream(_) => true,
-        TypeDescriptor::Future(inner) => contains_stream(inner),
-        TypeDescriptor::Option(inner) | TypeDescriptor::List(inner) => contains_stream(inner),
-        TypeDescriptor::Array(inner, _) => contains_stream(inner),
-        TypeDescriptor::Borrowed { inner, .. } => contains_stream(inner),
+        TypeDescriptor::Future(inner)
+        | TypeDescriptor::Option(inner)
+        | TypeDescriptor::List(inner)
+        | TypeDescriptor::Array(inner, _)
+        | TypeDescriptor::Borrowed { inner, .. } => contains_stream(inner),
         TypeDescriptor::Map(k, v) | TypeDescriptor::Result(k, v) => {
             contains_stream(k) || contains_stream(v)
         }
@@ -689,7 +695,7 @@ fn contains_stream(ty: &TypeDescriptor<'_>) -> bool {
     }
 }
 
-fn meets_thread_safety(actual: &ThreadSafety, required: &ThreadSafety) -> bool {
+fn meets_thread_safety(actual: ThreadSafety, required: ThreadSafety) -> bool {
     (!required.is_send || actual.is_send) && (!required.is_sync || actual.is_sync)
 }
 
@@ -759,6 +765,10 @@ pub enum CompatibilityError<'a> {
 }
 
 impl std::fmt::Display for CompatibilityError<'_> {
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one rendering arm per error kind; length tracks the error surface"
+    )]
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::DynGenericsUnsupported { function } => write!(

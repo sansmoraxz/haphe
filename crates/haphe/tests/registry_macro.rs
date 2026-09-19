@@ -70,6 +70,10 @@ haphe::registry! {
                 constants: [
                     /// Default scale factor.
                     SCALE: f64 = 2.5,
+                    /// Spelled with separators and a suffix; the descriptor
+                    /// carries the canonical value backends can `parse`.
+                    LIMIT: f64 = 1_000.5f64,
+                    MAX_ITEMS: i64 = 25_000i64,
                 ],
                 modules: [
                     mod inner {
@@ -122,6 +126,12 @@ fn registry_contents() {
     assert_eq!(scale.doc, Some("Default scale factor."));
     assert_eq!(*scale.ty, TypeDescriptor::Primitive(PrimitiveType::F64));
     assert_eq!(scale.value, "2.5");
+    let limit = &module.constants[1];
+    assert_eq!(limit.value, "1000.5");
+    assert_eq!(limit.value.parse::<f64>().ok(), Some(1000.5));
+    let max_items = &module.constants[2];
+    assert_eq!(max_items.value, "25000");
+    assert_eq!(max_items.value.parse::<i64>().ok(), Some(25000));
 
     let notifier = &REGISTRY.foreign_interfaces()[0];
     assert_eq!(notifier.name, "Notifier");

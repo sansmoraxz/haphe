@@ -229,11 +229,16 @@ impl Parse for RegistryInput {
     }
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "expansion drivers assemble one `quote!` output from many interdependent pieces; splitting them hurts locality more than length hurts readability"
+)]
 fn module_expr(module: &ModuleInput) -> TokenStream {
     let name = module.name.unraw().to_string();
-    let doc = match &module.doc {
-        Some(text) => quote! { ::core::option::Option::Some(#text) },
-        None => quote! { ::core::option::Option::None },
+    let doc = if let Some(text) = &module.doc {
+        quote! { ::core::option::Option::Some(#text) }
+    } else {
+        quote! { ::core::option::Option::None }
     };
     // Functions resolve through the `ScriptFunction` trait on the hidden type
     // `#[script]` emits next to each free fn; the type shares the fn's name,
@@ -250,8 +255,9 @@ fn module_expr(module: &ModuleInput) -> TokenStream {
         let args = stripped
             .segments
             .last_mut()
-            .map(|last| std::mem::replace(&mut last.arguments, syn::PathArguments::None))
-            .unwrap_or(syn::PathArguments::None);
+            .map_or(syn::PathArguments::None, |last| {
+                std::mem::replace(&mut last.arguments, syn::PathArguments::None)
+            });
         if seen_fn_paths.insert(stripped.to_token_stream().to_string()) {
             functions.push(quote_spanned! {path.span()=>
                 <#stripped as ::haphe::ScriptFunction>::DESCRIPTOR
@@ -320,7 +326,7 @@ fn module_expr(module: &ModuleInput) -> TokenStream {
         .flatten()
         .map(|c| {
             let name = c.name.unraw().to_string();
-            let doc = option_str_tokens(&c.doc);
+            let doc = option_str_tokens(c.doc.as_deref());
             let ty = &c.ty;
             let (value, check) = match &c.value {
                 // A string constant's value is the string itself (the declared
@@ -347,7 +353,17 @@ fn module_expr(module: &ModuleInput) -> TokenStream {
                     let ty_check = quote_spanned! {lit.span()=>
                         { const _: #ty = #lit; }
                     };
-                    (lit.to_token_stream().to_string(), ty_check)
+                    // Canonical value, not source spelling: `1_000.5f64`
+                    // carries as "1000.5" — backends `str::parse` it, and
+                    // separators/suffixes would break the parse.
+                    let rendered = match lit {
+                        Lit::Int(i) => i.base10_digits().to_string(),
+                        Lit::Float(f) => f.base10_digits().to_string(),
+                        Lit::Bool(b) => b.value.to_string(),
+                        Lit::Char(c) => c.value().to_string(),
+                        other => other.to_token_stream().to_string(),
+                    };
+                    (rendered, ty_check)
                 }
             };
             quote_spanned! {c.ty.span()=>
@@ -412,14 +428,14 @@ fn type_args(ty: &Type) -> Vec<&Type> {
 /// Erased descriptors (deduped by stripped path) plus one instantiation
 /// record per entry that carries type arguments.
 fn descs_and_instantiations(
-    types: &Option<Vec<Type>>,
-    script_trait: TokenStream,
+    types: Option<&[Type]>,
+    script_trait: &TokenStream,
     id_expr: impl Fn(&Type) -> TokenStream,
     instantiations: &mut Vec<TokenStream>,
 ) -> Vec<TokenStream> {
     let mut seen = std::collections::HashSet::new();
     let mut descs = Vec::new();
-    for ty in types.iter().flatten() {
+    for ty in types.into_iter().flatten() {
         if seen.insert(stripped_path_key(ty)) {
             descs.push(quote_spanned! {ty.span()=> <#ty as ::haphe::#script_trait>::DESCRIPTOR });
         }
@@ -437,7 +453,11 @@ fn descs_and_instantiations(
     descs
 }
 
-pub fn expand(input: RegistryInput) -> TokenStream {
+#[allow(
+    clippy::too_many_lines,
+    reason = "expansion drivers assemble one `quote!` output from many interdependent pieces; splitting them hurts locality more than length hurts readability"
+)]
+pub fn expand(input: &RegistryInput) -> TokenStream {
     let RegistryInput {
         attrs,
         vis,
@@ -451,14 +471,14 @@ pub fn expand(input: RegistryInput) -> TokenStream {
     let mut instantiations = Vec::new();
     let script_type_id = |ty: &Type| quote_spanned! {ty.span()=> <#ty as ::haphe::ScriptType>::ID };
     let struct_descs = descs_and_instantiations(
-        structs,
-        quote!(ScriptStruct),
+        structs.as_deref(),
+        &quote!(ScriptStruct),
         script_type_id,
         &mut instantiations,
     );
     let enum_descs = descs_and_instantiations(
-        enums,
-        quote!(ScriptEnum),
+        enums.as_deref(),
+        &quote!(ScriptEnum),
         script_type_id,
         &mut instantiations,
     );
@@ -469,8 +489,8 @@ pub fn expand(input: RegistryInput) -> TokenStream {
         .collect();
     let module_descs: Vec<_> = modules.iter().flatten().map(module_expr).collect();
     let foreign_descs = descs_and_instantiations(
-        foreign,
-        quote!(ScriptForeign),
+        foreign.as_deref(),
+        &quote!(ScriptForeign),
         |ty| quote_spanned! {ty.span()=> <#ty as ::haphe::ScriptForeign>::DESCRIPTOR.id },
         &mut instantiations,
     );

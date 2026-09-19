@@ -64,6 +64,22 @@ pub(crate) fn is_std_path(path: &syn::Path) -> bool {
         )
 }
 
+/// The std ident a type names — its bare or `std`/`alloc`/`core`-qualified
+/// last segment (without type arguments) — for matching against the tables
+/// here. `None` for namespaced paths, qualified-self types, and segments
+/// carrying arguments.
+pub(crate) fn std_ident(ty: &Type) -> Option<&syn::Ident> {
+    let Type::Path(p) = ty else { return None };
+    if p.qself.is_some() || !is_std_path(&p.path) {
+        return None;
+    }
+    let last = p.path.segments.last()?;
+    if !last.arguments.is_none() {
+        return None;
+    }
+    Some(&last.ident)
+}
+
 /// A transparent carrier's parts: its declared lifetime argument (if any)
 /// and the single carried type. `None` when `ty` is not a recognized std
 /// carrier.
