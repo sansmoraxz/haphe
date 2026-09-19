@@ -1394,11 +1394,13 @@ pub(crate) fn block_on<F: std::future::Future>(fut: F) -> F::Output {
 }
 
 /// Renders a wrapper-channel error into a trap message: conversion failures
-/// like [`trap_convert`], Host errors as their kind-prefixed rendering.
+/// like [`trap_convert`], Callee errors as their kind-prefixed rendering
+/// (reached only from result-less shapes — fallible surfaces lower Callee
+/// errors into their `result` err arm instead).
 pub(crate) fn trap_call(name: &str, e: Ce) -> wasmtime::Error {
     match e {
         ScriptCallError::Convert(e) => trap_convert(name, &e),
-        host @ ScriptCallError::Host { .. } => {
+        host @ ScriptCallError::Callee { .. } => {
             wasmtime::Error::msg(format!("haphe-wit: `{name}`: {host}"))
         }
     }

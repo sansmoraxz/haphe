@@ -34,6 +34,7 @@ static POINT_METHODS: [FunctionDescriptor<'static>; 1] = [FunctionDescriptor {
     return_ownership: Ownership::Owned,
     is_async: false,
     error_kind: None,
+    fallible: false,
 }];
 
 static POINT_FIELDS: [FieldDescriptor<'static>; 2] = [
@@ -225,6 +226,7 @@ fn module_tree() {
         return_ownership: Ownership::Owned,
         is_async: false,
         error_kind: None,
+        fallible: false,
     }];
     static PI_TYPE: TypeDescriptor<'static> = TypeDescriptor::Primitive(PrimitiveType::F64);
     static CONSTS: [ConstantDescriptor<'static>; 1] = [ConstantDescriptor {
@@ -405,6 +407,7 @@ fn validate_catches_dangling_ref_in_method_param() {
         return_ownership: Ownership::Owned,
         is_async: false,
         error_kind: None,
+        fallible: false,
     }];
     static STRUCTS: [StructDescriptor<'static>; 1] = [StructDescriptor {
         id: TypeId::new("HasBadMethod"),
@@ -576,6 +579,7 @@ fn async_function_descriptor() {
         return_ownership: Ownership::Owned,
         is_async: true,
         error_kind: None,
+        fallible: false,
     };
 
     assert!(FN_DESC.is_async);
@@ -622,6 +626,7 @@ fn constructors_on_struct() {
         return_ownership: Ownership::Owned,
         is_async: false,
         error_kind: None,
+        fallible: false,
     }];
     static STRUCTS: [StructDescriptor<'static>; 1] = [StructDescriptor {
         id: TypeId::new("Point"),
@@ -665,6 +670,7 @@ fn validate_catches_dangling_ref_in_constructor() {
         return_ownership: Ownership::Owned,
         is_async: false,
         error_kind: None,
+        fallible: false,
     }];
     static STRUCTS: [StructDescriptor<'static>; 1] = [StructDescriptor {
         id: TypeId::new("Bad"),
@@ -864,6 +870,7 @@ fn error_kind_on_function() {
         return_ownership: Ownership::Owned,
         is_async: false,
         error_kind: Some("ValueError"),
+        fallible: false,
     };
 
     assert_eq!(FN_DESC.error_kind, Some("ValueError"));
@@ -1196,6 +1203,7 @@ fn ownership_on_params_and_return() {
         return_ownership: Ownership::Owned,
         is_async: false,
         error_kind: None,
+        fallible: false,
     };
 
     assert_eq!(FN_DESC.params[0].ownership, Ownership::Clone);
@@ -1308,6 +1316,7 @@ fn capability_check_catches_unsupported_async() {
         return_ownership: Ownership::Owned,
         is_async: true,
         error_kind: None,
+        fallible: false,
     }];
     static STRUCTS: [StructDescriptor<'static>; 1] = [StructDescriptor {
         id: TypeId::new("Fetcher"),

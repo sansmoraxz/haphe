@@ -1,6 +1,6 @@
 //! Fallible surfaces: `Result<T, E>` constructors, methods, and free
 //! functions bind, describing `T` and mapping `Err` into
-//! [`ScriptCallError::Host`] (rendered via `Display`, tagged with the
+//! [`ScriptCallError::Callee`] (rendered via `Display`, tagged with the
 //! declared `error_kind`).
 
 #![cfg(feature = "macros")]
@@ -257,41 +257,41 @@ struct Gauge {
 #[script]
 impl Gauge {
     #[script(constructor, error_kind = "ValueError")]
-    fn new(level: i64) -> Result<Self, String> {
+    fn new(level: i64) -> Result<Self, TextError> {
         if level < 0 {
-            Err(format!("negative level {level}"))
+            Err(TextError(format!("negative level {level}")))
         } else {
             Ok(Gauge { level })
         }
     }
 
     #[script(constructor)]
-    async fn fetch(level: i64) -> Result<Self, String> {
+    async fn fetch(level: i64) -> Result<Self, TextError> {
         if level < 0 {
-            Err("negative".to_string())
+            Err(TextError("negative".into()))
         } else {
             Ok(Gauge { level })
         }
     }
 
     #[script(error_kind = "RangeError")]
-    fn checked_add(&self, amount: i64) -> Result<i64, String> {
+    fn checked_add(&self, amount: i64) -> Result<i64, TextError> {
         self.level
             .checked_add(amount)
-            .ok_or_else(|| "overflow".to_string())
+            .ok_or_else(|| TextError("overflow".into()))
     }
 
-    fn drain(&mut self, amount: i64) -> Result<(), String> {
+    fn drain(&mut self, amount: i64) -> Result<(), TextError> {
         if amount > self.level {
-            return Err("insufficient".to_string());
+            return Err(TextError("insufficient".into()));
         }
         self.level -= amount;
         Ok(())
     }
 
-    async fn refresh(&self) -> Result<i64, String> {
+    async fn refresh(&self) -> Result<i64, TextError> {
         if self.level == 0 {
-            Err("empty".to_string())
+            Err(TextError("empty".into()))
         } else {
             Ok(self.level)
         }
@@ -307,6 +307,7 @@ fn descriptors_see_the_ok_type() {
         .unwrap();
     assert!(!matches!(*ctor.return_type, TypeDescriptor::Result(..)));
     assert_eq!(ctor.error_kind, Some("ValueError"));
+    assert!(ctor.fallible);
     let add = <Gauge as ScriptImpl>::METHODS
         .iter()
         .find(|m| m.name == "checked_add")
@@ -324,11 +325,11 @@ fn fallible_constructor_maps_err_to_host() {
     assert_eq!(name, "new");
     assert_eq!(ctor(&[ScriptValue::I64(3)]).unwrap().level, 3);
     match ctor(&[ScriptValue::I64(-1)]).unwrap_err() {
-        ScriptCallError::Host { message, kind } => {
+        ScriptCallError::Callee { error, kind, .. } => {
             assert_eq!(kind, Some("ValueError"));
-            assert!(message.contains("negative level -1"));
+            assert!(error.to_string().contains("negative level -1"));
         }
-        ScriptCallError::Convert(other) => panic!("expected Host error, got {other:?}"),
+        ScriptCallError::Convert(other) => panic!("expected Callee error, got {other:?}"),
     }
 }
 
@@ -339,7 +340,7 @@ fn fallible_async_constructor_maps_err_to_host() {
     assert_eq!(name, "fetch");
     assert_eq!(poll_ready(ctor(&[ScriptValue::I64(5)])).unwrap().level, 5);
     match poll_ready(ctor(&[ScriptValue::I64(-1)])).unwrap_err() {
-        ScriptCallError::Host { kind: None, .. } => {}
+        ScriptCallError::Callee { kind: None, .. } => {}
         other => panic!("expected kind-less Host error, got {other:?}"),
     }
 }
@@ -361,11 +362,11 @@ fn fallible_methods_map_err_to_host() {
     )
     .unwrap_err()
     {
-        ScriptCallError::Host { message, kind } => {
+        ScriptCallError::Callee { error, kind, .. } => {
             assert_eq!(kind, Some("RangeError"));
-            assert_eq!(message, "overflow");
+            assert_eq!(error.to_string(), "overflow");
         }
-        ScriptCallError::Convert(other) => panic!("expected Host error, got {other:?}"),
+        ScriptCallError::Convert(other) => panic!("expected Callee error, got {other:?}"),
     }
 }
 
@@ -380,7 +381,7 @@ fn fallible_unit_methods_yield_unit_on_ok() {
     assert_eq!(gauge.level, 6);
     assert!(matches!(
         f(&mut gauge, &[ScriptValue::I64(100)]).unwrap_err(),
-        ScriptCallError::Host { kind: None, .. }
+        ScriptCallError::Callee { kind: None, .. }
     ));
 }
 
@@ -392,8 +393,8 @@ fn fallible_async_methods_map_err_to_host() {
     let gauge = Gauge { level: 0 };
     let args: [ScriptValue; 0] = [];
     match poll_ready(f(haphe::ScriptCow::Borrowed(&gauge), &args)).unwrap_err() {
-        ScriptCallError::Host { message, .. } => assert_eq!(message, "empty"),
-        ScriptCallError::Convert(other) => panic!("expected Host error, got {other:?}"),
+        ScriptCallError::Callee { error, .. } => assert_eq!(error.to_string(), "empty"),
+        ScriptCallError::Convert(other) => panic!("expected Callee error, got {other:?}"),
     }
 }
 
@@ -439,8 +440,8 @@ fn fallible_free_fns_map_err_to_host() {
     let out = f(&[ScriptValue::String("42".into())]).unwrap();
     assert!(matches!(out, ScriptValue::I64(42)));
     match f(&[ScriptValue::String("nope".into())]).unwrap_err() {
-        ScriptCallError::Host { kind, .. } => assert_eq!(kind, Some("ParseError")),
-        ScriptCallError::Convert(other) => panic!("expected Host error, got {other:?}"),
+        ScriptCallError::Callee { kind, .. } => assert_eq!(kind, Some("ParseError")),
+        ScriptCallError::Convert(other) => panic!("expected Callee error, got {other:?}"),
     }
 }
 
@@ -457,10 +458,10 @@ struct Reading {
     dead_code,
     reason = "fixtures are exercised through their generated descriptors and bridge wrappers, not direct calls"
 )]
-fn parse_reading(raw: String) -> Result<Reading, String> {
+fn parse_reading(raw: String) -> Result<Reading, TextError> {
     raw.parse()
         .map(|value| Reading { value })
-        .map_err(|e| e.to_string())
+        .map_err(|e| TextError(e.to_string()))
 }
 
 #[test]
@@ -470,4 +471,103 @@ fn fallible_non_whitelisted_ok_types_compile() {
         *<parse_reading as ScriptFunction>::DESCRIPTOR.return_type,
         TypeDescriptor::Ref(_)
     ));
+}
+
+/// A message-only fixture error: `String` itself no longer crosses (host
+/// errors must implement `std::error::Error`).
+#[derive(Debug)]
+struct TextError(String);
+
+impl std::fmt::Display for TextError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for TextError {}
+
+// ---------------------------------------------------------------------------
+// The error object crosses intact: downcast, source chain, type name
+// ---------------------------------------------------------------------------
+
+#[derive(Debug)]
+struct RootCause;
+
+impl std::fmt::Display for RootCause {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("root cause")
+    }
+}
+
+impl std::error::Error for RootCause {}
+
+#[derive(Debug)]
+struct Layered {
+    source: RootCause,
+}
+
+impl std::fmt::Display for Layered {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("layered failure")
+    }
+}
+
+impl std::error::Error for Layered {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
+#[derive(Script, Clone)]
+#[script(methods)]
+struct Prober {
+    n: i64,
+}
+
+#[script]
+impl Prober {
+    #[script(error_kind = "LayerError")]
+    fn probe(&self) -> Result<i64, Layered> {
+        Err(Layered { source: RootCause })
+    }
+}
+
+#[test]
+fn host_error_crosses_intact() {
+    let binder = bound::<Prober>();
+    let (_, f) = binder
+        .methods
+        .iter()
+        .find(|(n, _)| *n == "probe")
+        .expect("probe bound");
+    let p = Prober { n: 0 };
+    let err = f(haphe::ScriptCow::Borrowed(&p), &[]).unwrap_err();
+
+    // Kind-prefixed Display rendering is unchanged.
+    assert_eq!(err.to_string(), "LayerError: layered failure");
+    assert_eq!(err.message(), "layered failure");
+    // The source chain crosses (the error's own message excluded).
+    assert_eq!(err.cause_chain(), vec!["root cause".to_string()]);
+
+    let ScriptCallError::Callee {
+        error,
+        kind,
+        type_name,
+    } = err
+    else {
+        panic!("expected Callee");
+    };
+    assert_eq!(kind, Some("LayerError"));
+    assert!(type_name.ends_with("Layered"), "{type_name}");
+    // Host-side embedders recover the concrete type.
+    let concrete = error.downcast_ref::<Layered>().expect("downcasts");
+    assert_eq!(concrete.source.to_string(), "root cause");
+    // And std::error::Error::source on the call error walks into it.
+    let rebuilt = ScriptCallError::Callee {
+        error: error.clone(),
+        kind,
+        type_name,
+    };
+    let source = std::error::Error::source(&rebuilt).expect("host source");
+    assert_eq!(source.to_string(), "layered failure");
 }

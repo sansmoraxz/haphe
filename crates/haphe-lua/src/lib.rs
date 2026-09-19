@@ -163,8 +163,28 @@ impl RuntimeBinder for LuaBinder {
             globals.set(module.name, table).map_err(LuaBindError::Lua)?;
         }
 
+        install_error_info(runtime)?;
+
         Ok(())
     }
+}
+
+/// Installs the `haphe_error` global: callee errors cross as external error
+/// values rendering as "Kind: message" through `tostring(e)`, and
+/// `haphe_error(e)` decodes one caught by `pcall` into `{ message, kind?,
+/// type, chain }` — `kind` the declared `error_kind`, `type` the concrete
+/// Rust error type's name, `chain` the rendered `source()` cause chain.
+/// Returns `nil` for anything that is not a callee error.
+///
+/// [`RuntimeBinder::bind`] installs this automatically; call it directly
+/// when composing a state through [`bind_type`]/[`bind_fn`] alone.
+pub fn install_error_info(lua: &mlua::Lua) -> Result<(), LuaBindError> {
+    let error_info = lua
+        .create_function(error::error_info)
+        .map_err(LuaBindError::Lua)?;
+    lua.globals()
+        .set("haphe_error", error_info)
+        .map_err(LuaBindError::Lua)
 }
 
 /// Registers a type's fields, methods, constructors, and metamethods into

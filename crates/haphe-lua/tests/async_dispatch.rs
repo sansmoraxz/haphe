@@ -36,6 +36,28 @@ impl Toggle {
         tokio::task::yield_now().await;
         self.powered = next;
     }
+
+    /// Fallible sync dispatch: `Err` crosses as a Lua error carrying the
+    /// kind-prefixed rendered message.
+    #[script(error_kind = "ToggleError")]
+    fn checked_toggle(&self, next: Flag) -> Result<Flag, TextError> {
+        if next.0 {
+            Ok(Flag(!self.powered.0))
+        } else {
+            Err(TextError("off is not allowed".into()))
+        }
+    }
+
+    /// Fallible async dispatch: same mapping through the boxed future.
+    #[script(error_kind = "LateError")]
+    async fn checked_set(&self, next: Flag) -> Result<Flag, TextError> {
+        tokio::task::yield_now().await;
+        if next.0 {
+            Ok(next)
+        } else {
+            Err(TextError("cannot unset later".into()))
+        }
+    }
 }
 
 /// Newtype-typed async free fn: dispatch-registered via `function_async`.
@@ -98,6 +120,54 @@ mod with_async {
     }
 
     #[tokio::test]
+    async fn newtype_fallible_sync_method_ok_and_err() {
+        let lua = Lua::new();
+        env(&lua);
+        let (out, is_bool): (bool, bool) = lua
+            .load("local v = t:checked_toggle(true) return v, type(v) == 'boolean'")
+            .eval_async()
+            .await
+            .unwrap();
+        assert!(!out, "toggled off from powered");
+        assert!(is_bool, "Ok value crosses as a native boolean");
+        let (ok, err): (bool, String) = lua
+            .load("local ok, e = pcall(function() return t:checked_toggle(false) end) return ok, tostring(e)")
+            .eval_async()
+            .await
+            .unwrap();
+        assert!(!ok);
+        assert!(
+            err.contains("ToggleError: off is not allowed"),
+            "kind-prefixed message, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn newtype_fallible_async_method_ok_and_err() {
+        let lua = Lua::new();
+        env(&lua);
+        let out: bool = lua
+            .load("return t:checked_set(true)")
+            .eval_async()
+            .await
+            .unwrap();
+        assert!(out);
+        // The async call yields through the coroutine machinery, so the error
+        // is inspected host-side rather than through `pcall` (yields across
+        // `pcall` are version-dependent).
+        let err = lua
+            .load("return t:checked_set(false)")
+            .eval_async::<mlua::Value>()
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("LateError: cannot unset later"),
+            "kind-prefixed message, got {msg:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn newtype_async_method_wrong_arg_errors() {
         let lua = Lua::new();
         env(&lua);
@@ -109,3 +179,16 @@ mod with_async {
         );
     }
 }
+
+/// A message-only fixture error: `String` itself no longer crosses (host
+/// errors must implement `std::error::Error`).
+#[derive(Debug)]
+struct TextError(String);
+
+impl std::fmt::Display for TextError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for TextError {}

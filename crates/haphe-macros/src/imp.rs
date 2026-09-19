@@ -188,8 +188,9 @@ pub fn expand(mut item: ItemImpl) -> TokenStream {
         let info_ctx = if has_fn_generics { &fn_ctx } else { &ctx };
         // A `Result<T, E>` return is fallible: the descriptor and the bridge
         // see `T` (mirroring foreign methods — the host receives the value
-        // or a Host error rendered from `E` via Display, tagged with the
-        // declared `error_kind`), so `E` needs no bridge representation.
+        // or a Callee error carrying `E` intact, tagged with the declared
+        // `error_kind`), so `E` needs no bridge representation — only
+        // `std::error::Error + Send + Sync`.
         let fallible = matches!(
             &func.sig.output,
             syn::ReturnType::Type(_, ret) if crate::fn_desc::result_types(ret).is_some()
@@ -199,15 +200,15 @@ pub fn expand(mut item: ItemImpl) -> TokenStream {
             if let syn::ReturnType::Type(_, ret) = &func.sig.output
                 && let Some((ok, err)) = crate::fn_desc::result_types(ret)
             {
-                // The error crosses as a rendered message: `E: Display` is
-                // the only requirement, checked here so the failure points
-                // at the declared error type.
+                // The error crosses intact: `E: Error + Send + Sync` is the
+                // requirement, checked here so the failure points at the
+                // declared error type.
                 if !has_fn_generics && !has_type_params {
                     let err = crate::ty_map::substitute_self(err, info_ctx);
                     probes.push(quote_spanned! {err.span()=>
                         const _: () = {
-                            fn __haphe_fallible_error_is_display<__E: ::core::fmt::Display>() {}
-                            let _ = __haphe_fallible_error_is_display::<#err>;
+                            fn __haphe_fallible_error_bound<__E: ::std::error::Error + ::core::marker::Send + ::core::marker::Sync + 'static>() {}
+                            let _ = __haphe_fallible_error_bound::<#err>;
                         };
                     });
                 }
@@ -219,11 +220,25 @@ pub fn expand(mut item: ItemImpl) -> TokenStream {
                     syn::parse_quote! { -> #ok }
                 };
             }
-            let info = build_fn_info(&mut desc_sig, &fn_args, &func.attrs, info_ctx, &mut errors);
+            let info = build_fn_info(
+                &mut desc_sig,
+                &fn_args,
+                &func.attrs,
+                info_ctx,
+                true,
+                &mut errors,
+            );
             strip_param_script_attrs(&mut func.sig);
             info
         } else {
-            build_fn_info(&mut func.sig, &fn_args, &func.attrs, info_ctx, &mut errors)
+            build_fn_info(
+                &mut func.sig,
+                &fn_args,
+                &func.attrs,
+                info_ctx,
+                false,
+                &mut errors,
+            )
         };
         let Some(info) = info else {
             continue;
@@ -275,7 +290,7 @@ pub fn expand(mut item: ItemImpl) -> TokenStream {
                 });
             }
             // Bridge: register non-cfg-gated constructors; a fallible one
-            // maps its `Err` into a Host error inside the wrapper.
+            // maps its `Err` into a Callee error inside the wrapper.
             if cfgs.is_empty() {
                 let bind = extract_bind_method(func, &info, fallible, &fn_args);
                 if info.is_async {
@@ -461,12 +476,12 @@ pub fn expand(mut item: ItemImpl) -> TokenStream {
                     // dispatch, like sync methods.
                     if !has_type_params && is_bind_compatible(func, &info) {
                         async_methods.push(extract_bind_method(func, &info, fallible, &fn_args));
-                    } else if !has_type_params && !fallible && is_dispatch_eligible(func, &info) {
+                    } else if !has_type_params && is_dispatch_eligible(func, &info) {
                         dispatch_methods.push(extract_bind_method(func, &info, fallible, &fn_args));
                     }
                 } else if has_type_params || is_bind_compatible(func, &info) {
                     bind_methods.push(extract_bind_method(func, &info, fallible, &fn_args));
-                } else if !has_type_params && !fallible && is_dispatch_eligible(func, &info) {
+                } else if !has_type_params && is_dispatch_eligible(func, &info) {
                     // Types the whitelist can't judge (e.g. transparent
                     // primitive newtypes): registration is decided by
                     // compile-time trait-presence dispatch instead.

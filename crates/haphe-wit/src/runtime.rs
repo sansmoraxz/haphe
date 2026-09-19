@@ -1353,6 +1353,47 @@ fn call_error(function: &'static str, message: String) -> ForeignError {
     }
 }
 
+/// Decodes a guest-authored `script-error` record into the uniform
+/// [`ForeignFailure`] downcast target. `None` when the value is not
+/// record-shaped or a field is missing/mistyped — the caller falls back to
+/// the rendered-message path.
+fn lift_foreign_failure(fields: &[(String, Val)]) -> Option<haphe::ForeignFailure> {
+    let mut kind = None;
+    let mut message = None;
+    let mut type_name = None;
+    let mut chain = None;
+    for (name, val) in fields {
+        match (name.as_str(), val) {
+            ("kind", Val::Option(inner)) => {
+                kind = Some(match inner {
+                    Some(boxed) => match boxed.as_ref() {
+                        Val::String(s) => Some(s.clone()),
+                        _ => return None,
+                    },
+                    None => None,
+                });
+            }
+            ("message", Val::String(s)) => message = Some(s.clone()),
+            ("type-name", Val::String(s)) => type_name = Some(s.clone()),
+            ("chain", Val::List(items)) => {
+                let mut rendered = Vec::with_capacity(items.len());
+                for item in items {
+                    let Val::String(s) = item else { return None };
+                    rendered.push(s.clone());
+                }
+                chain = Some(rendered);
+            }
+            _ => return None,
+        }
+    }
+    Some(haphe::ForeignFailure {
+        kind: kind?,
+        message: message?,
+        type_name: type_name?,
+        chain: chain?,
+    })
+}
+
 fn convert_error(function: &'static str, e: ScriptConvertError) -> ForeignError {
     ForeignError {
         function,
@@ -1602,13 +1643,24 @@ impl<T: 'static> CallerInner<T> {
     ) -> Result<ScriptValue, ForeignError> {
         match results.into_iter().next() {
             None => Ok(ScriptValue::Unit),
-            // An `error_kind` return is wrapped in `result<T>` by the
-            // generator: unwrap the payload, mapping the guest's error case
-            // into the host error channel.
+            // A fallible declaration is wrapped in `result<T, script-error>`
+            // by the generator: unwrap the payload, lifting the guest's
+            // authored error record into the uniform [`ForeignFailure`]
+            // downcast target; a payload that is not the record shape falls
+            // back to the rendered-message path.
             Some(Val::Result(r)) if matches!(f.result, Some(Type::Result(_))) => match r {
                 Ok(Some(v)) => self.lift(&v).map_err(|e| convert_error(function, e)),
                 Ok(None) => Ok(ScriptValue::Unit),
                 Err(payload) => {
+                    if let Some(boxed) = &payload
+                        && let Val::Record(fields) = boxed.as_ref()
+                        && let Some(failure) = lift_foreign_failure(fields)
+                    {
+                        return Err(ForeignError {
+                            function,
+                            kind: ForeignErrorKind::Call(Box::new(failure)),
+                        });
+                    }
                     let detail = match payload {
                         Some(v) => match self.lift(&v) {
                             Ok(ScriptValue::String(s)) => s,
@@ -2397,6 +2449,70 @@ fn trap(name: &str, detail: &str) -> wasmtime::Error {
     wasmtime::Error::msg(format!("haphe-wit: `{name}`: {detail}"))
 }
 
+/// Builds the guest-visible `script-error` record value for a Callee error.
+/// Field order mirrors the generator's record definition.
+fn callee_error_val(err: &ScriptCallError) -> Val {
+    let (kind, type_name) = match err {
+        ScriptCallError::Callee {
+            kind, type_name, ..
+        } => (*kind, *type_name),
+        ScriptCallError::Convert(_) => (None, "conversion"),
+    };
+    Val::Record(vec![
+        (
+            "kind".to_string(),
+            Val::Option(kind.map(|k| Box::new(Val::String(k.to_string())))),
+        ),
+        ("message".to_string(), Val::String(err.message())),
+        ("type-name".to_string(), Val::String(type_name.to_string())),
+        (
+            "chain".to_string(),
+            Val::List(err.cause_chain().into_iter().map(Val::String).collect()),
+        ),
+    ])
+}
+
+/// Lowers a call outcome into the declared return shape. A `result<..>`
+/// return — the generator's rendering of a FALLIBLE surface — carries `Ok`
+/// in the ok arm and Callee errors in the err arm as the `script-error`
+/// record (guest-visible errors); conversion errors always trap, boundary
+/// misuse is not a guest-visible outcome. Any other shape traps on every
+/// call error, as infallible surfaces always have.
+fn lower_call_outcome<S: AsContextMut, I: Iterator<Item = Type>>(
+    cx: &DispatchCx,
+    store: &mut S,
+    mut result_types: I,
+    outcome: Result<ScriptValue, ScriptCallError>,
+    results: &mut [Val],
+    name: &str,
+) -> wasmtime::Result<()> {
+    let Some(rty) = result_types.next() else {
+        outcome.map_err(|e| trap_call(name, e))?;
+        return Ok(());
+    };
+    if let Type::Result(rt) = &rty {
+        results[0] = match outcome {
+            Ok(out) => match rt.ok() {
+                Some(ok_ty) => {
+                    let ok = cx
+                        .lower(store, &out, &ok_ty)
+                        .map_err(|e| trap_convert(name, &e))?;
+                    Val::Result(Ok(Some(Box::new(ok))))
+                }
+                None => Val::Result(Ok(None)),
+            },
+            Err(e @ ScriptCallError::Convert(_)) => return Err(trap_call(name, e)),
+            Err(host) => Val::Result(Err(Some(Box::new(callee_error_val(&host))))),
+        };
+        return Ok(());
+    }
+    let out = outcome.map_err(|e| trap_call(name, e))?;
+    results[0] = cx
+        .lower(store, &out, &rty)
+        .map_err(|e| trap_convert(name, &e))?;
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // dyn-generics: synthesized dispatcher dispatch (feature `dyn-generics`)
 // ---------------------------------------------------------------------------
@@ -2631,13 +2747,29 @@ fn define_dyn_value_fn<T: 'static>(
             match (cands[i].1)(&values) {
                 Ok(out) => {
                     let out = wrap_dyn_result(desc, &cands[i].0.key, out);
-                    return lower_result(&cx, &mut store, fty.results(), &out, results, &msg);
+                    return lower_call_outcome(
+                        &cx,
+                        &mut store,
+                        fty.results(),
+                        Ok(out),
+                        results,
+                        &msg,
+                    );
                 }
                 // A convert error means the candidate rejected the
-                // arguments — fall through. A Host error is the matched
+                // arguments — fall through. A Callee error is the matched
                 // implementation's own failure: propagate it.
                 Err(ScriptCallError::Convert(e)) => last = Some(e),
-                Err(host) => return Err(trap_call(&msg, host)),
+                Err(host) => {
+                    return lower_call_outcome(
+                        &cx,
+                        &mut store,
+                        fty.results(),
+                        Err(host),
+                        results,
+                        &msg,
+                    );
+                }
             }
         }
         Err(no_candidate_trap(&msg, last))
@@ -2666,13 +2798,29 @@ fn define_dyn_value_fn_async<T: 'static>(
             match block_on((cands[i].1)(&values)) {
                 Ok(out) => {
                     let out = wrap_dyn_result(desc, &cands[i].0.key, out);
-                    return lower_result(&cx, &mut store, fty.results(), &out, results, &msg);
+                    return lower_call_outcome(
+                        &cx,
+                        &mut store,
+                        fty.results(),
+                        Ok(out),
+                        results,
+                        &msg,
+                    );
                 }
                 // A convert error means the candidate rejected the
-                // arguments — fall through. A Host error is the matched
+                // arguments — fall through. A Callee error is the matched
                 // implementation's own failure: propagate it.
                 Err(ScriptCallError::Convert(e)) => last = Some(e),
-                Err(host) => return Err(trap_call(&msg, host)),
+                Err(host) => {
+                    return lower_call_outcome(
+                        &cx,
+                        &mut store,
+                        fty.results(),
+                        Err(host),
+                        results,
+                        &msg,
+                    );
+                }
             }
         }
         Err(no_candidate_trap(&msg, last))
@@ -2743,13 +2891,29 @@ fn define_dyn_method<T: 'static>(
             match attempt {
                 Ok(out) => {
                     let out = wrap_dyn_result(desc, &cands[i].0.key, out);
-                    return lower_result(&cx, &mut store, fty.results(), &out, results, &msg);
+                    return lower_call_outcome(
+                        &cx,
+                        &mut store,
+                        fty.results(),
+                        Ok(out),
+                        results,
+                        &msg,
+                    );
                 }
                 // A convert error means the candidate rejected the
-                // arguments — fall through. A Host error is the matched
+                // arguments — fall through. A Callee error is the matched
                 // implementation's own failure: propagate it.
                 Err(ScriptCallError::Convert(e)) => last = Some(e),
-                Err(host) => return Err(trap_call(&msg, host)),
+                Err(host) => {
+                    return lower_call_outcome(
+                        &cx,
+                        &mut store,
+                        fty.results(),
+                        Err(host),
+                        results,
+                        &msg,
+                    );
+                }
             }
         }
         Err(no_candidate_trap(&msg, last))
@@ -2785,13 +2949,29 @@ fn define_enum_dyn_companion<T: 'static>(
             match m(this.clone(), &values) {
                 Ok(out) => {
                     let out = wrap_dyn_result(desc, &cands[i].0.key, out);
-                    return lower_result(&cx, &mut store, fty.results(), &out, results, &msg);
+                    return lower_call_outcome(
+                        &cx,
+                        &mut store,
+                        fty.results(),
+                        Ok(out),
+                        results,
+                        &msg,
+                    );
                 }
                 // A convert error means the candidate rejected the
-                // arguments — fall through. A Host error is the matched
+                // arguments — fall through. A Callee error is the matched
                 // implementation's own failure: propagate it.
                 Err(ScriptCallError::Convert(e)) => last = Some(e),
-                Err(host) => return Err(trap_call(&msg, host)),
+                Err(host) => {
+                    return lower_call_outcome(
+                        &cx,
+                        &mut store,
+                        fty.results(),
+                        Err(host),
+                        results,
+                        &msg,
+                    );
+                }
             }
         }
         Err(no_candidate_trap(&msg, last))
@@ -2826,12 +3006,28 @@ fn define_enum_dyn_assoc_companion<T: 'static>(
             match attempt {
                 Ok(out) => {
                     let out = wrap_dyn_result(desc, &cands[i].0.key, out);
-                    return lower_result(&cx, &mut store, fty.results(), &out, results, &msg);
+                    return lower_call_outcome(
+                        &cx,
+                        &mut store,
+                        fty.results(),
+                        Ok(out),
+                        results,
+                        &msg,
+                    );
                 }
                 // Convert error: the candidate rejected the arguments — fall
-                // through. A Host error is the implementation's own failure.
+                // through. A Callee error is the implementation's own failure.
                 Err(ScriptCallError::Convert(e)) => last = Some(e),
-                Err(host) => return Err(trap_call(&msg, host)),
+                Err(host) => {
+                    return lower_call_outcome(
+                        &cx,
+                        &mut store,
+                        fty.results(),
+                        Err(host),
+                        results,
+                        &msg,
+                    );
+                }
             }
         }
         Err(no_candidate_trap(&msg, last))
@@ -2850,8 +3046,7 @@ fn define_value_fn<T: 'static>(
     let msg_name = name.to_string();
     inst.func_new(name, move |mut store, fty, params, results| {
         let args = lift_args(&cx, &mut store, params, 0, &msg_name)?;
-        let out = f(&args).map_err(|e| trap_call(&msg_name, e))?;
-        lower_result(&cx, &mut store, fty.results(), &out, results, &msg_name)
+        lower_call_outcome(&cx, &mut store, fty.results(), f(&args), results, &msg_name)
     })?;
     Ok(())
 }
@@ -2870,8 +3065,8 @@ fn define_value_fn_async<T: 'static>(
     let msg_name = name.to_string();
     inst.func_new(name, move |mut store, fty, params, results| {
         let args = lift_args(&cx, &mut store, params, 0, &msg_name)?;
-        let out = block_on(f(&args)).map_err(|e| trap_call(&msg_name, e))?;
-        lower_result(&cx, &mut store, fty.results(), &out, results, &msg_name)
+        let out = block_on(f(&args));
+        lower_call_outcome(&cx, &mut store, fty.results(), out, results, &msg_name)
     })?;
     Ok(())
 }
@@ -3136,9 +3331,8 @@ fn define_enum_companion<T: 'static>(
             let out = match a {
                 EAssoc::Sync(f) => f(&args),
                 EAssoc::Async(f) => block_on(f(&args)),
-            }
-            .map_err(|e| trap_call(&msg_name, e))?;
-            return lower_result(&cx, &mut store, fty.results(), &out, results, &msg_name);
+            };
+            return lower_call_outcome(&cx, &mut store, fty.results(), out, results, &msg_name);
         }
         let m = match &method {
             ValueMethodKey::Named(n) => entry.methods.get(n.as_str()),
@@ -3151,8 +3345,8 @@ fn define_enum_companion<T: 'static>(
         let (this, rest) = args
             .split_first()
             .ok_or_else(|| trap(&msg_name, "companion call is missing its receiver"))?;
-        let out = m(this.clone(), rest).map_err(|e| trap_call(&msg_name, e))?;
-        lower_result(&cx, &mut store, fty.results(), &out, results, &msg_name)
+        let out = m(this.clone(), rest);
+        lower_call_outcome(&cx, &mut store, fty.results(), out, results, &msg_name)
     })?;
     Ok(())
 }
@@ -3216,7 +3410,7 @@ fn bind_resource_live<T: 'static>(
 
     let mut ctor_slot_free = true;
     for ctor in s.constructors {
-        let (linker_name, ctor_key) = if ctor_slot_free && !ctor.is_async {
+        let (linker_name, ctor_key) = if ctor_slot_free && !ctor.is_async && !ctor.fallible {
             ctor_slot_free = false;
             (format!("[constructor]{res}"), ctor.name.to_string())
         } else {
@@ -3543,16 +3737,47 @@ fn define_ctor_async<T: 'static>(
 ) -> Result<(), WasmBindError> {
     let (entry, cx) = (entry.clone(), cx.clone());
     let msg = linker_name.to_string();
-    inst.func_new(linker_name, move |mut store, _fty, params, results| {
+    inst.func_new(linker_name, move |mut store, fty, params, results| {
         let args = lift_args(&cx, &mut store, params, 0, &msg)?;
         let ctor = entry
             .ctors_async
             .get(ctor_key.as_str())
             .ok_or_else(|| trap(&msg, "constructor has no bridge channel"))?;
-        let value = block_on(ctor(&args)).map_err(|e| trap_call(&msg, e))?;
-        results[0] = cx.own_handle(&mut store, entry.type_name, value)?;
-        Ok(())
+        let value = block_on(ctor(&args));
+        lower_ctor_outcome(&cx, &mut store, fty.results(), value, &entry, results, &msg)
     })?;
+    Ok(())
+}
+
+/// Lowers a constructor outcome: a `result<..>` return shape (a FALLIBLE
+/// constructor renders as a static function returning
+/// `result<resource, script-error>`) carries the fresh handle in the ok arm
+/// and Callee errors in the err arm; the plain shape traps on every call
+/// error, like the `constructor` slot always has. Convert errors trap in
+/// both shapes.
+fn lower_ctor_outcome<S: AsContextMut, I: Iterator<Item = Type>>(
+    cx: &DispatchCx,
+    store: &mut S,
+    mut result_types: I,
+    outcome: Result<AnyBox, ScriptCallError>,
+    entry: &Arc<ResourceEntry>,
+    results: &mut [Val],
+    name: &str,
+) -> wasmtime::Result<()> {
+    let rty = result_types.next();
+    if let Some(Type::Result(_)) = &rty {
+        results[0] = match outcome {
+            Ok(value) => {
+                let handle = cx.own_handle(store, entry.type_name, value)?;
+                Val::Result(Ok(Some(Box::new(handle))))
+            }
+            Err(e @ ScriptCallError::Convert(_)) => return Err(trap_call(name, e)),
+            Err(host) => Val::Result(Err(Some(Box::new(callee_error_val(&host))))),
+        };
+        return Ok(());
+    }
+    let value = outcome.map_err(|e| trap_call(name, e))?;
+    results[0] = cx.own_handle(store, entry.type_name, value)?;
     Ok(())
 }
 
@@ -3576,15 +3801,14 @@ fn define_ctor<T: 'static>(
 ) -> Result<(), WasmBindError> {
     let (entry, cx) = (entry.clone(), cx.clone());
     let msg = linker_name.to_string();
-    inst.func_new(linker_name, move |mut store, _fty, params, results| {
+    inst.func_new(linker_name, move |mut store, fty, params, results| {
         let args = lift_args(&cx, &mut store, params, 0, &msg)?;
         let ctor = entry
             .ctors
             .get(ctor_key.as_str())
             .ok_or_else(|| trap(&msg, "constructor has no bridge channel"))?;
-        let value = ctor(&args).map_err(|e| trap_call(&msg, e))?;
-        results[0] = cx.own_handle(&mut store, entry.type_name, value)?;
-        Ok(())
+        let value = ctor(&args);
+        lower_ctor_outcome(&cx, &mut store, fty.results(), value, &entry, results, &msg)
     })?;
     Ok(())
 }
@@ -3633,12 +3857,12 @@ fn define_assoc<T: 'static>(
         }
         .ok_or_else(|| trap(&msg, "associated function has no bridge channel"))?;
         let out = match a {
-            EAssoc::Sync(f) => f(&args).map_err(|e| trap_call(&msg, e))?,
+            EAssoc::Sync(f) => f(&args),
             // Driven to completion on this thread, like async methods; no
             // table lock is held (no receiver), so re-entrancy is safe.
-            EAssoc::Async(f) => block_on(f(&args)).map_err(|e| trap_call(&msg, e))?,
+            EAssoc::Async(f) => block_on(f(&args)),
         };
-        lower_result(&cx, &mut store, fty.results(), &out, results, &msg)
+        lower_call_outcome(&cx, &mut store, fty.results(), out, results, &msg)
     })?;
     Ok(())
 }
@@ -3671,12 +3895,28 @@ fn define_dyn_assoc<T: 'static>(
             match attempt {
                 Ok(out) => {
                     let out = wrap_dyn_result(desc, &cands[i].0.key, out);
-                    return lower_result(&cx, &mut store, fty.results(), &out, results, &msg);
+                    return lower_call_outcome(
+                        &cx,
+                        &mut store,
+                        fty.results(),
+                        Ok(out),
+                        results,
+                        &msg,
+                    );
                 }
                 // Convert error: the candidate rejected the arguments — fall
-                // through. A Host error is the implementation's own failure.
+                // through. A Callee error is the implementation's own failure.
                 Err(ScriptCallError::Convert(e)) => last = Some(e),
-                Err(host) => return Err(trap_call(&msg, host)),
+                Err(host) => {
+                    return lower_call_outcome(
+                        &cx,
+                        &mut store,
+                        fty.results(),
+                        Err(host),
+                        results,
+                        &msg,
+                    );
+                }
             }
         }
         Err(no_candidate_trap(&msg, last))
@@ -3712,7 +3952,7 @@ fn define_method<T: 'static>(
                     .remove(rep)
                     .ok_or_else(|| trap(&msg, "stale or already-consumed resource handle"))?;
                 check_type(&msg, e.type_name, entry.type_name)?;
-                f(CowAny::Owned(e.value), &args).map_err(|e| trap_call(&msg, e))?
+                f(CowAny::Owned(e.value), &args)
             }
             (EMethod::Cow(f), _) => {
                 let guard = cx.table.lock();
@@ -3720,7 +3960,7 @@ fn define_method<T: 'static>(
                     .get(&rep)
                     .ok_or_else(|| trap(&msg, "stale resource handle"))?;
                 check_type(&msg, e.type_name, entry.type_name)?;
-                f(CowAny::Borrowed(&*e.value), &args).map_err(|e| trap_call(&msg, e))?
+                f(CowAny::Borrowed(&*e.value), &args)
             }
             (EMethod::Mut(f), _) => {
                 let mut guard = cx.table.lock();
@@ -3728,7 +3968,7 @@ fn define_method<T: 'static>(
                     .get_mut(&rep)
                     .ok_or_else(|| trap(&msg, "stale resource handle"))?;
                 check_type(&msg, e.type_name, entry.type_name)?;
-                f(&mut *e.value, &args).map_err(|e| trap_call(&msg, e))?
+                f(&mut *e.value, &args)
             }
             // Async dispatch: wasmtime's dynamic host functions are
             // synchronous, so the bridge future is driven to completion on
@@ -3741,7 +3981,7 @@ fn define_method<T: 'static>(
                     .remove(rep)
                     .ok_or_else(|| trap(&msg, "stale or already-consumed resource handle"))?;
                 check_type(&msg, e.type_name, entry.type_name)?;
-                block_on(f(CowAny::Owned(e.value), &args)).map_err(|e| trap_call(&msg, e))?
+                block_on(f(CowAny::Owned(e.value), &args))
             }
             (EMethod::AsyncCow(f), _) => {
                 let guard = cx.table.lock();
@@ -3749,7 +3989,7 @@ fn define_method<T: 'static>(
                     .get(&rep)
                     .ok_or_else(|| trap(&msg, "stale resource handle"))?;
                 check_type(&msg, e.type_name, entry.type_name)?;
-                block_on(f(CowAny::Borrowed(&*e.value), &args)).map_err(|e| trap_call(&msg, e))?
+                block_on(f(CowAny::Borrowed(&*e.value), &args))
             }
             (EMethod::AsyncMut(f), _) => {
                 let mut guard = cx.table.lock();
@@ -3757,10 +3997,10 @@ fn define_method<T: 'static>(
                     .get_mut(&rep)
                     .ok_or_else(|| trap(&msg, "stale resource handle"))?;
                 check_type(&msg, e.type_name, entry.type_name)?;
-                block_on(f(&mut *e.value, &args)).map_err(|e| trap_call(&msg, e))?
+                block_on(f(&mut *e.value, &args))
             }
         };
-        lower_result(&cx, &mut store, fty.results(), &out, results, &msg)
+        lower_call_outcome(&cx, &mut store, fty.results(), out, results, &msg)
     })?;
     Ok(())
 }
@@ -4056,7 +4296,7 @@ fn bind_resource_stub<T: 'static>(
 
     let mut ctor_slot_free = true;
     for ctor in s.constructors {
-        if ctor_slot_free && !ctor.is_async {
+        if ctor_slot_free && !ctor.is_async && !ctor.fallible {
             ctor_slot_free = false;
             stub_func_msg(inst, &format!("[constructor]{res}"), unregistered)?;
         } else {

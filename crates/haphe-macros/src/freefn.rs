@@ -53,8 +53,9 @@ pub fn expand(mut item: ItemFn) -> TokenStream {
         self_ty: None,
     };
     // A `Result<T, E>` return is fallible: the descriptor and the bridge see
-    // `T`; the wrapper maps `Err` into a Host error (rendered via `Display`,
-    // tagged with `error_kind`), so `E` needs no bridge representation.
+    // `T`; the wrapper carries `Err` intact in a Callee error (tagged with
+    // `error_kind`), so `E` needs no bridge representation — only
+    // `std::error::Error + Send + Sync`.
     let fallible = matches!(
         &item.sig.output,
         syn::ReturnType::Type(_, ret) if crate::fn_desc::result_types(ret).is_some()
@@ -73,11 +74,25 @@ pub fn expand(mut item: ItemFn) -> TokenStream {
                 syn::parse_quote! { -> #ok }
             };
         }
-        let info = build_fn_info(&mut desc_sig, &fn_args, &item.attrs, &ctx, &mut errors);
+        let info = build_fn_info(
+            &mut desc_sig,
+            &fn_args,
+            &item.attrs,
+            &ctx,
+            true,
+            &mut errors,
+        );
         crate::fn_desc::strip_param_script_attrs(&mut item.sig);
         info
     } else {
-        build_fn_info(&mut item.sig, &fn_args, &item.attrs, &ctx, &mut errors)
+        build_fn_info(
+            &mut item.sig,
+            &fn_args,
+            &item.attrs,
+            &ctx,
+            false,
+            &mut errors,
+        )
     };
     if let Some(info) = &info
         && info.receiver != ReceiverShape::None
@@ -165,16 +180,35 @@ pub fn expand(mut item: ItemFn) -> TokenStream {
     } else {
         quote! { ::core::option::Option::None }
     };
+    // `E: Error + Send + Sync` is the requirement on a fallible error type;
+    // checked
+    // here so the failure points at the declared error type, not at
+    // generated conversion code.
+    let display_probe = if fallible
+        && !has_type_params
+        && let syn::ReturnType::Type(_, ret) = &item.sig.output
+        && let Some((_, err)) = crate::fn_desc::result_types(ret)
+    {
+        quote_spanned! {err.span()=>
+            const _: () = {
+                fn __haphe_fallible_error_bound<__E: ::std::error::Error + ::core::marker::Send + ::core::marker::Sync + 'static>() {}
+                let _ = __haphe_fallible_error_bound::<#err>;
+            };
+        }
+    } else {
+        TokenStream::new()
+    };
     // The wrapper expression producing the call's ScriptValue result; a
-    // fallible call's `Err` maps into a Host error.
+    // fallible call's `Err` maps into a Callee error.
     let wrap_return = |call: TokenStream| -> TokenStream {
         if fallible {
             quote! {
                 match #call {
                     ::core::result::Result::Ok(__v) => ::haphe::IntoScript::into_script(__v),
                     ::core::result::Result::Err(__e) => {
-                        return ::core::result::Result::Err(::haphe::ScriptCallError::Host {
-                            message: ::std::string::ToString::to_string(&__e),
+                        return ::core::result::Result::Err(::haphe::ScriptCallError::Callee {
+                            type_name: ::core::any::type_name_of_val(&__e),
+                            error: ::std::sync::Arc::new(__e),
                             kind: #error_kind_tokens,
                         });
                     }
@@ -332,7 +366,6 @@ pub fn expand(mut item: ItemFn) -> TokenStream {
     } else {
         let whitelisted = compatible(&empty_subst);
         let dispatch_eligible = !whitelisted
-            && !fallible
             && param_info.iter().all(|(_, ty)| {
                 crate::bind::is_bridge_compatible_type(ty) || crate::bind::is_dispatchable_path(ty)
             })
@@ -396,6 +429,7 @@ pub fn expand(mut item: ItemFn) -> TokenStream {
                     &param_info,
                     &param_is_ref,
                     &info,
+                    fallible.then_some(&error_kind_tokens),
                 )
             }
         };
@@ -422,6 +456,9 @@ pub fn expand(mut item: ItemFn) -> TokenStream {
         #[doc(hidden)]
         #[allow(non_camel_case_types)]
         #vis struct #ident {}
+
+        #(#cfgs)*
+        #display_probe
 
         #(#cfgs)*
         #[automatically_derived]
@@ -452,6 +489,7 @@ fn gen_dispatched_fn_registration(
     param_info: &[(syn::Ident, Type)],
     param_is_ref: &[bool],
     info: &crate::fn_desc::FnInfo,
+    fallible_error_kind: Option<&TokenStream>,
 ) -> TokenStream {
     // param_info types are already stripped of outer references.
     let stripped: Vec<Type> = param_info.iter().map(|(_, t)| t.clone()).collect();
@@ -490,6 +528,30 @@ fn gen_dispatched_fn_registration(
     } else {
         quote! { #fn_ident(#(#call_args),*) }
     };
+    // Fallible twin: `__invoke` maps `Err` into a Callee error at the concrete
+    // impl, where `E` is inferable — it never appears in the probe's types.
+    let (invoke_ret_trait, invoke_ret_impl, invoke_body, try_op) =
+        if let Some(kind) = fallible_error_kind {
+            (
+                quote! { ::core::result::Result<Self::__R, ::haphe::ScriptCallError> },
+                quote! { ::core::result::Result<#ret_ty, ::haphe::ScriptCallError> },
+                quote! {
+                    #invoke_body.map_err(|__e| ::haphe::ScriptCallError::Callee {
+                        type_name: ::core::any::type_name_of_val(&__e),
+                        error: ::std::sync::Arc::new(__e),
+                        kind: #kind,
+                    })
+                },
+                quote! { ? },
+            )
+        } else {
+            (
+                quote! { Self::__R },
+                ret_ty.clone(),
+                invoke_body,
+                TokenStream::new(),
+            )
+        };
     let registration = if info.is_async {
         quote! {
             __b.function_async(
@@ -503,7 +565,7 @@ fn gen_dispatched_fn_registration(
                             )?;
                         )*
                         ::core::result::Result::Ok(::haphe::ScriptValue::from(
-                            __T::__invoke(#( #p_vars ),*).await
+                            __T::__invoke(#( #p_vars ),*).await #try_op
                         ))
                     })
                 }) as for<'a> fn(&'a [::haphe::ScriptValue]) -> ::haphe::ScriptCallFuture<'a>,
@@ -522,7 +584,7 @@ fn gen_dispatched_fn_registration(
                         )?;
                     )*
                     ::core::result::Result::Ok(::haphe::ScriptValue::from(
-                        __T::__invoke(#( #p_vars ),*)
+                        __T::__invoke(#( #p_vars ),*) #try_op
                     ))
                 }) as fn(&[::haphe::ScriptValue])
                     -> ::core::result::Result<::haphe::ScriptValue, ::haphe::ScriptCallError>,
@@ -537,13 +599,13 @@ fn gen_dispatched_fn_registration(
             trait __Call {
                 #( type #p_assoc; )*
                 type __R;
-                #asyncness fn __invoke(#( #p_vars: Self::#p_assoc ),*) -> Self::__R;
+                #asyncness fn __invoke(#( #p_vars: Self::#p_assoc ),*) -> #invoke_ret_trait;
             }
             impl __Call for #carrier {
                 #( type #p_assoc = #stripped; )*
                 type __R = #ret_ty;
                 #[allow(unused_variables)]
-                #asyncness fn __invoke(#( #p_vars: #stripped ),*) -> #ret_ty {
+                #asyncness fn __invoke(#( #p_vars: #stripped ),*) -> #invoke_ret_impl {
                     #invoke_body
                 }
             }

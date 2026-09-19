@@ -98,7 +98,7 @@ fn pick(name: String, fallback: Option<i64>) -> Vec<i64> {
     reason = "the `Result` IS the surface under test (fallible stub emission)"
 )]
 #[script(error_kind = "TagError")]
-fn tag(entries: std::collections::HashMap<String, i64>) -> Result<String, String> {
+fn tag(entries: std::collections::HashMap<String, i64>) -> Result<String, TextError> {
     let _ = entries;
     Ok(String::new())
 }
@@ -680,3 +680,16 @@ fn async_methods_appear_in_stubs() {
     // is identical when mlua drives the future.
     assert!(s.contains("function Client:get("), "got:\n{s}");
 }
+
+/// A message-only fixture error: `String` itself no longer crosses (host
+/// errors must implement `std::error::Error`).
+#[derive(Debug)]
+struct TextError(String);
+
+impl std::fmt::Display for TextError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for TextError {}

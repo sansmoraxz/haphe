@@ -50,6 +50,11 @@ pub struct FunctionDescriptor<'a> {
     /// their target language. `None` means use the backend's default error
     /// type.
     pub error_kind: Option<&'a str>,
+    /// Whether the declared return was `Result<T, E>` — the descriptor's
+    /// [`return_type`](Self::return_type) is `T` and calls may yield a
+    /// [`Callee`](crate::ScriptCallError::Callee) error. Fallibility is explicit
+    /// here; [`error_kind`](Self::error_kind) presence is NOT its proxy.
+    pub fallible: bool,
 }
 
 /// Whether any function in the slice is `async`. Usable in `const` contexts.

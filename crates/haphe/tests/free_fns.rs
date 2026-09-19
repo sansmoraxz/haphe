@@ -73,6 +73,7 @@ static EXPECTED_ADD: FunctionDescriptor<'static> = FunctionDescriptor {
     return_ownership: Ownership::Owned,
     is_async: false,
     error_kind: None,
+    fallible: false,
 };
 
 /// Descriptors are usable in static initializers (`registry!` relies on this).

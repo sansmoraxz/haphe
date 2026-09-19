@@ -203,11 +203,11 @@ fn sum_block(samples: [u8; 4]) -> u32 {
 /// text) see `point`; the error crosses as a Host failure with no wire
 /// representation.
 #[script]
-fn parse_point(text: String) -> Result<Point, String> {
-    let (x, y) = text.split_once(',').ok_or("bad format")?;
+fn parse_point(text: String) -> Result<Point, TextError> {
+    let (x, y) = text.split_once(',').ok_or(TextError("bad format".into()))?;
     Ok(Point {
-        x: x.trim().parse().map_err(|e| format!("{e}"))?,
-        y: y.trim().parse().map_err(|e| format!("{e}"))?,
+        x: x.trim().parse().map_err(|e| TextError(format!("{e}")))?,
+        y: y.trim().parse().map_err(|e| TextError(format!("{e}")))?,
     })
 }
 
@@ -380,8 +380,20 @@ fn free_functions() {
         wit.contains("midpoint: func(a: borrow<point>, b: borrow<point>) -> point;"),
         "got:\n{wit}"
     );
+    // Fallible WITHOUT a declared kind: fallibility is explicit in the
+    // descriptor (`error_kind` presence used to be a wrong proxy that
+    // rendered this signature infallible) — guests see a real `result`.
     assert!(
-        wit.contains("parse-point: func(text: string) -> point;"),
+        wit.contains("parse-point: func(text: string) -> result<point, script-error>;"),
+        "got:\n{wit}"
+    );
+    // The shared error record is defined once in the interface.
+    assert!(wit.contains("record script-error {"), "got:\n{wit}");
+    assert!(
+        wit.contains("kind: option<string>,")
+            && wit.contains("message: string,")
+            && wit.contains("type-name: string,")
+            && wit.contains("chain: list<string>,"),
         "got:\n{wit}"
     );
     assert!(
@@ -670,13 +682,21 @@ fn foreign_interface_is_emitted() {
         wit.contains("notify: func(message: string);"),
         "got:\n{wit}"
     );
-    // Owned `Point` param pulls a `use` from its defining interface, and
-    // `error_kind` wraps the return in `result<...>` with a doc line.
+    // Owned `Point` param pulls a `use` from its defining interface. A
+    // fallible FOREIGN method carries the same `script-error` err arm as a
+    // provided one — the guest's implementation authors the record, lifted
+    // host-side into `ForeignFailure`.
     assert!(wit.contains("use geometry.{point};"), "got:\n{wit}");
     assert!(wit.contains("/// Errors: IoError"), "got:\n{wit}");
     assert!(
-        wit.contains("moved: func(to: point) -> result<u32>;"),
+        wit.contains("moved: func(to: point) -> result<u32, script-error>;"),
         "got:\n{wit}"
+    );
+    // The record is therefore defined in the foreign interface too.
+    let notifier = wit.split("interface notifier {").nth(1).expect("notifier");
+    assert!(
+        notifier.contains("record script-error {"),
+        "got:\n{notifier}"
     );
     assert!(wit.contains("flush: async func();"), "got:\n{wit}");
 }
@@ -966,3 +986,16 @@ fn receiverless_associated_fns_emit_as_static_members() {
     let wit = String::from_utf8_lossy(&output.files[0].content).to_string();
     assert!(wit.contains("origin: static func() -> s64;"), "got:\n{wit}");
 }
+
+/// A message-only fixture error: `String` itself no longer crosses (host
+/// errors must implement `std::error::Error`).
+#[derive(Debug)]
+struct TextError(String);
+
+impl std::fmt::Display for TextError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for TextError {}

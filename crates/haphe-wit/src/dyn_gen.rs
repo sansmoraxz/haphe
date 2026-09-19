@@ -162,6 +162,17 @@ impl DynCx {
             )?),
         };
 
+        // A FALLIBLE dispatcher's return wraps like any other fallible
+        // surface, in both directions: `result<T, script-error>`.
+        let ret = if f.fallible {
+            Some(match ret {
+                Some(t) => format!("result<{t}, script-error>"),
+                None => "result<_, script-error>".to_string(),
+            })
+        } else {
+            ret
+        };
+
         Ok(DispatcherSig {
             raw_name: format!("{}-dyn", f.name),
             params,

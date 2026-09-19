@@ -42,6 +42,7 @@ const fn module_fn(
         return_ownership: Ownership::Owned,
         is_async,
         error_kind: None,
+        fallible: false,
     }
 }
 

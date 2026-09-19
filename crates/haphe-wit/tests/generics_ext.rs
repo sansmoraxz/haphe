@@ -269,6 +269,7 @@ static ASYNC_GENERIC_METHOD: [haphe::FunctionDescriptor; 1] = [haphe::FunctionDe
     return_ownership: haphe::Ownership::Owned,
     is_async: true,
     error_kind: None,
+    fallible: false,
 }];
 
 static ASYNC_HOLDER: [haphe::StructDescriptor; 1] = [haphe::StructDescriptor {

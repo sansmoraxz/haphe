@@ -108,6 +108,7 @@ pub fn build_fn_info(
     fn_args: &FnArgs,
     attrs: &[syn::Attribute],
     ctx: &TyCtx,
+    fallible: bool,
     errors: &mut Errors,
 ) -> Option<FnInfo> {
     // Parse and strip parameter attrs first: every early return below must
@@ -346,6 +347,7 @@ pub fn build_fn_info(
             return_ownership: #return_ownership,
             is_async: #is_async,
             error_kind: #error_kind,
+            fallible: #fallible,
         }
     };
 

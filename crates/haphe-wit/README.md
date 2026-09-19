@@ -85,28 +85,55 @@ projections, and constants. Anything declared in the registry but not
 registered is defined as a stub that traps descriptively when called, so
 guests always link.
 
-## Errors: conversion failures and fallible Rust surfaces
+## Errors: guest-visible results and conversion traps
 
-Every bound call wrapper yields haphe's `ScriptCallError`. Both variants map
-to a **wasmtime trap** on the guest boundary:
+Every bound call wrapper yields haphe's `ScriptCallError`; the two variants
+part ways at the guest boundary:
 
-- `Convert` (an argument or result failed to convert) traps as
-  `` haphe-wit: `name`: argument/result conversion failed: … `` — unchanged
-  behavior.
-- `Host` (a fallible Rust implementation — a `Result<T, E>` constructor,
-  method, or free function — returned `Err`) traps with the error's
-  `Display` rendering, prefixed by the declared `error_kind` hint when one
-  exists: `` haphe-wit: `bounded`: RangeError: negative seed -1 ``.
+- `Convert` (an argument or result failed to convert) **traps** as
+  `` haphe-wit: `name`: argument/result conversion failed: … `` — boundary
+  misuse is not a guest-visible outcome.
+- `Callee` (a fallible Rust implementation — a `Result<T, E>` constructor,
+  method, or free function — returned `Err`) is **guest-visible**: the
+  fallible surface is declared `result<T, script-error>` and the guest
+  receives the err arm as a value.
 
-Fallible surfaces describe their **ok type** in WIT text (`Result<T, E>`
-never appears as `result<t, e>` for these; the error has no wire
-representation). Hand-built descriptors using `TypeDescriptor::Result`
-explicitly are unrelated and still lower to WIT `result`. A future
-refinement could lower `Host` errors into a native `result<T>` return the
-way the foreign direction's `error_kind` convention does; the trap mapping
-is the minimal contract today. In `dyn` dispatch, only `Convert` errors fall
-through to the next candidate — a `Host` error means the matched
-implementation itself failed and propagates immediately.
+The record is symmetric: a fallible FOREIGN method (guest-implemented,
+called from Rust) is declared `result<T, script-error>` too — the guest's
+implementation authors the record, and the host lifts the err arm into a
+`haphe::ForeignFailure` carried in `ForeignErrorKind::Call`, so Rust callers
+`downcast_ref::<ForeignFailure>()` for the structured kind/message/type-name/
+chain. A guest err whose payload is not the record shape falls back to the
+rendered-message path.
+
+Each interface with fallible surfaces, in either direction, defines the
+shared record once:
+
+```wit
+record script-error {
+  kind: option<string>,
+  message: string,
+  type-name: string,
+  chain: list<string>,
+}
+```
+
+`kind` is the declared `error_kind` hint; `message` is the error's `Display`
+rendering; `type-name` names the implementation-side error type; `chain` is
+the rendered `source()` chain, outermost first. The originating error object
+stays on its own side, intact — for provided surfaces, embedders downcast
+`ScriptCallError::Callee`'s carried `Arc<dyn Error>` and walk `source()`
+directly.
+
+Fallibility is explicit in the descriptor (`fallible: bool`), so a fallible
+function *without* a declared `error_kind` is result-shaped too. A fallible
+constructor cannot occupy the WIT `constructor` slot (constructors cannot
+return `result`), so it renders as a static function returning
+`result<resource, script-error>`. Hand-built descriptors using
+`TypeDescriptor::Result` explicitly are unrelated and still lower to WIT
+`result`. In `dyn` dispatch, only `Convert` errors fall through to the next
+candidate — a `Callee` error means the matched implementation itself failed
+and crosses as the err arm.
 
 ## Naming: implicit kebab-case conversion
 

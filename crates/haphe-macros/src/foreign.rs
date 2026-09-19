@@ -250,7 +250,14 @@ pub fn expand(mut item: ItemTrait) -> TokenStream {
         };
         // Strips parameter attrs even on error paths (on the clone; the
         // re-emitted trait method is stripped below).
-        let info = build_fn_info(&mut desc_sig, &fn_args, &m.attrs, &ctx, &mut errors);
+        let info = build_fn_info(
+            &mut desc_sig,
+            &fn_args,
+            &m.attrs,
+            &ctx,
+            err_ty.is_some(),
+            &mut errors,
+        );
         strip_param_script_attrs(&mut m.sig);
         strip_script_attrs(&mut m.attrs);
         let Some(info) = info else { continue };

@@ -117,18 +117,18 @@ impl Counter {
 
     /// Fallible constructor: rejects negative seeds.
     #[script(constructor, error_kind = "RangeError")]
-    fn bounded(n: i64) -> Result<Self, String> {
+    fn bounded(n: i64) -> Result<Self, TextError> {
         if n < 0 {
-            Err(format!("negative seed {n}"))
+            Err(TextError(format!("negative seed {n}")))
         } else {
             Ok(Counter { n })
         }
     }
 
     /// Fallible method: errors on underflow.
-    fn checked_sub(&mut self, by: i64) -> Result<i64, String> {
+    fn checked_sub(&mut self, by: i64) -> Result<i64, TextError> {
         if by > self.n {
-            return Err("underflow".to_string());
+            return Err(TextError("underflow".into()));
         }
         self.n -= by;
         Ok(self.n)
@@ -141,9 +141,9 @@ impl Counter {
 
     /// Async fallible method: rejects targets below the current count.
     #[script(error_kind = "PowerError")]
-    async fn recharged(&self, to: i64) -> Result<i64, String> {
+    async fn recharged(&self, to: i64) -> Result<i64, TextError> {
         if to < self.n {
-            return Err(format!("target {to} below charge"));
+            return Err(TextError(format!("target {to} below charge")));
         }
         Ok(to)
     }
@@ -218,11 +218,11 @@ fn delayed(x: f64) -> haphe::Future<f64> {
 
 /// Halves an even number; odd input is a host error.
 #[script(error_kind = "ParityError")]
-fn halve_even(n: i64) -> Result<i64, String> {
+fn halve_even(n: i64) -> Result<i64, TextError> {
     if n % 2 == 0 {
         Ok(n / 2)
     } else {
-        Err(format!("{n} is odd"))
+        Err(TextError(format!("{n} is odd")))
     }
 }
 
@@ -699,6 +699,7 @@ fn generic_instance_resource_links() {
         return_ownership: haphe::Ownership::Owned,
         is_async: false,
         error_kind: None,
+        fallible: false,
     }];
     static STRUCTS: [haphe::StructDescriptor; 1] = [haphe::StructDescriptor {
         id: haphe::TypeId::new("test::Holder"),
@@ -831,6 +832,94 @@ fn missing_foreign_function_is_reported() {
 fn trapping_guest_export_panics_through_non_result_method() {
     let math: HostMathHandle = foreign_handle_from_wat(TRAPPING_MATH_GUEST).unwrap();
     math.add(1, 1);
+}
+
+// ---------------------------------------------------------------------------
+// Fallible foreign methods: the guest authors the `script-error` record
+// ---------------------------------------------------------------------------
+
+/// A fallible foreign error type keeping the raw [`haphe::ForeignError`] so
+/// the test can downcast its `Call` box.
+#[derive(Debug)]
+struct StoreError(haphe::ForeignError);
+
+impl From<haphe::ForeignError> for StoreError {
+    fn from(e: haphe::ForeignError) -> Self {
+        StoreError(e)
+    }
+}
+
+#[script(foreign, thread_safety = none)]
+trait RemoteStore {
+    #[script(error_kind = "IoError")]
+    fn fetch(&self, n: i64) -> Result<i64, StoreError>;
+}
+
+/// Guest implementing `fetch: func(n: s64) -> result<s64, script-error>`:
+/// non-negative echoes ok; negative returns a fully-populated err record
+/// (`IoError` kind, `pipe closed` message, `io-failure` type name, and a
+/// two-entry chain) laid out statically in linear memory per the canonical
+/// ABI (result disc at +0, err payload at +8; strings and the chain's
+/// pointer/length element array in data segments).
+const REMOTE_STORE_GUEST: &str = r#"
+(component
+  (core module $m
+    (memory (export "mem") 1)
+    ;; strings
+    (data (i32.const 256) "IoError")
+    (data (i32.const 272) "pipe closed")
+    (data (i32.const 288) "io-failure")
+    (data (i32.const 304) "fd 3 gone")
+    (data (i32.const 320) "epoll died")
+    ;; chain element array: [(304, 9), (320, 10)]
+    (data (i32.const 512) "\30\01\00\00\09\00\00\00\40\01\00\00\0a\00\00\00")
+    ;; err result blob: disc 1, pad; record { kind some(256,7),
+    ;; message (272,11), type-name (288,10), chain (512,2) }
+    (data (i32.const 2048) "\01\00\00\00\00\00\00\00\01\00\00\00\00\01\00\00\07\00\00\00\10\01\00\00\0b\00\00\00\20\01\00\00\0a\00\00\00\00\02\00\00\02\00\00\00")
+    (func (export "fetch") (param i64) (result i32)
+      (if (result i32) (i64.ge_s (local.get 0) (i64.const 0))
+        (then
+          (i32.store8 (i32.const 1024) (i32.const 0))
+          (i64.store (i32.const 1032) (local.get 0))
+          (i32.const 1024))
+        (else (i32.const 2048)))))
+  (core instance $mi (instantiate $m))
+  (type $script-error (record
+    (field "kind" (option string))
+    (field "message" string)
+    (field "type-name" string)
+    (field "chain" (list string))))
+  (func $fetch (param "n" s64) (result (result s64 (error $script-error)))
+    (canon lift (core func $mi "fetch") (memory (core memory $mi "mem"))))
+  (instance $i
+    (export "script-error" (type $script-error))
+    (export "fetch" (func $fetch)))
+  (export "haphe:demo/remote-store" (instance $i))
+)
+"#;
+
+#[test]
+fn foreign_err_record_lifts_into_foreign_failure() {
+    let store: RemoteStoreHandle = foreign_handle_from_wat(REMOTE_STORE_GUEST).unwrap();
+    // Ok arm unwraps to the payload.
+    assert_eq!(store.fetch(41).unwrap(), 41);
+    // Err arm: the guest-authored record arrives as a downcastable
+    // `ForeignFailure` in the `Call` box.
+    let StoreError(err) = store.fetch(-1).unwrap_err();
+    assert_eq!(err.function, "fetch");
+    let haphe::ForeignErrorKind::Call(boxed) = &err.kind else {
+        panic!("expected Call, got {err:?}");
+    };
+    let failure = boxed
+        .downcast_ref::<haphe::ForeignFailure>()
+        .expect("downcasts to ForeignFailure");
+    assert_eq!(failure.kind.as_deref(), Some("IoError"));
+    assert_eq!(failure.message, "pipe closed");
+    assert_eq!(failure.type_name, "io-failure");
+    assert_eq!(failure.chain, ["fd 3 gone", "epoll died"]);
+    assert_eq!(failure.to_string(), "IoError: pipe closed");
+    // It renders through the ForeignError chain too.
+    assert!(err.to_string().contains("IoError: pipe closed"));
 }
 
 // ---------------------------------------------------------------------------
@@ -1366,6 +1455,7 @@ fn colliding_export_names_are_rejected_at_caller_construction() {
             return_ownership: Ownership::Owned,
             is_async: false,
             error_kind: None,
+            fallible: false,
         }
     }
     static FNS: [FunctionDescriptor<'static>; 2] = [
@@ -2033,6 +2123,7 @@ fn store_descriptor() -> &'static haphe::ForeignInterfaceDescriptor<'static> {
             return_ownership: Ownership::Owned,
             is_async: false,
             error_kind: None,
+            fallible: false,
         }
     }
     static FNS: [FunctionDescriptor<'static>; 3] = [
@@ -2302,6 +2393,7 @@ fn host_resources_cross_into_foreign_calls() {
             return_ownership: Ownership::Owned,
             is_async: false,
             error_kind: None,
+            fallible: false,
         },
         FunctionDescriptor {
             name: "consume",
@@ -2315,6 +2407,7 @@ fn host_resources_cross_into_foreign_calls() {
             return_ownership: Ownership::Owned,
             is_async: false,
             error_kind: None,
+            fallible: false,
         },
     ];
     static PROBE_DESC: ForeignInterfaceDescriptor<'static> = ForeignInterfaceDescriptor {
@@ -2987,149 +3080,290 @@ fn dyn_method_dispatcher_executes_live() {
 }
 
 // ---------------------------------------------------------------------------
-// Fallible surfaces: Ok paths return the value; Err paths trap with the
-// kind-prefixed Host message.
+// Fallible surfaces: guest-visible `result<T, script-error>` — Ok paths
+// carry the value, Err paths carry the record (never a trap).
 // ---------------------------------------------------------------------------
 
-/// bounded(6) -> checked-sub(2) = 4; halve-even(8) = 4; total 8.
-const FALLIBLE_OK_GUEST: &str = r#"
+/// Imports the geometry surface with its result-shaped fallible members and
+/// re-exports them through core lift/lower trampolines (wasmtime forbids
+/// direct re-exports of imports), so the test drives them directly and
+/// asserts the STRUCTURED result values host-side. The `script-error`
+/// payload carries strings, so the host's lowering needs guest memory and a
+/// realloc; the trampoline hands the lowered import a return area and the
+/// lifted export returns that pointer.
+const FALLIBLE_TRAMPOLINE_GUEST: &str = r#"
 (component
+  (type $se' (record
+    (field "kind" (option string))
+    (field "message" string)
+    (field "type-name" string)
+    (field "chain" (list string))))
   (import "haphe:demo/geometry" (instance $geo
+    (export "script-error" (type $se (eq $se')))
     (export "counter" (type $counter (sub resource)))
-    (export "[static]counter.bounded" (func (param "n" s64) (result (own $counter))))
-    (export "[method]counter.checked-sub" (func (param "self" (borrow $counter)) (param "by" s64) (result s64)))
-    (export "halve-even" (func (param "n" s64) (result s64)))
+    (export "[static]counter.bounded" (func (param "n" s64) (result (result (own $counter) (error $se)))))
+    (export "[method]counter.checked-sub" (func (param "self" (borrow $counter)) (param "by" s64) (result (result s64 (error $se)))))
+    (export "[method]counter.recharged" (func (param "self" (borrow $counter)) (param "to" s64) (result (result s64 (error $se)))))
+    (export "halve-even" (func (param "n" s64) (result (result s64 (error $se)))))
   ))
-  (core func $bounded (canon lower (func $geo "[static]counter.bounded")))
-  (core func $sub (canon lower (func $geo "[method]counter.checked-sub")))
-  (core func $halve (canon lower (func $geo "halve-even")))
+  (alias export $geo "counter" (type $counter-t))
+  (alias export $geo "script-error" (type $se-t))
+  (core module $libc
+    (memory (export "mem") 16)
+    (global $next (mut i32) (i32.const 4096))
+    (func (export "realloc") (param i32 i32 i32 i32) (result i32)
+      (local $ptr i32)
+      (global.set $next (i32.and (i32.add (global.get $next) (i32.const 7)) (i32.const -8)))
+      (local.set $ptr (global.get $next))
+      (global.set $next (i32.add (global.get $next) (local.get 3)))
+      (local.get $ptr))
+  )
+  (core instance $li (instantiate $libc))
+  (core func $bounded (canon lower (func $geo "[static]counter.bounded")
+    (memory (core memory $li "mem")) (realloc (core func $li "realloc"))))
+  (core func $sub (canon lower (func $geo "[method]counter.checked-sub")
+    (memory (core memory $li "mem")) (realloc (core func $li "realloc"))))
+  (core func $rech (canon lower (func $geo "[method]counter.recharged")
+    (memory (core memory $li "mem")) (realloc (core func $li "realloc"))))
+  (core func $halve (canon lower (func $geo "halve-even")
+    (memory (core memory $li "mem")) (realloc (core func $li "realloc"))))
+  (core func $dropc (canon resource.drop $counter-t))
   (core module $m
-    (import "geo" "bounded" (func $bounded (param i64) (result i32)))
-    (import "geo" "sub" (func $sub (param i32 i64) (result i64)))
-    (import "geo" "halve" (func $halve (param i64) (result i64)))
-    (func (export "run") (result i64) (local $c i32)
-      (local.set $c (call $bounded (i64.const 6)))
-      (i64.add
-        (call $sub (local.get $c) (i64.const 2))
-        (call $halve (i64.const 8))))
+    (import "libc" "realloc" (func $ra (param i32 i32 i32 i32) (result i32)))
+    (import "geo" "bounded" (func $bounded (param i64 i32)))
+    (import "geo" "sub" (func $sub (param i32 i64 i32)))
+    (import "geo" "rech" (func $rech (param i32 i64 i32)))
+    (import "geo" "halve" (func $halve (param i64 i32)))
+    (import "geo" "drop" (func $dropc (param i32)))
+    (func $area (result i32) (call $ra (i32.const 0) (i32.const 0) (i32.const 8) (i32.const 256)))
+    (func (export "bounded") (param i64) (result i32) (local $p i32)
+      (local.set $p (call $area))
+      (call $bounded (local.get 0) (local.get $p))
+      (local.get $p))
+    (func (export "checked-sub") (param i32 i64) (result i32) (local $p i32)
+      (local.set $p (call $area))
+      (call $sub (local.get 0) (local.get 1) (local.get $p))
+      (call $dropc (local.get 0))
+      (local.get $p))
+    (func (export "recharged") (param i32 i64) (result i32) (local $p i32)
+      (local.set $p (call $area))
+      (call $rech (local.get 0) (local.get 1) (local.get $p))
+      (call $dropc (local.get 0))
+      (local.get $p))
+    (func (export "halve-even") (param i64) (result i32) (local $p i32)
+      (local.set $p (call $area))
+      (call $halve (local.get 0) (local.get $p))
+      (local.get $p))
   )
   (core instance $mi (instantiate $m
+    (with "libc" (instance
+      (export "realloc" (func $li "realloc"))))
     (with "geo" (instance
       (export "bounded" (func $bounded))
       (export "sub" (func $sub))
-      (export "halve" (func $halve))))
+      (export "rech" (func $rech))
+      (export "halve" (func $halve))
+      (export "drop" (func $dropc))))
   ))
-  (func (export "run") (result s64) (canon lift (core func $mi "run")))
+  (func $bounded' (param "n" s64) (result (result (own $counter-t) (error $se-t)))
+    (canon lift (core func $mi "bounded") (memory (core memory $li "mem"))))
+  (func $sub' (param "self" (borrow $counter-t)) (param "by" s64) (result (result s64 (error $se-t)))
+    (canon lift (core func $mi "checked-sub") (memory (core memory $li "mem"))))
+  (func $rech' (param "self" (borrow $counter-t)) (param "to" s64) (result (result s64 (error $se-t)))
+    (canon lift (core func $mi "recharged") (memory (core memory $li "mem"))))
+  (func $halve' (param "n" s64) (result (result s64 (error $se-t)))
+    (canon lift (core func $mi "halve-even") (memory (core memory $li "mem"))))
+  (export "bounded" (func $bounded'))
+  (export "checked-sub" (func $sub'))
+  (export "recharged" (func $rech'))
+  (export "halve-even" (func $halve'))
 )
 "#;
 
-/// bounded(-1) traps before any handle exists.
-const FALLIBLE_CTOR_TRAP_GUEST: &str = r#"
-(component
-  (import "haphe:demo/geometry" (instance $geo
-    (export "counter" (type $counter (sub resource)))
-    (export "[static]counter.bounded" (func (param "n" s64) (result (own $counter))))
-  ))
-  (core func $bounded (canon lower (func $geo "[static]counter.bounded")))
-  (core module $m
-    (import "geo" "bounded" (func $bounded (param i64) (result i32)))
-    (func (export "run") (result i64)
-      (i64.extend_i32_s (call $bounded (i64.const -1))))
-  )
-  (core instance $mi (instantiate $m
-    (with "geo" (instance (export "bounded" (func $bounded))))
-  ))
-  (func (export "run") (result s64) (canon lift (core func $mi "run")))
-)
-"#;
+/// Instantiates `guest_wat` and calls its `export` with `args`, returning
+/// the single result value.
+fn call_export<T>(
+    engine: &Engine,
+    linker: &Linker<T>,
+    store: &mut wasmtime::Store<T>,
+    instance: &wasmtime::component::Instance,
+    export: &str,
+    args: &[Val],
+) -> Result<Val, wasmtime::Error> {
+    let _ = (engine, linker);
+    let f = instance
+        .get_func(&mut *store, export)
+        .unwrap_or_else(|| panic!("guest exports `{export}`"));
+    let mut results = [Val::Bool(false)];
+    f.call(&mut *store, args, &mut results)?;
+    Ok(results.into_iter().next().unwrap())
+}
 
-/// checked-sub(5) on a counter seeded with 1 traps.
-const FALLIBLE_METHOD_TRAP_GUEST: &str = r#"
-(component
-  (import "haphe:demo/geometry" (instance $geo
-    (export "counter" (type $counter (sub resource)))
-    (export "[static]counter.bounded" (func (param "n" s64) (result (own $counter))))
-    (export "[method]counter.checked-sub" (func (param "self" (borrow $counter)) (param "by" s64) (result s64)))
-  ))
-  (core func $bounded (canon lower (func $geo "[static]counter.bounded")))
-  (core func $sub (canon lower (func $geo "[method]counter.checked-sub")))
-  (core module $m
-    (import "geo" "bounded" (func $bounded (param i64) (result i32)))
-    (import "geo" "sub" (func $sub (param i32 i64) (result i64)))
-    (func (export "run") (result i64)
-      (call $sub (call $bounded (i64.const 1)) (i64.const 5)))
-  )
-  (core instance $mi (instantiate $m
-    (with "geo" (instance
-      (export "bounded" (func $bounded))
-      (export "sub" (func $sub))))
-  ))
-  (func (export "run") (result s64) (canon lift (core func $mi "run")))
-)
-"#;
+/// Unpacks a `script-error` record value into (kind, message, type-name,
+/// chain).
+fn unpack_script_error(v: &Val) -> (Option<String>, String, String, Vec<String>) {
+    let Val::Result(Err(Some(rec))) = v else {
+        panic!("expected an err-arm record, got: {v:?}");
+    };
+    let Val::Record(fields) = rec.as_ref() else {
+        panic!("expected a record payload, got: {rec:?}");
+    };
+    let field = |name: &str| {
+        fields
+            .iter()
+            .find(|(n, _)| n == name)
+            .map_or_else(|| panic!("record has `{name}`"), |(_, v)| v.clone())
+    };
+    let kind = match field("kind") {
+        Val::Option(Some(b)) => match *b {
+            Val::String(s) => Some(s),
+            other => panic!("kind is a string, got {other:?}"),
+        },
+        Val::Option(None) => None,
+        other => panic!("kind is an option, got {other:?}"),
+    };
+    let Val::String(message) = field("message") else {
+        panic!("message is a string")
+    };
+    let Val::String(type_name) = field("type-name") else {
+        panic!("type-name is a string")
+    };
+    let Val::List(chain) = field("chain") else {
+        panic!("chain is a list")
+    };
+    let chain = chain
+        .into_iter()
+        .map(|v| match v {
+            Val::String(s) => s,
+            other => panic!("chain entries are strings, got {other:?}"),
+        })
+        .collect();
+    (kind, message, type_name, chain)
+}
 
-/// halve-even(3) traps.
-const FALLIBLE_FN_TRAP_GUEST: &str = r#"
-(component
-  (import "haphe:demo/geometry" (instance $geo
-    (export "halve-even" (func (param "n" s64) (result s64)))
-  ))
-  (core func $halve (canon lower (func $geo "halve-even")))
-  (core module $m
-    (import "geo" "halve" (func $halve (param i64) (result i64)))
-    (func (export "run") (result i64) (call $halve (i64.const 3)))
-  )
-  (core instance $mi (instantiate $m
-    (with "geo" (instance (export "halve" (func $halve))))
-  ))
-  (func (export "run") (result s64) (canon lift (core func $mi "run")))
-)
-"#;
-
-#[test]
-fn fallible_surfaces_dispatch_ok_paths_live() {
+fn fallible_geometry_instance() -> (
+    Engine,
+    wasmtime::Store<()>,
+    wasmtime::component::Instance,
+    Linker<()>,
+) {
     let engine = Engine::default();
     let mut linker = Linker::new(&engine);
     haphe::bind(&live_binder(), &REGISTRY, &mut linker).expect("binding succeeds");
-
-    let result = run_guest(&engine, &linker, (), FALLIBLE_OK_GUEST).expect("guest runs");
-    assert!(matches!(result, Val::S64(8)), "got: {result:?}");
+    let component =
+        Component::new(&engine, wat::parse_str(FALLIBLE_TRAMPOLINE_GUEST).unwrap()).unwrap();
+    let mut store = wasmtime::Store::new(&engine, ());
+    let instance = linker.instantiate(&mut store, &component).unwrap();
+    (engine, store, instance, linker)
 }
 
 #[test]
-fn fallible_constructor_err_traps_with_kind() {
-    let engine = Engine::default();
-    let mut linker = Linker::new(&engine);
-    haphe::bind(&live_binder(), &REGISTRY, &mut linker).expect("binding succeeds");
-
-    let err = run_guest(&engine, &linker, (), FALLIBLE_CTOR_TRAP_GUEST).expect_err("Err traps");
-    let msg = format!("{err:?}");
-    assert!(msg.contains("RangeError: negative seed -1"), "got: {msg}");
-}
-
-#[test]
-fn fallible_method_err_traps_without_kind() {
-    let engine = Engine::default();
-    let mut linker = Linker::new(&engine);
-    haphe::bind(&live_binder(), &REGISTRY, &mut linker).expect("binding succeeds");
-
-    let err = run_guest(&engine, &linker, (), FALLIBLE_METHOD_TRAP_GUEST).expect_err("Err traps");
-    let msg = format!("{err:?}");
+fn fallible_surfaces_return_ok_arms_live() {
+    let (engine, mut store, instance, linker) = fallible_geometry_instance();
+    let handle = call_export(
+        &engine,
+        &linker,
+        &mut store,
+        &instance,
+        "bounded",
+        &[Val::S64(6)],
+    )
+    .expect("bounded(6) call runs");
+    let Val::Result(Ok(Some(handle))) = handle else {
+        panic!("expected an ok-arm handle, got: {handle:?}");
+    };
+    let out = call_export(
+        &engine,
+        &linker,
+        &mut store,
+        &instance,
+        "checked-sub",
+        &[*handle, Val::S64(2)],
+    )
+    .expect("checked-sub(6, 2) call runs");
     assert!(
-        msg.contains("checked-sub") && msg.contains("underflow"),
-        "got: {msg}"
+        matches!(&out, Val::Result(Ok(Some(v))) if matches!(v.as_ref(), Val::S64(4))),
+        "got: {out:?}"
+    );
+    let out = call_export(
+        &engine,
+        &linker,
+        &mut store,
+        &instance,
+        "halve-even",
+        &[Val::S64(8)],
+    )
+    .expect("halve-even(8) call runs");
+    assert!(
+        matches!(&out, Val::Result(Ok(Some(v))) if matches!(v.as_ref(), Val::S64(4))),
+        "got: {out:?}"
     );
 }
 
 #[test]
-fn fallible_free_fn_err_traps_with_kind() {
-    let engine = Engine::default();
-    let mut linker = Linker::new(&engine);
-    haphe::bind(&live_binder(), &REGISTRY, &mut linker).expect("binding succeeds");
+fn fallible_constructor_err_is_guest_visible_with_kind() {
+    let (engine, mut store, instance, linker) = fallible_geometry_instance();
+    let out = call_export(
+        &engine,
+        &linker,
+        &mut store,
+        &instance,
+        "bounded",
+        &[Val::S64(-1)],
+    )
+    .expect("Err is a value, not a trap");
+    let (kind, message, type_name, chain) = unpack_script_error(&out);
+    assert_eq!(kind.as_deref(), Some("RangeError"));
+    assert_eq!(message, "negative seed -1");
+    assert!(type_name.ends_with("TextError"), "got: {type_name}");
+    assert!(chain.is_empty(), "got: {chain:?}");
+}
 
-    let err = run_guest(&engine, &linker, (), FALLIBLE_FN_TRAP_GUEST).expect_err("Err traps");
-    let msg = format!("{err:?}");
-    assert!(msg.contains("ParityError: 3 is odd"), "got: {msg}");
+#[test]
+fn fallible_method_err_is_guest_visible_without_kind() {
+    let (engine, mut store, instance, linker) = fallible_geometry_instance();
+    let handle = call_export(
+        &engine,
+        &linker,
+        &mut store,
+        &instance,
+        "bounded",
+        &[Val::S64(1)],
+    )
+    .expect("bounded(1) call runs");
+    let Val::Result(Ok(Some(handle))) = handle else {
+        panic!("expected an ok-arm handle, got: {handle:?}");
+    };
+    let out = call_export(
+        &engine,
+        &linker,
+        &mut store,
+        &instance,
+        "checked-sub",
+        &[*handle, Val::S64(5)],
+    )
+    .expect("Err is a value, not a trap");
+    let (kind, message, _, _) = unpack_script_error(&out);
+    assert_eq!(kind, None);
+    assert!(message.contains("underflow"), "got: {message}");
+}
+
+#[test]
+fn fallible_free_fn_err_is_guest_visible_with_kind() {
+    let (engine, mut store, instance, linker) = fallible_geometry_instance();
+    let out = call_export(
+        &engine,
+        &linker,
+        &mut store,
+        &instance,
+        "halve-even",
+        &[Val::S64(3)],
+    )
+    .expect("Err is a value, not a trap");
+    let (kind, message, type_name, _) = unpack_script_error(&out);
+    assert_eq!(kind.as_deref(), Some("ParityError"));
+    assert_eq!(message, "3 is odd");
+    assert!(type_name.ends_with("TextError"), "got: {type_name}");
 }
 
 // ---------------------------------------------------------------------------
@@ -3292,42 +3526,33 @@ fn payload_enum_errors_are_descriptive() {
 // internally — no separate async store is needed for the provided direction).
 // ---------------------------------------------------------------------------
 
-/// bounded(5) -> recharged(2) traps: 2 < 5.
-const ASYNC_FALLIBLE_TRAP_GUEST: &str = r#"
-(component
-  (import "haphe:demo/geometry" (instance $geo
-    (export "counter" (type $counter (sub resource)))
-    (export "[static]counter.bounded" (func (param "n" s64) (result (own $counter))))
-    (export "[method]counter.recharged" (func (param "self" (borrow $counter)) (param "to" s64) (result s64)))
-  ))
-  (core func $bounded (canon lower (func $geo "[static]counter.bounded")))
-  (core func $rech (canon lower (func $geo "[method]counter.recharged")))
-  (core module $m
-    (import "geo" "bounded" (func $bounded (param i64) (result i32)))
-    (import "geo" "rech" (func $rech (param i32 i64) (result i64)))
-    (func (export "run") (result i64)
-      (call $rech (call $bounded (i64.const 5)) (i64.const 2)))
-  )
-  (core instance $mi (instantiate $m
-    (with "geo" (instance
-      (export "bounded" (func $bounded))
-      (export "rech" (func $rech))))
-  ))
-  (func (export "run") (result s64) (canon lift (core func $mi "run")))
-)
-"#;
-
 #[test]
-fn async_fallible_method_err_traps_with_kind() {
-    let engine = Engine::default();
-    let mut linker = Linker::new(&engine);
-    haphe::bind(&live_binder(), &REGISTRY, &mut linker).expect("binding succeeds");
-    let err = run_guest(&engine, &linker, (), ASYNC_FALLIBLE_TRAP_GUEST).expect_err("Err traps");
-    let msg = format!("{err:?}");
-    assert!(
-        msg.contains("PowerError: target 2 below charge"),
-        "got: {msg}"
-    );
+fn async_fallible_method_err_is_guest_visible_with_kind() {
+    let (engine, mut store, instance, linker) = fallible_geometry_instance();
+    let handle = call_export(
+        &engine,
+        &linker,
+        &mut store,
+        &instance,
+        "bounded",
+        &[Val::S64(5)],
+    )
+    .expect("bounded(5) call runs");
+    let Val::Result(Ok(Some(handle))) = handle else {
+        panic!("expected an ok-arm handle, got: {handle:?}");
+    };
+    let out = call_export(
+        &engine,
+        &linker,
+        &mut store,
+        &instance,
+        "recharged",
+        &[*handle, Val::S64(2)],
+    )
+    .expect("Err is a value, not a trap");
+    let (kind, message, _, _) = unpack_script_error(&out);
+    assert_eq!(kind.as_deref(), Some("PowerError"));
+    assert!(message.contains("target 2 below charge"), "got: {message}");
 }
 
 // ---------------------------------------------------------------------------
@@ -3967,6 +4192,17 @@ impl Toggle {
     async fn toggled_later(&self, next: FlagT) -> FlagT {
         FlagT(self.powered.0 != next.0)
     }
+
+    /// Fallible over the newtype: dispatch registers it, `Err` becomes a
+    /// Host error tagged with the declared kind.
+    #[script(error_kind = "ToggleError")]
+    fn checked_toggle(&self, next: FlagT) -> Result<FlagT, TextError> {
+        if next.0 {
+            Ok(FlagT(!self.powered.0))
+        } else {
+            Err(TextError("off is not allowed".into()))
+        }
+    }
 }
 
 #[script]
@@ -3974,11 +4210,45 @@ async fn invert_later(flag: FlagT) -> FlagT {
     FlagT(!flag.0)
 }
 
+#[derive(Debug)]
+struct RootCause;
+
+impl std::fmt::Display for RootCause {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("root cause")
+    }
+}
+
+impl std::error::Error for RootCause {}
+
+#[derive(Debug)]
+struct LayeredError;
+
+impl std::fmt::Display for LayeredError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("layered failure")
+    }
+}
+
+impl std::error::Error for LayeredError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&RootCause)
+    }
+}
+
+/// Always fails through a two-level error: the rendered source chain
+/// crosses in the `script-error` record.
+#[script(error_kind = "DeepError")]
+fn flip_deep(flag: bool) -> Result<bool, LayeredError> {
+    let _ = flag;
+    Err(LayeredError)
+}
+
 haphe::registry! {
     static TOGGLE_REGISTRY = {
         structs: [Toggle],
         modules: [
-            mod toggles { functions: [invert_later], types: [Toggle] },
+            mod toggles { functions: [invert_later, flip_deep], types: [Toggle] },
         ],
     };
 }
@@ -4018,6 +4288,174 @@ const TOGGLE_GUEST: &str = r#"
 )
 "#;
 
+/// Result-shaped trampolines over the fallible toggle surfaces (see
+/// `FALLIBLE_TRAMPOLINE_GUEST` for the shape), driven directly by the test
+/// with structured err-arm assertions host-side.
+const TOGGLE_CHECKED_GUEST: &str = r#"
+(component
+  (type $se' (record
+    (field "kind" (option string))
+    (field "message" string)
+    (field "type-name" string)
+    (field "chain" (list string))))
+  (import "haphe:demo/toggles" (instance $tg
+    (export "script-error" (type $se (eq $se')))
+    (export "toggle" (type $t (sub resource)))
+    (export "[constructor]toggle" (func (param "on" bool) (result (own $t))))
+    (export "[method]toggle.checked-toggle" (func (param "self" (borrow $t)) (param "next" bool) (result (result bool (error $se)))))
+    (export "flip-deep" (func (param "flag" bool) (result (result bool (error $se)))))
+  ))
+  (alias export $tg "toggle" (type $t-t))
+  (alias export $tg "script-error" (type $se-t))
+  (core module $libc
+    (memory (export "mem") 16)
+    (global $next (mut i32) (i32.const 4096))
+    (func (export "realloc") (param i32 i32 i32 i32) (result i32)
+      (local $ptr i32)
+      (global.set $next (i32.and (i32.add (global.get $next) (i32.const 7)) (i32.const -8)))
+      (local.set $ptr (global.get $next))
+      (global.set $next (i32.add (global.get $next) (local.get 3)))
+      (local.get $ptr))
+  )
+  (core instance $li (instantiate $libc))
+  (core func $ctor (canon lower (func $tg "[constructor]toggle")))
+  (core func $chk (canon lower (func $tg "[method]toggle.checked-toggle")
+    (memory (core memory $li "mem")) (realloc (core func $li "realloc"))))
+  (core func $deep (canon lower (func $tg "flip-deep")
+    (memory (core memory $li "mem")) (realloc (core func $li "realloc"))))
+  (core func $dropt (canon resource.drop $t-t))
+  (core module $m
+    (import "libc" "realloc" (func $ra (param i32 i32 i32 i32) (result i32)))
+    (import "tg" "ctor" (func $ctor (param i32) (result i32)))
+    (import "tg" "chk" (func $chk (param i32 i32 i32)))
+    (import "tg" "deep" (func $deep (param i32 i32)))
+    (import "tg" "drop" (func $dropt (param i32)))
+    (func $area (result i32) (call $ra (i32.const 0) (i32.const 0) (i32.const 8) (i32.const 256)))
+    (func (export "make") (param i32) (result i32) (call $ctor (local.get 0)))
+    (func (export "checked-toggle") (param i32 i32) (result i32) (local $p i32)
+      (local.set $p (call $area))
+      (call $chk (local.get 0) (local.get 1) (local.get $p))
+      (call $dropt (local.get 0))
+      (local.get $p))
+    (func (export "flip-deep") (param i32) (result i32) (local $p i32)
+      (local.set $p (call $area))
+      (call $deep (local.get 0) (local.get $p))
+      (local.get $p))
+  )
+  (core instance $mi (instantiate $m
+    (with "libc" (instance
+      (export "realloc" (func $li "realloc"))))
+    (with "tg" (instance
+      (export "ctor" (func $ctor))
+      (export "chk" (func $chk))
+      (export "deep" (func $deep))
+      (export "drop" (func $dropt))))
+  ))
+  (func $make' (param "on" bool) (result (own $t-t))
+    (canon lift (core func $mi "make")))
+  (func $chk' (param "self" (borrow $t-t)) (param "next" bool) (result (result bool (error $se-t)))
+    (canon lift (core func $mi "checked-toggle") (memory (core memory $li "mem"))))
+  (func $deep' (param "flag" bool) (result (result bool (error $se-t)))
+    (canon lift (core func $mi "flip-deep") (memory (core memory $li "mem"))))
+  (export "make" (func $make'))
+  (export "checked-toggle" (func $chk'))
+  (export "flip-deep" (func $deep'))
+)
+"#;
+
+fn toggle_checked_instance() -> (
+    Engine,
+    wasmtime::Store<()>,
+    wasmtime::component::Instance,
+    Linker<()>,
+) {
+    let engine = Engine::default();
+    let mut linker = Linker::new(&engine);
+    let mut b = WasmBinder::new(WitGenerator::new("haphe:demo"));
+    b.register_type::<Toggle>().unwrap();
+    b.register_fn::<invert_later>().unwrap();
+    b.register_fn::<flip_deep>().unwrap();
+    haphe::bind(&b, &TOGGLE_REGISTRY, &mut linker).expect("binding succeeds");
+    let component = Component::new(&engine, wat::parse_str(TOGGLE_CHECKED_GUEST).unwrap()).unwrap();
+    let mut store = wasmtime::Store::new(&engine, ());
+    let instance = linker.instantiate(&mut store, &component).unwrap();
+    (engine, store, instance, linker)
+}
+
+#[test]
+fn fallible_newtype_dispatch_ok_path_executes_live() {
+    let (engine, mut store, instance, linker) = toggle_checked_instance();
+    let handle = call_export(
+        &engine,
+        &linker,
+        &mut store,
+        &instance,
+        "make",
+        &[Val::Bool(false)],
+    )
+    .expect("constructor runs");
+    let out = call_export(
+        &engine,
+        &linker,
+        &mut store,
+        &instance,
+        "checked-toggle",
+        &[handle, Val::Bool(true)],
+    )
+    .expect("Ok path dispatches");
+    assert!(
+        matches!(&out, Val::Result(Ok(Some(v))) if matches!(v.as_ref(), Val::Bool(true))),
+        "got: {out:?}"
+    );
+}
+
+#[test]
+fn fallible_newtype_dispatch_err_is_guest_visible() {
+    let (engine, mut store, instance, linker) = toggle_checked_instance();
+    let handle = call_export(
+        &engine,
+        &linker,
+        &mut store,
+        &instance,
+        "make",
+        &[Val::Bool(true)],
+    )
+    .expect("constructor runs");
+    let out = call_export(
+        &engine,
+        &linker,
+        &mut store,
+        &instance,
+        "checked-toggle",
+        &[handle, Val::Bool(false)],
+    )
+    .expect("Err is a value, not a trap");
+    let (kind, message, type_name, chain) = unpack_script_error(&out);
+    assert_eq!(kind.as_deref(), Some("ToggleError"));
+    assert_eq!(message, "off is not allowed");
+    assert!(type_name.ends_with("TextError"), "got: {type_name}");
+    assert!(chain.is_empty(), "got: {chain:?}");
+}
+
+#[test]
+fn fallible_err_carries_the_rendered_source_chain() {
+    let (engine, mut store, instance, linker) = toggle_checked_instance();
+    let out = call_export(
+        &engine,
+        &linker,
+        &mut store,
+        &instance,
+        "flip-deep",
+        &[Val::Bool(true)],
+    )
+    .expect("Err is a value, not a trap");
+    let (kind, message, type_name, chain) = unpack_script_error(&out);
+    assert_eq!(kind.as_deref(), Some("DeepError"));
+    assert_eq!(message, "layered failure");
+    assert!(type_name.ends_with("LayeredError"), "got: {type_name}");
+    assert_eq!(chain, vec!["root cause".to_string()]);
+}
+
 #[test]
 fn transparent_newtype_async_dispatch_executes_live() {
     let engine = Engine::default();
@@ -4045,4 +4483,24 @@ fn transparent_newtype_async_signatures_render_as_bool() {
         text.contains("invert-later: async func(flag: bool) -> bool;"),
         "got:\n{text}"
     );
+    // Fallible surfaces are guest-visible: `result<T, script-error>` with
+    // the newtype lowered to its carried bool.
+    assert!(
+        text.contains("checked-toggle: func(next: bool) -> result<bool, script-error>;"),
+        "got:\n{text}"
+    );
+    assert!(text.contains("record script-error {"), "got:\n{text}");
 }
+
+/// A message-only fixture error: `String` itself no longer crosses (host
+/// errors must implement `std::error::Error`).
+#[derive(Debug)]
+struct TextError(String);
+
+impl std::fmt::Display for TextError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for TextError {}

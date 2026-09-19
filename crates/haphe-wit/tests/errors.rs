@@ -68,6 +68,7 @@ fn borrowed_resource_return_rejected() {
         return_ownership: Ownership::Ref,
         is_async: false,
         error_kind: None,
+        fallible: false,
     }];
     static STRUCTS: [StructDescriptor; 1] = [StructDescriptor {
         methods: &METHODS,
@@ -158,6 +159,7 @@ fn async_constructor_becomes_static_func() {
             return_ownership: Ownership::Owned,
             is_async: true,
             error_kind: None,
+            fallible: false,
         },
         FunctionDescriptor {
             name: "new",
@@ -171,6 +173,7 @@ fn async_constructor_becomes_static_func() {
             return_ownership: Ownership::Owned,
             is_async: false,
             error_kind: None,
+            fallible: false,
         },
     ];
     static STRUCTS: [StructDescriptor; 1] = [StructDescriptor {
@@ -344,6 +347,7 @@ fn cyclic_interface_use_rejected() {
             return_ownership: Ownership::Owned,
             is_async: false,
             error_kind: None,
+            fallible: false,
         }
     }
     static R1_METHODS: [FunctionDescriptor; 1] = [method("other", &R2_REF)];
@@ -545,6 +549,7 @@ const fn foreign_fn(
         return_ownership: Ownership::Owned,
         is_async: false,
         error_kind: None,
+        fallible: false,
     }
 }
 
@@ -713,6 +718,7 @@ fn projection_name_collision_with_user_method() {
         return_ownership: Ownership::Owned,
         is_async: false,
         error_kind: None,
+        fallible: false,
     }];
     static S64: TypeDescriptor = TypeDescriptor::Primitive(PrimitiveType::I64);
     static TRAITS: [haphe::TraitImpl; 1] = [haphe::TraitImpl::Index {
@@ -760,6 +766,7 @@ fn both_call_traits_rejected_in_projection() {
         return_ownership: Ownership::Owned,
         is_async: false,
         error_kind: None,
+        fallible: false,
     }];
     static STRUCTS: [StructDescriptor; 1] = [StructDescriptor {
         constructors: &CTOR,
@@ -794,6 +801,7 @@ const fn plain_string_fn(
         return_ownership: Ownership::Owned,
         is_async: false,
         error_kind: None,
+        fallible: false,
     }
 }
 
@@ -872,6 +880,7 @@ const fn generic_module_fn(dispatch: haphe::Dispatch) -> FunctionDescriptor<'sta
         return_ownership: Ownership::Owned,
         is_async: false,
         error_kind: None,
+        fallible: false,
     }
 }
 

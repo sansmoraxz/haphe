@@ -2,6 +2,12 @@ use haphe::{Script, script};
 
 struct Opaque;
 
+impl std::fmt::Display for Opaque {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("opaque")
+    }
+}
+
 #[derive(Script)]
 #[script(methods)]
 struct Counter {

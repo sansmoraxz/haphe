@@ -141,6 +141,7 @@ const fn dyn_fn(params: &'static [ParamDescriptor<'static>]) -> FunctionDescript
         return_ownership: Ownership::Owned,
         is_async: false,
         error_kind: None,
+        fallible: false,
     }
 }
 

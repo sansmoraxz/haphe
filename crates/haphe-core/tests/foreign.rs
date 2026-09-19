@@ -27,6 +27,7 @@ const fn method(
         return_ownership: Ownership::Owned,
         is_async,
         error_kind: None,
+        fallible: false,
     }
 }
 
@@ -325,6 +326,7 @@ const fn generic_fn(
         return_ownership: Ownership::Owned,
         is_async: false,
         error_kind: None,
+        fallible: false,
     }
 }
 
@@ -472,4 +474,30 @@ fn required_thread_safety_applies_to_foreign_interfaces() {
         CompatibilityError::InsufficientThreadSafety { type_id, .. }
             if *type_id == TypeId::new("HostHooks")
     )));
+}
+
+#[test]
+fn foreign_failure_downcasts_through_the_call_box() {
+    use haphe_core::{ForeignError, ForeignErrorKind, ForeignFailure};
+    let err = ForeignError {
+        function: "notify",
+        kind: ForeignErrorKind::Call(Box::new(ForeignFailure {
+            kind: Some("IoError".to_string()),
+            message: "pipe closed".to_string(),
+            type_name: "io-failure".to_string(),
+            chain: vec!["fd 3 gone".to_string()],
+        })),
+    };
+    // The structured failure is recoverable from the box.
+    let ForeignErrorKind::Call(boxed) = &err.kind else {
+        panic!("expected Call");
+    };
+    let failure = boxed.downcast_ref::<ForeignFailure>().expect("downcasts");
+    assert_eq!(failure.kind.as_deref(), Some("IoError"));
+    assert_eq!(failure.chain, ["fd 3 gone"]);
+    assert_eq!(failure.to_string(), "IoError: pipe closed");
+    // And it renders through the ForeignError chain.
+    assert!(err.to_string().contains("IoError: pipe closed"));
+    let source = std::error::Error::source(&err).expect("source");
+    assert_eq!(source.to_string(), "IoError: pipe closed");
 }

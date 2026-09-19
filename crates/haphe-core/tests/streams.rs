@@ -70,6 +70,7 @@ fn module_stream_fn_rejected_without_capability() {
         return_ownership: Ownership::Owned,
         is_async: false,
         error_kind: None,
+        fallible: false,
     }];
     static MODULES: [ModuleDescriptor; 1] = [ModuleDescriptor {
         name: "events",

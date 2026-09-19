@@ -626,7 +626,7 @@ impl<T: 'static + Clone + mlua::MaybeSend + mlua::MaybeSync> LuaTypeBinder<T> {
                     .iter()
                     .map(lua_to_script)
                     .collect::<mlua::Result<_>>()?;
-                let value = f(&sv_args).map_err(|e| mlua::Error::runtime(e.to_string()))?;
+                let value = f(&sv_args).map_err(crate::error::call_error)?;
                 lua.create_any_userdata(value)
             })?;
             type_table.set(ctor.name, lua_fn)?;
@@ -642,9 +642,7 @@ impl<T: 'static + Clone + mlua::MaybeSend + mlua::MaybeSync> LuaTypeBinder<T> {
                         .iter()
                         .map(lua_to_script)
                         .collect::<mlua::Result<_>>()?;
-                    let value = f(&sv_args)
-                        .await
-                        .map_err(|e| mlua::Error::runtime(e.to_string()))?;
+                    let value = f(&sv_args).await.map_err(crate::error::call_error)?;
                     lua.create_any_userdata(value)
                 })?;
             type_table.set(*name, lua_fn)?;
@@ -660,7 +658,7 @@ impl<T: 'static + Clone + mlua::MaybeSend + mlua::MaybeSync> LuaTypeBinder<T> {
                     .iter()
                     .map(lua_to_script)
                     .collect::<mlua::Result<_>>()?;
-                let result = f(&sv_args).map_err(|e| mlua::Error::runtime(e.to_string()))?;
+                let result = f(&sv_args).map_err(crate::error::call_error)?;
                 script_to_lua(lua, result)
             })?;
             type_table.set(*name, lua_fn)?;
@@ -674,9 +672,7 @@ impl<T: 'static + Clone + mlua::MaybeSend + mlua::MaybeSync> LuaTypeBinder<T> {
                     args.into_vec().iter().map(lua_to_script).collect();
                 async move {
                     let sv_args = sv_args?;
-                    let out = f(&sv_args)
-                        .await
-                        .map_err(|e| mlua::Error::runtime(e.to_string()))?;
+                    let out = f(&sv_args).await.map_err(crate::error::call_error)?;
                     script_to_lua(&lua, out)
                 }
             })?;
@@ -693,7 +689,7 @@ impl<T: 'static + Clone + mlua::MaybeSend + mlua::MaybeSync> LuaTypeBinder<T> {
                     .iter()
                     .map(lua_to_script)
                     .collect::<mlua::Result<_>>()?;
-                let result = f(&sv_args).map_err(|e| mlua::Error::runtime(e.to_string()))?;
+                let result = f(&sv_args).map_err(crate::error::call_error)?;
                 script_to_lua(lua, result)
             })?;
             type_table.set(name.as_str(), lua_fn)?;
@@ -706,9 +702,7 @@ impl<T: 'static + Clone + mlua::MaybeSend + mlua::MaybeSync> LuaTypeBinder<T> {
                     args.into_vec().iter().map(lua_to_script).collect();
                 async move {
                     let sv_args = sv_args?;
-                    let out = f(&sv_args)
-                        .await
-                        .map_err(|e| mlua::Error::runtime(e.to_string()))?;
+                    let out = f(&sv_args).await.map_err(crate::error::call_error)?;
                     script_to_lua(&lua, out)
                 }
             })?;
@@ -718,7 +712,7 @@ impl<T: 'static + Clone + mlua::MaybeSend + mlua::MaybeSync> LuaTypeBinder<T> {
         // the monomorph candidates at call time — core's shared resolver
         // ranks (a generic SELF instantiation merges in, like dyn methods),
         // a rejected conversion falls through in declaration order, and a
-        // Host error propagates immediately.
+        // Callee error propagates immediately.
         #[cfg(feature = "generics")]
         for (name, candidates) in &self.dyn_associated {
             let name = *name;
@@ -737,7 +731,7 @@ impl<T: 'static + Clone + mlua::MaybeSend + mlua::MaybeSync> LuaTypeBinder<T> {
                         Ok(out) => return script_to_lua(lua, out),
                         Err(haphe::ScriptCallError::Convert(e)) => last_err = Some(e),
                         Err(host) => {
-                            return Err(mlua::Error::runtime(host.to_string()));
+                            return Err(crate::error::call_error(host));
                         }
                     }
                 }
@@ -765,7 +759,7 @@ impl<T: 'static + Clone + mlua::MaybeSend + mlua::MaybeSync> LuaTypeBinder<T> {
                             Ok(out) => return script_to_lua(&lua, out),
                             Err(haphe::ScriptCallError::Convert(e)) => last_err = Some(e),
                             Err(host) => {
-                                return Err(mlua::Error::runtime(host.to_string()));
+                                return Err(crate::error::call_error(host));
                             }
                         }
                     }
@@ -823,7 +817,7 @@ impl<T: 'static + Clone + mlua::MaybeSend + mlua::MaybeSync> LuaTypeBinder<T> {
                     // for `&self`; a consuming method clones inside the
                     // wrapper via `into_owned`.
                     let result = f(ScriptCow::Borrowed(&this), &sv_args)
-                        .map_err(|e| mlua::Error::runtime(e.to_string()))?;
+                        .map_err(crate::error::call_error)?;
                     script_to_lua(lua, result)
                 });
             }
@@ -849,7 +843,7 @@ impl<T: 'static + Clone + mlua::MaybeSend + mlua::MaybeSync> LuaTypeBinder<T> {
                             let sv_args = sv_args?;
                             let out = f(ScriptCow::Borrowed(&this), &sv_args)
                                 .await
-                                .map_err(|e| mlua::Error::runtime(e.to_string()))?;
+                                .map_err(crate::error::call_error)?;
                             script_to_lua(&lua, out)
                         }
                     },
@@ -871,7 +865,7 @@ impl<T: 'static + Clone + mlua::MaybeSend + mlua::MaybeSync> LuaTypeBinder<T> {
                             let sv_args = sv_args?;
                             let out = f(&mut this, &sv_args)
                                 .await
-                                .map_err(|e| mlua::Error::runtime(e.to_string()))?;
+                                .map_err(crate::error::call_error)?;
                             script_to_lua(&lua, out)
                         }
                     },
@@ -887,8 +881,7 @@ impl<T: 'static + Clone + mlua::MaybeSend + mlua::MaybeSync> LuaTypeBinder<T> {
                     let mut this = ud.borrow_mut::<T>()?;
                     let sv_args: Vec<ScriptValue> =
                         v.iter().map(lua_to_script).collect::<mlua::Result<_>>()?;
-                    let result =
-                        f(&mut *this, &sv_args).map_err(|e| mlua::Error::runtime(e.to_string()))?;
+                    let result = f(&mut *this, &sv_args).map_err(crate::error::call_error)?;
                     script_to_lua(lua, result)
                 });
             }
@@ -907,7 +900,7 @@ impl<T: 'static + Clone + mlua::MaybeSend + mlua::MaybeSync> LuaTypeBinder<T> {
                     let sv_args: Vec<ScriptValue> =
                         v.iter().map(lua_to_script).collect::<mlua::Result<_>>()?;
                     let result = f(ScriptCow::Borrowed(&this), &sv_args)
-                        .map_err(|e| mlua::Error::runtime(e.to_string()))?;
+                        .map_err(crate::error::call_error)?;
                     script_to_lua(lua, result)
                 });
             }
@@ -920,8 +913,7 @@ impl<T: 'static + Clone + mlua::MaybeSend + mlua::MaybeSync> LuaTypeBinder<T> {
                     let mut this = ud.borrow_mut::<T>()?;
                     let sv_args: Vec<ScriptValue> =
                         v.iter().map(lua_to_script).collect::<mlua::Result<_>>()?;
-                    let result =
-                        f(&mut *this, &sv_args).map_err(|e| mlua::Error::runtime(e.to_string()))?;
+                    let result = f(&mut *this, &sv_args).map_err(crate::error::call_error)?;
                     script_to_lua(lua, result)
                 });
             }
@@ -942,7 +934,7 @@ impl<T: 'static + Clone + mlua::MaybeSend + mlua::MaybeSync> LuaTypeBinder<T> {
                             let sv_args = sv_args?;
                             let out = f(ScriptCow::Borrowed(&this), &sv_args)
                                 .await
-                                .map_err(|e| mlua::Error::runtime(e.to_string()))?;
+                                .map_err(crate::error::call_error)?;
                             script_to_lua(&lua, out)
                         }
                     },
@@ -961,7 +953,7 @@ impl<T: 'static + Clone + mlua::MaybeSend + mlua::MaybeSync> LuaTypeBinder<T> {
                             let sv_args = sv_args?;
                             let out = f(&mut this, &sv_args)
                                 .await
-                                .map_err(|e| mlua::Error::runtime(e.to_string()))?;
+                                .map_err(crate::error::call_error)?;
                             script_to_lua(&lua, out)
                         }
                     },
@@ -971,7 +963,7 @@ impl<T: 'static + Clone + mlua::MaybeSend + mlua::MaybeSync> LuaTypeBinder<T> {
             // Dyn generic methods: ONE Lua method per name scans its
             // monomorph candidates at call time — core's shared resolver
             // ranks, a rejected conversion falls through in declaration
-            // order (same machinery as dyn free functions), and a Host
+            // order (same machinery as dyn free functions), and a callee
             // error — the matched candidate's Rust impl failed — propagates
             // immediately, never retried. Candidate tables are built here,
             // once.
@@ -998,7 +990,7 @@ impl<T: 'static + Clone + mlua::MaybeSend + mlua::MaybeSync> LuaTypeBinder<T> {
                             Ok(out) => return script_to_lua(lua, out),
                             Err(haphe::ScriptCallError::Convert(e)) => last_err = Some(e),
                             Err(host) => {
-                                return Err(mlua::Error::runtime(host.to_string()));
+                                return Err(crate::error::call_error(host));
                             }
                         }
                     }
@@ -1028,7 +1020,7 @@ impl<T: 'static + Clone + mlua::MaybeSend + mlua::MaybeSync> LuaTypeBinder<T> {
                             Ok(out) => return script_to_lua(lua, out),
                             Err(haphe::ScriptCallError::Convert(e)) => last_err = Some(e),
                             Err(host) => {
-                                return Err(mlua::Error::runtime(host.to_string()));
+                                return Err(crate::error::call_error(host));
                             }
                         }
                     }
@@ -1062,7 +1054,7 @@ impl<T: 'static + Clone + mlua::MaybeSend + mlua::MaybeSync> LuaTypeBinder<T> {
                                     Ok(out) => return script_to_lua(&lua, out),
                                     Err(haphe::ScriptCallError::Convert(e)) => last_err = Some(e),
                                     Err(host) => {
-                                        return Err(mlua::Error::runtime(host.to_string()));
+                                        return Err(crate::error::call_error(host));
                                     }
                                 }
                             }
@@ -1096,7 +1088,7 @@ impl<T: 'static + Clone + mlua::MaybeSend + mlua::MaybeSync> LuaTypeBinder<T> {
                                     Ok(out) => return script_to_lua(&lua, out),
                                     Err(haphe::ScriptCallError::Convert(e)) => last_err = Some(e),
                                     Err(host) => {
-                                        return Err(mlua::Error::runtime(host.to_string()));
+                                        return Err(crate::error::call_error(host));
                                     }
                                 }
                             }
@@ -1323,7 +1315,7 @@ impl<T: 'static + Clone + mlua::MaybeSend + mlua::MaybeSync> LuaTypeBinder<T> {
                             let sv_args = sv_args?;
                             let out = f(ScriptCow::Borrowed(&this), &sv_args)
                                 .await
-                                .map_err(|e| mlua::Error::runtime(e.to_string()))?;
+                                .map_err(crate::error::call_error)?;
                             script_to_lua(&lua, out)
                         }
                     },
@@ -2502,7 +2494,7 @@ impl LuaFnBinder {
                     .iter()
                     .map(lua_to_script)
                     .collect::<mlua::Result<_>>()?;
-                let result = f(&script_args).map_err(|e| mlua::Error::runtime(e.to_string()))?;
+                let result = f(&script_args).map_err(crate::error::call_error)?;
                 script_to_lua(lua, result)
             })?;
             table.set(name, lua_fn)?;
@@ -2514,9 +2506,7 @@ impl LuaFnBinder {
                     args.into_vec().iter().map(lua_to_script).collect();
                 async move {
                     let sv_args = sv_args?;
-                    let out = f(&sv_args)
-                        .await
-                        .map_err(|e| mlua::Error::runtime(e.to_string()))?;
+                    let out = f(&sv_args).await.map_err(crate::error::call_error)?;
                     script_to_lua(&lua, out)
                 }
             })?;
@@ -2529,7 +2519,7 @@ impl LuaFnBinder {
                     .iter()
                     .map(lua_to_script)
                     .collect::<mlua::Result<_>>()?;
-                let result = f(&script_args).map_err(|e| mlua::Error::runtime(e.to_string()))?;
+                let result = f(&script_args).map_err(crate::error::call_error)?;
                 script_to_lua(lua, result)
             })?;
             table.set(name, lua_fn)?;
@@ -2556,7 +2546,7 @@ impl LuaFnBinder {
                         Ok(out) => return script_to_lua(lua, out),
                         Err(haphe::ScriptCallError::Convert(e)) => last_err = Some(e),
                         Err(host) => {
-                            return Err(mlua::Error::runtime(host.to_string()));
+                            return Err(crate::error::call_error(host));
                         }
                     }
                 }
@@ -2583,7 +2573,7 @@ impl LuaFnBinder {
                             Ok(out) => return script_to_lua(&lua, out),
                             Err(haphe::ScriptCallError::Convert(e)) => last_err = Some(e),
                             Err(host) => {
-                                return Err(mlua::Error::runtime(host.to_string()));
+                                return Err(crate::error::call_error(host));
                             }
                         }
                     }
@@ -2601,9 +2591,7 @@ impl LuaFnBinder {
                     args.into_vec().iter().map(lua_to_script).collect();
                 async move {
                     let sv_args = sv_args?;
-                    let out = f(&sv_args)
-                        .await
-                        .map_err(|e| mlua::Error::runtime(e.to_string()))?;
+                    let out = f(&sv_args).await.map_err(crate::error::call_error)?;
                     script_to_lua(&lua, out)
                 }
             })?;

@@ -60,9 +60,9 @@ pub use backend::{
 };
 pub use bridge::{
     BindTarget, BridgeProbe, FnBinder, ForeignCaller, ForeignError, ForeignErrorKind,
-    ForeignHandle, FromScript, IntoScript, OpaqueUserData, ScriptBind, ScriptBindFn,
-    ScriptCallError, ScriptCallFuture, ScriptConvertError, ScriptCow, ScriptCtorFuture, ScriptIter,
-    ScriptValue, SelfInstantiation, SkipBind, SkipBindFn, TypeBinder,
+    ForeignFailure, ForeignHandle, FromScript, IntoScript, OpaqueUserData, ScriptBind,
+    ScriptBindFn, ScriptCallError, ScriptCallFuture, ScriptConvertError, ScriptCow,
+    ScriptCtorFuture, ScriptIter, ScriptValue, SelfInstantiation, SkipBind, SkipBindFn, TypeBinder,
 };
 pub use foreign::ForeignInterfaceDescriptor;
 pub use function::{Dispatch, FunctionDescriptor, Ownership, ParamDescriptor, Receiver, any_async};

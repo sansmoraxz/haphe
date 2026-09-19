@@ -753,6 +753,33 @@ impl Machine {
     fn twin(&self) -> Machine {
         self.clone()
     }
+
+    #[script(error_kind = "ToggleError")]
+    fn checked_toggle(&self, next: Flag) -> Result<Flag, TextError> {
+        if next.0 {
+            Ok(Flag(!self.powered.0))
+        } else {
+            Err(TextError("off is not allowed".into()))
+        }
+    }
+
+    #[allow(
+        clippy::unused_self,
+        clippy::unnecessary_wraps,
+        reason = "the `&self` receiver and `Result<(), E>` shape ARE the surface under test (unit-ok fallible dispatch)"
+    )]
+    fn ping(&self) -> Result<(), TextError> {
+        Ok(())
+    }
+
+    #[allow(
+        dead_code,
+        clippy::unnecessary_wraps,
+        reason = "a described struct ok type in a `Result` stays descriptor-only (dispatch no-op), so the method is never invoked — the wrap is the surface under test"
+    )]
+    fn twin_checked(&self) -> Result<Machine, TextError> {
+        Ok(self.clone())
+    }
 }
 
 #[haphe::script]
@@ -850,6 +877,15 @@ impl AsyncMachine {
     )]
     async fn twin_later(&self) -> AsyncMachine {
         self.clone()
+    }
+
+    #[script(error_kind = "ToggleError")]
+    async fn checked_set(&self, next: Flag) -> Result<Flag, TextError> {
+        if next.0 {
+            Ok(next)
+        } else {
+            Err(TextError("off is not allowed".into()))
+        }
     }
 }
 
@@ -1277,12 +1313,12 @@ struct Gauge {
 )]
 impl Gauge {
     #[script(constructor)]
-    fn try_new(raw: i64) -> Result<Self, String> {
+    fn try_new(raw: i64) -> Result<Self, TextError> {
         Ok(Gauge { raw })
     }
 
     #[script(constructor)]
-    async fn try_connect(raw: i64) -> Result<Self, String> {
+    async fn try_connect(raw: i64) -> Result<Self, TextError> {
         Ok(Gauge { raw })
     }
 
@@ -1303,3 +1339,168 @@ fn fallible_constructors_are_described_and_bound() {
     assert_eq!(binder.constructors.len(), 1, "fallible sync ctor bound");
     assert_eq!(binder.async_ctors.len(), 1, "fallible async ctor bound");
 }
+
+// ---------------------------------------------------------------------------
+// Fallible trait-presence dispatch
+// ---------------------------------------------------------------------------
+
+#[haphe::script(error_kind = "FlagError")]
+fn checked_invert(flag: Flag) -> Result<Flag, TextError> {
+    if flag.0 {
+        Ok(Flag(false))
+    } else {
+        Err(TextError("already off".into()))
+    }
+}
+
+#[haphe::script]
+async fn checked_invert_later(flag: Flag) -> Result<Flag, TextError> {
+    if flag.0 {
+        Ok(Flag(false))
+    } else {
+        Err(TextError("already off".into()))
+    }
+}
+
+#[test]
+fn fallible_dispatched_method_maps_err_to_host() {
+    let binder = bound::<Machine>();
+    let (_, f) = binder
+        .methods
+        .iter()
+        .find(|(n, _)| *n == "checked_toggle")
+        .expect("fallible newtype method bound via dispatch");
+    let m = Machine {
+        powered: Flag(true),
+        label: "m".into(),
+    };
+    let out = f(haphe::ScriptCow::Borrowed(&m), &[ScriptValue::Bool(true)]).unwrap();
+    assert!(matches!(out, ScriptValue::Bool(false)));
+    let err = f(haphe::ScriptCow::Borrowed(&m), &[ScriptValue::Bool(false)]).unwrap_err();
+    match err {
+        ScriptCallError::Callee { error, kind, .. } => {
+            assert_eq!(error.to_string(), "off is not allowed");
+            assert_eq!(kind, Some("ToggleError"));
+        }
+        other @ haphe::ScriptCallError::Convert(_) => {
+            panic!("expected Callee error, got {other:?}")
+        }
+    }
+
+    // `Result<(), E>` dispatches and returns Unit on the ok path.
+    let (_, ping) = binder
+        .methods
+        .iter()
+        .find(|(n, _)| *n == "ping")
+        .expect("unit-ok fallible method bound via dispatch");
+    let out = ping(haphe::ScriptCow::Borrowed(&m), &[]).unwrap();
+    assert!(matches!(out, ScriptValue::Unit));
+
+    // A described-struct ok type stays descriptor-only.
+    assert!(!binder.methods.iter().any(|(n, _)| *n == "twin_checked"));
+}
+
+#[test]
+fn fallible_async_dispatched_method_maps_err_to_host() {
+    let binder = bound::<AsyncMachine>();
+    let (_, f) = binder
+        .async_methods
+        .iter()
+        .find(|(n, _)| *n == "checked_set")
+        .expect("fallible async newtype method bound via dispatch");
+    let m = AsyncMachine {
+        powered: Flag(false),
+    };
+    let out = poll_ready(f(ScriptCow::Borrowed(&m), &[ScriptValue::Bool(true)])).unwrap();
+    assert!(matches!(out, ScriptValue::Bool(true)));
+    let err = poll_ready(f(ScriptCow::Borrowed(&m), &[ScriptValue::Bool(false)])).unwrap_err();
+    match err {
+        ScriptCallError::Callee { error, kind, .. } => {
+            assert_eq!(error.to_string(), "off is not allowed");
+            assert_eq!(kind, Some("ToggleError"));
+        }
+        other @ haphe::ScriptCallError::Convert(_) => {
+            panic!("expected Callee error, got {other:?}")
+        }
+    }
+}
+
+#[test]
+fn fallible_dispatched_free_fns_map_err_to_host() {
+    use haphe::{FnBinder, ScriptBindFn};
+
+    type SyncFn = fn(&[ScriptValue]) -> Result<ScriptValue, ScriptCallError>;
+    type AsyncFreeFn = for<'a> fn(&'a [ScriptValue]) -> haphe::ScriptCallFuture<'a>;
+    #[derive(Default)]
+    struct Collect {
+        sync: Vec<(&'static str, SyncFn)>,
+        asynchronous: Vec<(&'static str, AsyncFreeFn)>,
+    }
+    impl FnBinder for Collect {
+        type Error = NeverError;
+        fn function(
+            &mut self,
+            name: &'static str,
+            _: &'static [haphe::TypeDescriptor<'static>],
+            f: SyncFn,
+        ) -> Result<(), NeverError> {
+            self.sync.push((name, f));
+            Ok(())
+        }
+
+        fn function_async(
+            &mut self,
+            name: &'static str,
+            _: &'static [haphe::TypeDescriptor<'static>],
+            f: AsyncFreeFn,
+        ) -> Result<(), NeverError> {
+            self.asynchronous.push((name, f));
+            Ok(())
+        }
+    }
+
+    let mut binder = Collect::default();
+    <checked_invert as ScriptBindFn>::bind(&mut binder).unwrap();
+    <checked_invert_later as ScriptBindFn>::bind(&mut binder).unwrap();
+
+    let (name, f) = binder.sync[0];
+    assert_eq!(name, "checked_invert");
+    let out = f(&[ScriptValue::Bool(true)]).unwrap();
+    assert!(matches!(out, ScriptValue::Bool(false)));
+    match f(&[ScriptValue::Bool(false)]).unwrap_err() {
+        ScriptCallError::Callee { error, kind, .. } => {
+            assert_eq!(error.to_string(), "already off");
+            assert_eq!(kind, Some("FlagError"));
+        }
+        other @ haphe::ScriptCallError::Convert(_) => {
+            panic!("expected Callee error, got {other:?}")
+        }
+    }
+
+    let (name, f) = binder.asynchronous[0];
+    assert_eq!(name, "checked_invert_later");
+    let out = poll_ready(f(&[ScriptValue::Bool(true)])).unwrap();
+    assert!(matches!(out, ScriptValue::Bool(false)));
+    match poll_ready(f(&[ScriptValue::Bool(false)])).unwrap_err() {
+        ScriptCallError::Callee { error, kind, .. } => {
+            assert_eq!(error.to_string(), "already off");
+            assert_eq!(kind, None);
+        }
+        other @ haphe::ScriptCallError::Convert(_) => {
+            panic!("expected Callee error, got {other:?}")
+        }
+    }
+}
+
+/// A message-only fixture error: `String` itself no longer crosses (host
+/// errors must implement `std::error::Error`).
+#[derive(Debug)]
+struct TextError(String);
+
+impl std::fmt::Display for TextError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for TextError {}

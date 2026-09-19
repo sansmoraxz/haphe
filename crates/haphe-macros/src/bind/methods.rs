@@ -32,8 +32,8 @@ pub(crate) fn gen_param_extractions(params: &[(Ident, Type)]) -> Vec<TokenStream
 
 /// The wrapper expression producing the call's `ScriptValue` result:
 /// infallible calls convert directly; fallible ones (`Result<T, E>` in the
-/// declared signature) map `Err` into [`ScriptCallError::Host`], rendering
-/// `E` via `Display` and tagging the declared `error_kind`.
+/// declared signature) carry `Err` intact in [`ScriptCallError::Callee`],
+/// tagged with the declared `error_kind`.
 pub(crate) fn gen_result_expr(method: &BindMethod, call: &TokenStream) -> TokenStream {
     if method.fallible {
         let kind = if let Some(kind) = &method.error_kind {
@@ -45,8 +45,9 @@ pub(crate) fn gen_result_expr(method: &BindMethod, call: &TokenStream) -> TokenS
             match #call {
                 ::core::result::Result::Ok(__v) => ::haphe::IntoScript::into_script(__v),
                 ::core::result::Result::Err(__e) => {
-                    return ::core::result::Result::Err(::haphe::ScriptCallError::Host {
-                        message: ::std::string::ToString::to_string(&__e),
+                    return ::core::result::Result::Err(::haphe::ScriptCallError::Callee {
+                        type_name: ::core::any::type_name_of_val(&__e),
+                        error: ::std::sync::Arc::new(__e),
                         kind: #kind,
                     });
                 }
@@ -181,6 +182,32 @@ pub fn gen_dispatched_method_registration(self_ty: &Type, method: &BindMethod) -
     } else {
         recv_call
     };
+    // Fallible twin: `__invoke` maps `Err` into a Callee error AT THE CONCRETE
+    // IMPL, where `E` is inferable — it never appears in the probe's types
+    // (`E: Error + Send + Sync` is hard-enforced by the spanned const probe at the
+    // declaration site). The wrapper then just `?`s.
+    let (invoke_ret_trait, invoke_ret_impl, invoke_body, try_op) = if method.fallible {
+        let kind = crate::attrs::option_str_tokens(method.error_kind.as_deref());
+        (
+            quote! { ::core::result::Result<Self::__R, ::haphe::ScriptCallError> },
+            quote! { ::core::result::Result<#ret_ty, ::haphe::ScriptCallError> },
+            quote! {
+                #recv_call.map_err(|__e| ::haphe::ScriptCallError::Callee {
+                    type_name: ::core::any::type_name_of_val(&__e),
+                    error: ::std::sync::Arc::new(__e),
+                    kind: #kind,
+                })
+            },
+            quote! { ? },
+        )
+    } else {
+        (
+            quote! { Self::__R },
+            ret_ty.clone(),
+            recv_call.clone(),
+            TokenStream::new(),
+        )
+    };
     if method.is_async {
         register = if matches!(method.receiver, ReceiverShape::RefMut) {
             format_ident!("method_async_mut")
@@ -207,7 +234,7 @@ pub fn gen_dispatched_method_registration(self_ty: &Type, method: &BindMethod) -
                             )?;
                         )*
                         ::core::result::Result::Ok(::haphe::ScriptValue::from(
-                            __T::__invoke(__t, #( #p_vars ),*).await
+                            __T::__invoke(__t, #( #p_vars ),*).await #try_op
                         ))
                     })
                 }) as #cast_ty,
@@ -226,7 +253,7 @@ pub fn gen_dispatched_method_registration(self_ty: &Type, method: &BindMethod) -
                         )?;
                     )*
                     ::core::result::Result::Ok(::haphe::ScriptValue::from(
-                        __T::__invoke(__t, #( #p_vars ),*)
+                        __T::__invoke(__t, #( #p_vars ),*) #try_op
                     ))
                 }) as #cast_ty
                     -> ::core::result::Result<::haphe::ScriptValue, ::haphe::ScriptCallError>,
@@ -241,14 +268,14 @@ pub fn gen_dispatched_method_registration(self_ty: &Type, method: &BindMethod) -
             trait __Call {
                 #( type #p_assoc; )*
                 type __R;
-                #asyncness fn __invoke(#recv_decl, #( #p_vars: Self::#p_assoc ),*) -> Self::__R;
+                #asyncness fn __invoke(#recv_decl, #( #p_vars: Self::#p_assoc ),*) -> #invoke_ret_trait;
             }
             impl __Call for #self_ty {
                 #( type #p_assoc = #stripped; )*
                 type __R = #ret_ty;
                 #[allow(unused_variables)]
-                #asyncness fn __invoke(#recv_decl2, #( #p_vars: #stripped ),*) -> #ret_ty {
-                    #recv_call
+                #asyncness fn __invoke(#recv_decl2, #( #p_vars: #stripped ),*) -> #invoke_ret_impl {
+                    #invoke_body
                 }
             }
             #[allow(non_camel_case_types)]
@@ -452,7 +479,7 @@ pub(crate) fn gen_async_constructor_registration(self_ty: &Type, ctor: &BindMeth
 }
 
 /// The expression producing the constructed value: a fallible constructor's
-/// `Err` maps into [`ScriptCallError::Host`], like [`gen_result_expr`].
+/// `Err` maps into [`ScriptCallError::Callee`], like [`gen_result_expr`].
 fn gen_ctor_expr(ctor: &BindMethod, call: TokenStream) -> TokenStream {
     if !ctor.fallible {
         return call;
@@ -466,8 +493,9 @@ fn gen_ctor_expr(ctor: &BindMethod, call: TokenStream) -> TokenStream {
         match #call {
             ::core::result::Result::Ok(__v) => __v,
             ::core::result::Result::Err(__e) => {
-                return ::core::result::Result::Err(::haphe::ScriptCallError::Host {
-                    message: ::std::string::ToString::to_string(&__e),
+                return ::core::result::Result::Err(::haphe::ScriptCallError::Callee {
+                    type_name: ::core::any::type_name_of_val(&__e),
+                    error: ::std::sync::Arc::new(__e),
                     kind: #kind,
                 });
             }

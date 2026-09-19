@@ -42,8 +42,10 @@ impl Meter {
     /// Fallible associated fn: the `Result` error surfaces as a Lua error
     /// tagged with the declared kind.
     #[script(error_kind = "ParseError")]
-    fn parse(text: String) -> Result<i64, String> {
-        text.trim().parse::<i64>().map_err(|e| e.to_string())
+    fn parse(text: String) -> Result<i64, TextError> {
+        text.trim()
+            .parse::<i64>()
+            .map_err(|e| TextError(e.to_string()))
     }
 }
 
@@ -235,3 +237,16 @@ mod without_generics {
         );
     }
 }
+
+/// A message-only fixture error: `String` itself no longer crosses (host
+/// errors must implement `std::error::Error`).
+#[derive(Debug)]
+struct TextError(String);
+
+impl std::fmt::Display for TextError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for TextError {}

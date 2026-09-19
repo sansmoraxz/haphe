@@ -64,6 +64,7 @@ static ADD_FN: FunctionDescriptor<'static> = FunctionDescriptor {
     return_ownership: Ownership::Owned,
     is_async: false,
     error_kind: None,
+    fallible: false,
 };
 
 static PI_CONST: ConstantDescriptor<'static> = ConstantDescriptor {

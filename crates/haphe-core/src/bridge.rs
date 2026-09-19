@@ -115,22 +115,57 @@ pub enum ScriptValue {
 }
 
 /// Error produced by a bridge call wrapper: either an argument/return
-/// conversion mismatch, or an error the Rust implementation itself returned
-/// (a fallible constructor or `Result`-returning function). Backends map
-/// `Host` onto their native error construct, using `kind` (the descriptor's
-/// [`error_kind`](crate::FunctionDescriptor::error_kind) hint) to pick an
-/// error class where the runtime has them.
+/// conversion mismatch, or an error the called implementation itself
+/// returned (a fallible constructor or `Result`-returning function).
+/// Backends map `Callee` onto their native error construct, rendering data
+/// from the intact error object at THEIR boundary — message via `Display`,
+/// cause chain via [`cause_chain`](Self::cause_chain), `kind` (the
+/// descriptor's [`error_kind`](crate::FunctionDescriptor::error_kind) hint)
+/// to pick an error class where the runtime has them.
 #[derive(Debug, Clone)]
 pub enum ScriptCallError {
     /// A value didn't convert at the boundary.
     Convert(ScriptConvertError),
-    /// The Rust implementation returned its error (rendered via `Display`).
-    Host {
-        /// The error's rendered message.
-        message: String,
+    /// The called implementation returned its own error, carried intact:
+    /// callers on the Rust side downcast to the concrete type and walk
+    /// `source()`; scripts receive the rendered form. Named for the CALLEE —
+    /// whichever side of the bridge implements the function — not for a
+    /// particular runtime topology.
+    Callee {
+        /// The callee's error itself.
+        error: std::sync::Arc<dyn std::error::Error + Send + Sync>,
         /// Error-class hint from the descriptor, when declared.
         kind: Option<&'static str>,
+        /// The concrete error type's name, captured at the boundary.
+        type_name: &'static str,
     },
+}
+
+impl ScriptCallError {
+    /// A `Callee` error's rendered message (`Display` of the carried error);
+    /// the conversion rendering for `Convert`.
+    pub fn message(&self) -> String {
+        match self {
+            Self::Convert(e) => e.to_string(),
+            Self::Callee { error, .. } => error.to_string(),
+        }
+    }
+
+    /// A `Callee` error's rendered cause chain, outermost first — the carried
+    /// error's `source()` links, NOT including the error's own message.
+    /// Empty for `Convert` and for chain-less errors.
+    pub fn cause_chain(&self) -> Vec<String> {
+        let Self::Callee { error, .. } = self else {
+            return Vec::new();
+        };
+        let mut chain = Vec::new();
+        let mut cause = error.source();
+        while let Some(err) = cause {
+            chain.push(err.to_string());
+            cause = err.source();
+        }
+        chain
+    }
 }
 
 impl From<ScriptConvertError> for ScriptCallError {
@@ -143,14 +178,14 @@ impl std::fmt::Display for ScriptCallError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Convert(e) => e.fmt(f),
-            Self::Host {
-                message,
+            Self::Callee {
+                error,
                 kind: Some(kind),
-            } => write!(f, "{kind}: {message}"),
-            Self::Host {
-                message,
-                kind: None,
-            } => f.write_str(message),
+                ..
+            } => write!(f, "{kind}: {error}"),
+            Self::Callee {
+                error, kind: None, ..
+            } => error.fmt(f),
         }
     }
 }
@@ -159,7 +194,7 @@ impl std::error::Error for ScriptCallError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Convert(e) => Some(e),
-            Self::Host { .. } => None,
+            Self::Callee { error, .. } => Some(&**error as &(dyn std::error::Error + 'static)),
         }
     }
 }
@@ -1276,6 +1311,38 @@ pub struct ForeignError {
     /// What went wrong.
     pub kind: ForeignErrorKind,
 }
+
+/// A structured failure raised by a foreign function's script-side
+/// implementation, carried through [`ForeignErrorKind::Call`].
+///
+/// Backends construct it when the implementation supplies structured error
+/// data (mirroring the fields a fallible provided surface exposes in the
+/// other direction — see [`ScriptCallError::Callee`]); Rust callers recover
+/// it by downcasting the [`Call`](ForeignErrorKind::Call) box. A backend
+/// whose runtime can only convey a rendered message keeps boxing its own
+/// error type instead.
+#[derive(Debug, Clone)]
+pub struct ForeignFailure {
+    /// Error-class hint the implementation supplied, when any.
+    pub kind: Option<String>,
+    /// The failure's rendered message.
+    pub message: String,
+    /// The implementation-side error type's name, as it chose to report it.
+    pub type_name: String,
+    /// Rendered cause chain, outermost first, excluding the message itself.
+    pub chain: Vec<String>,
+}
+
+impl std::fmt::Display for ForeignFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.kind {
+            Some(kind) => write!(f, "{kind}: {}", self.message),
+            None => f.write_str(&self.message),
+        }
+    }
+}
+
+impl std::error::Error for ForeignFailure {}
 
 /// The failure modes of a foreign function call.
 #[derive(Debug)]

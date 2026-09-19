@@ -46,7 +46,7 @@ impl Point {
         dead_code,
         reason = "fixtures are exercised through their generated descriptors and bridge wrappers, not direct calls"
     )]
-    pub async fn fetch_data(&self) -> Result<String, String> {
+    pub async fn fetch_data(&self) -> Result<String, TextError> {
         Ok(format!("{},{}", self.x, self.y))
     }
 
@@ -89,6 +89,7 @@ static EXPECTED_METHODS: &[FunctionDescriptor<'static>] = &[
         return_ownership: Ownership::Owned,
         is_async: false,
         error_kind: None,
+        fallible: false,
     },
     FunctionDescriptor {
         name: "scaled",
@@ -106,6 +107,7 @@ static EXPECTED_METHODS: &[FunctionDescriptor<'static>] = &[
         return_ownership: Ownership::Owned,
         is_async: false,
         error_kind: None,
+        fallible: false,
     },
     FunctionDescriptor {
         name: "fetch",
@@ -119,6 +121,7 @@ static EXPECTED_METHODS: &[FunctionDescriptor<'static>] = &[
         return_ownership: Ownership::Owned,
         is_async: true,
         error_kind: Some("IOError"),
+        fallible: true,
     },
 ];
 
@@ -145,6 +148,7 @@ static EXPECTED_CONSTRUCTORS: &[FunctionDescriptor<'static>] = &[FunctionDescrip
     return_ownership: Ownership::Owned,
     is_async: false,
     error_kind: None,
+    fallible: false,
 }];
 
 static EXPECTED_PROPERTIES: &[PropertyDescriptor<'static>] = &[PropertyDescriptor {
@@ -324,10 +328,10 @@ struct Port {
 #[script]
 impl Port {
     #[script(constructor, error_kind = "ValueError")]
-    fn new(number: i64) -> Result<Self, String> {
+    fn new(number: i64) -> Result<Self, TextError> {
         u16::try_from(number)
             .map(|number| Port { number })
-            .map_err(|e| e.to_string())
+            .map_err(|e| TextError(e.to_string()))
     }
 }
 
@@ -375,3 +379,16 @@ fn self_in_accessor_signatures() {
     assert_eq!(props.len(), 1);
     assert!(!props[0].readonly);
 }
+
+/// A message-only fixture error: `String` itself no longer crosses (host
+/// errors must implement `std::error::Error`).
+#[derive(Debug)]
+struct TextError(String);
+
+impl std::fmt::Display for TextError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for TextError {}

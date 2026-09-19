@@ -271,3 +271,50 @@ impl From<mlua::Error> for LuaBindError {
         Self::Lua(e)
     }
 }
+
+/// Maps a bridge call error onto the mlua error a wrapper raises. `Convert`
+/// stays a plain runtime string (boundary misuse rendered in place); `Callee`
+/// crosses as an EXTERNAL error carrying the [`haphe::ScriptCallError`]
+/// intact — `tostring(e)` in Lua still renders "Kind: message" (mlua's
+/// external-error `Display` is a passthrough), and the structured form
+/// (message, kind, type, chain) is recovered by the `haphe_error` global
+/// installed at bind time.
+pub(crate) fn call_error(e: haphe::ScriptCallError) -> mlua::Error {
+    match e {
+        haphe::ScriptCallError::Convert(_) => mlua::Error::runtime(e.to_string()),
+        callee @ haphe::ScriptCallError::Callee { .. } => mlua::Error::external(callee),
+    }
+}
+
+/// The `haphe_error` global: decodes a caught callee error value into a table.
+///
+/// ```lua
+/// local ok, e = pcall(function() return gauge:checked_add(m) end)
+/// local info = haphe_error(e)
+/// -- info.message, info.kind (or nil), info.type, info.chain[1]...
+/// ```
+///
+/// Returns `nil` for anything that is not a callee error (plain string errors,
+/// conversion errors, foreign values).
+pub(crate) fn error_info(lua: &mlua::Lua, value: mlua::Value) -> mlua::Result<mlua::Value> {
+    let mlua::Value::Error(err) = value else {
+        return Ok(mlua::Value::Nil);
+    };
+    let Some(call_err) = err.downcast_ref::<haphe::ScriptCallError>() else {
+        return Ok(mlua::Value::Nil);
+    };
+    let haphe::ScriptCallError::Callee {
+        kind, type_name, ..
+    } = call_err
+    else {
+        return Ok(mlua::Value::Nil);
+    };
+    let info = lua.create_table()?;
+    info.set("message", call_err.message())?;
+    if let Some(kind) = kind {
+        info.set("kind", *kind)?;
+    }
+    info.set("type", *type_name)?;
+    info.set("chain", call_err.cause_chain())?;
+    Ok(mlua::Value::Table(info))
+}

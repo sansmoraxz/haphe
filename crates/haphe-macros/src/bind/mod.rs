@@ -31,10 +31,10 @@ pub struct BindMethod {
     pub has_return: bool,
     pub return_ty: Option<Type>,
     /// The declared return was `Result<T, E>`: `return_ty` holds `T` and the
-    /// wrapper maps `Err(e)` into [`ScriptCallError::Host`] (rendered via
+    /// wrapper maps `Err(e)` into [`ScriptCallError::Callee`] (rendered via
     /// `Display`), tagged with `error_kind`.
     pub fallible: bool,
-    /// The `error_kind = "..."` hint, carried into `Host` errors.
+    /// The `error_kind = "..."` hint, carried into `Callee` errors.
     pub error_kind: Option<String>,
     pub is_async: bool,
 }

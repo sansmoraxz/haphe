@@ -1,6 +1,6 @@
 //! Fallible surfaces through the VM: `Result<T, E>` constructors, methods,
 //! and free functions bind; `Ok` crosses as the value, `Err` raises a Lua
-//! error carrying the rendered Host message, prefixed by the declared
+//! error carrying the rendered callee message, prefixed by the declared
 //! `error_kind` ("`ValueError`: ..."). Conversion errors keep their existing
 //! text.
 
@@ -29,27 +29,32 @@ struct Meter {
 #[script]
 impl Meter {
     #[script(constructor, error_kind = "ValueError")]
-    fn new(level: i64) -> Result<Self, String> {
+    fn new(level: i64) -> Result<Self, TextError> {
         if level < 0 {
-            Err(format!("negative level {level}"))
+            Err(TextError(format!("negative level {level}")))
         } else {
             Ok(Meter { level })
         }
     }
 
     #[script(error_kind = "RangeError")]
-    fn checked_add(&self, amount: i64) -> Result<i64, String> {
+    fn checked_add(&self, amount: i64) -> Result<i64, TextError> {
         self.level
             .checked_add(amount)
-            .ok_or_else(|| "overflow".to_string())
+            .ok_or_else(|| TextError("overflow".into()))
     }
 
-    fn drain(&mut self, amount: i64) -> Result<(), String> {
+    fn drain(&mut self, amount: i64) -> Result<(), TextError> {
         if amount > self.level {
-            return Err("insufficient".to_string());
+            return Err(TextError("insufficient".into()));
         }
         self.level -= amount;
         Ok(())
+    }
+
+    #[script(error_kind = "IoError")]
+    fn reload(&self) -> Result<i64, Layered> {
+        Err(Layered { source: RootCause })
     }
 
     fn remaining(&self) -> i64 {
@@ -71,6 +76,7 @@ fn env() -> Lua {
     let fns = lua.create_table().unwrap();
     bind_fn::<parse_level>(&lua, &fns).unwrap();
     lua.globals().set("fns", fns).unwrap();
+    haphe_lua::install_error_info(&lua).unwrap();
     lua
 }
 
@@ -179,10 +185,10 @@ mod with_async {
         }
 
         #[script(error_kind = "IOError")]
-        async fn refresh(&self) -> Result<i64, String> {
+        async fn refresh(&self) -> Result<i64, TextError> {
             tokio::task::yield_now().await;
             if self.level == 0 {
-                Err("empty".to_string())
+                Err(TextError("empty".into()))
             } else {
                 Ok(self.level)
             }
@@ -214,4 +220,132 @@ mod with_async {
         let text = err.to_string();
         assert!(text.contains("IOError: empty"), "got {text:?}");
     }
+}
+
+/// A message-only fixture error: `String` itself no longer crosses (host
+/// errors must implement `std::error::Error`).
+#[derive(Debug)]
+struct TextError(String);
+
+impl std::fmt::Display for TextError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for TextError {}
+
+/// A two-level error: `source()` renders into the decoded `chain`.
+#[derive(Debug)]
+struct RootCause;
+
+impl std::fmt::Display for RootCause {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("root cause")
+    }
+}
+
+impl std::error::Error for RootCause {}
+
+#[derive(Debug)]
+struct Layered {
+    source: RootCause,
+}
+
+impl std::fmt::Display for Layered {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("layered failure")
+    }
+}
+
+impl std::error::Error for Layered {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Structured error access: haphe_error(e)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn host_error_decodes_to_structured_table() {
+    let lua = env();
+    let (kind, message, type_name, chain_len): (String, String, String, i64) = lua
+        .load(
+            "local m = Meter.new(1) \
+             local ok, e = pcall(function() return m:checked_add(9223372036854775807) end) \
+             assert(not ok) \
+             local info = haphe_error(e) \
+             return info.kind, info.message, info.type, #info.chain",
+        )
+        .eval()
+        .unwrap();
+    assert_eq!(kind, "RangeError");
+    assert_eq!(message, "overflow");
+    assert!(type_name.contains("TextError"), "got {type_name:?}");
+    assert_eq!(chain_len, 0, "TextError has no source chain");
+}
+
+#[test]
+fn source_chain_and_type_cross_into_the_decoded_table() {
+    let lua = env();
+    let (kind, message, type_name, first_cause, rendered): (
+        String,
+        String,
+        String,
+        String,
+        String,
+    ) = lua
+        .load(
+            "local m = Meter.new(1) \
+             local ok, e = pcall(function() return m:reload() end) \
+             assert(not ok) \
+             local info = haphe_error(e) \
+             return info.kind, info.message, info.type, info.chain[1], tostring(e)",
+        )
+        .eval()
+        .unwrap();
+    assert_eq!(kind, "IoError");
+    assert_eq!(message, "layered failure");
+    assert!(type_name.contains("Layered"), "got {type_name:?}");
+    assert_eq!(first_cause, "root cause");
+    // The plain string rendering is unchanged by the structured surface.
+    assert!(
+        rendered.contains("IoError: layered failure"),
+        "got {rendered:?}"
+    );
+}
+
+#[test]
+fn kindless_host_error_decodes_without_kind() {
+    let lua = env();
+    let (kind_is_nil, message): (bool, String) = lua
+        .load(
+            "local m = Meter.new(1) \
+             local ok, e = pcall(function() m:drain(100) end) \
+             assert(not ok) \
+             local info = haphe_error(e) \
+             return info.kind == nil, info.message",
+        )
+        .eval()
+        .unwrap();
+    assert!(kind_is_nil);
+    assert_eq!(message, "insufficient");
+}
+
+#[test]
+fn non_host_values_decode_to_nil() {
+    let lua = env();
+    let (plain, convert): (bool, bool) = lua
+        .load(
+            "local plain = haphe_error('just a string') == nil \
+             local ok, e = pcall(function() local m = Meter.new(1) return m:checked_add('x') end) \
+             assert(not ok) \
+             return plain, haphe_error(e) == nil",
+        )
+        .eval()
+        .unwrap();
+    assert!(plain, "a plain string error is not a callee error");
+    assert!(convert, "a conversion error is not a callee error");
 }

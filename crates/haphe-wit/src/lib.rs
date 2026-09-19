@@ -458,6 +458,10 @@ impl WitGenerator {
             p.line(&format!("use {owner}.{{{}}};", names.join(", ")));
         }
 
+        if interface_needs_script_error(iface, registry, plan) {
+            emit_script_error_record(p);
+        }
+
         let mut member_names = NameMap::new();
         let mut dyn_cx = dyn_gen::DynCx::new();
 
@@ -801,6 +805,59 @@ fn emit_record_properties(
     Ok(())
 }
 
+/// The shared per-interface error record's WIT name: fallible provided
+/// surfaces return `result<T, script-error>`, so guests match on host
+/// failures as values instead of trapping.
+const SCRIPT_ERROR_NAME: &str = "script-error";
+
+/// Whether the interface declares any fallible surface, in either direction
+/// — if so, its `script-error` record must be defined: provided surfaces
+/// carry the implementation's error OUT to the guest; foreign surfaces let
+/// the guest's implementation author the same record.
+fn interface_needs_script_error(
+    iface: &crate::model::Iface<'_>,
+    registry: &ValidatedRegistry<'_>,
+    plan: &Plan<'_>,
+) -> bool {
+    let type_fallible = |erased_id: &str| match registry.get_type(&haphe::TypeId::new(erased_id)) {
+        Some(TypeKind::Struct(s)) => {
+            s.constructors.iter().any(|c| c.fallible) || s.methods.iter().any(|m| m.fallible)
+        }
+        Some(TypeKind::Enum(e)) => e.methods.iter().any(|m| m.fallible),
+        _ => false,
+    };
+    let _ = plan;
+    iface.functions.iter().any(|f| f.fallible)
+        || iface.type_ids.iter().any(|id| type_fallible(id))
+        || iface
+            .instance_indices
+            .iter()
+            .any(|&i| type_fallible(plan.instances[i].erased_id))
+}
+
+/// Emits the shared `script-error` record: the wire rendering of a call
+/// failure raised by a function's implementation, on either side of the
+/// boundary (the originating error object stays on its own side).
+fn emit_script_error_record(p: &mut Printer) {
+    p.doc(Some(
+        "A call failure raised by the function's implementation, carried as a value.",
+    ));
+    p.open(&format!("record {SCRIPT_ERROR_NAME}"));
+    p.doc(Some(
+        "Error-class hint from the declaration, when declared.",
+    ));
+    p.line("kind: option<string>,");
+    p.doc(Some("The error's rendered message."));
+    p.line("message: string,");
+    p.doc(Some("The implementation-side error type's name."));
+    p.line("type-name: string,");
+    p.doc(Some(
+        "The rendered cause chain, outermost first (the message itself excluded).",
+    ));
+    p.line("chain: list<string>,");
+    p.close();
+}
+
 fn emit_record(
     p: &mut Printer,
     s: &StructDescriptor<'_>,
@@ -870,13 +927,21 @@ fn emit_resource(
         let context = format!("{}::{}", s.name, ctor.name);
         p.doc(ctor.doc);
         let params = render_params(ctor, plan, env, &context)?;
-        if ctor_slot_free && !ctor.is_async {
+        // WIT `constructor` also cannot return `result`: a FALLIBLE
+        // constructor becomes a static function whose err arm is the
+        // guest-visible `script-error`.
+        if ctor_slot_free && !ctor.is_async && !ctor.fallible {
             ctor_slot_free = false;
             p.line(&format!("constructor({params});"));
         } else {
             let name = members.insert(ctor.name)?;
             let kw = fn_keyword(ctor);
-            p.line(&format!("{name}: static {kw}({params}) -> {wit_name};"));
+            let ret = if ctor.fallible {
+                format!("result<{wit_name}, {SCRIPT_ERROR_NAME}>")
+            } else {
+                wit_name.to_string()
+            };
+            p.line(&format!("{name}: static {kw}({params}) -> {ret};"));
         }
     }
 
@@ -1302,6 +1367,12 @@ fn render_params(
     Ok(out.join(", "))
 }
 
+/// Renders a function's return arrow. A FALLIBLE declaration (explicit in
+/// the descriptor — `error_kind` presence is not its proxy) wraps in
+/// `result<T, script-error>` in BOTH directions: provided surfaces carry the
+/// implementation's error out to the guest; foreign surfaces let the guest's
+/// implementation author the same record, lifted host-side into
+/// `ForeignFailure`.
 fn render_fn_return(
     f: &FunctionDescriptor<'_>,
     plan: &Plan<'_>,
@@ -1309,10 +1380,10 @@ fn render_fn_return(
     context: &str,
 ) -> Result<String, WitGenError> {
     let mut ret = render_return(f.return_type, f.return_ownership, plan, env, context)?;
-    if f.error_kind.is_some() && !matches!(f.return_type, TypeDescriptor::Result(_, _)) {
+    if f.fallible && !matches!(f.return_type, TypeDescriptor::Result(_, _)) {
         ret = Some(match ret {
-            Some(t) => format!("result<{t}>"),
-            None => "result".to_string(),
+            Some(t) => format!("result<{t}, {SCRIPT_ERROR_NAME}>"),
+            None => format!("result<_, {SCRIPT_ERROR_NAME}>"),
         });
     }
     Ok(match ret {
