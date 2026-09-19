@@ -136,6 +136,8 @@ type AsyncCowFn<U> = for<'a> fn(ScriptCow<'a, U>, &'a [Sv]) -> ScriptCallFuture<
 type AsyncMutFn<U> = for<'a> fn(&'a mut U, &'a [Sv]) -> ScriptCallFuture<'a>;
 type CtorFn<U> = fn(&[Sv]) -> Result<U, Ce>;
 type AsyncCtorFn<U> = for<'a> fn(&'a [Sv]) -> ScriptCtorFuture<'a, U>;
+type AssocFn = fn(&[Sv]) -> Result<Sv, Ce>;
+type AsyncAssocFn = for<'a> fn(&'a [Sv]) -> ScriptCallFuture<'a>;
 type PropGetFn<U> = fn(&U) -> Sv;
 type PropSetFn<U> = fn(&mut U, Sv) -> Result<(), Sce>;
 type AsyncPropGetFn<U> = for<'a> fn(ScriptCow<'a, U>) -> ScriptCallFuture<'a>;
@@ -168,6 +170,14 @@ pub(crate) struct RawTable<U> {
     pub fields: Vec<FieldEntry<U>>,
     pub ctors: Vec<(&'static str, CtorFn<U>)>,
     pub ctors_async: Vec<(&'static str, AsyncCtorFn<U>)>,
+    pub assoc: Vec<(&'static str, AssocFn)>,
+    pub assoc_async: Vec<(&'static str, AsyncAssocFn)>,
+    pub assoc_generic: Vec<(GenericKey, AssocFn)>,
+    pub assoc_generic_async: Vec<(GenericKey, AsyncAssocFn)>,
+    #[cfg(feature = "dyn-generics")]
+    pub assoc_dyn: Vec<(DynKey, AssocFn)>,
+    #[cfg(feature = "dyn-generics")]
+    pub assoc_dyn_async: Vec<(DynKey, AsyncAssocFn)>,
     pub props_get: Vec<(&'static str, PropGetFn<U>)>,
     pub props_set: Vec<(&'static str, PropSetFn<U>)>,
     pub props_get_async: Vec<(&'static str, AsyncPropGetFn<U>)>,
@@ -213,6 +223,14 @@ impl<U> Default for RawTable<U> {
             fields: Vec::new(),
             ctors: Vec::new(),
             ctors_async: Vec::new(),
+            assoc: Vec::new(),
+            assoc_async: Vec::new(),
+            assoc_generic: Vec::new(),
+            assoc_generic_async: Vec::new(),
+            #[cfg(feature = "dyn-generics")]
+            assoc_dyn: Vec::new(),
+            #[cfg(feature = "dyn-generics")]
+            assoc_dyn_async: Vec::new(),
             props_get: Vec::new(),
             props_set: Vec::new(),
             props_get_async: Vec::new(),
@@ -396,6 +414,65 @@ impl<U: 'static> TypeBinder<U> for RawTable<U> {
         Ok(())
     }
 
+    fn associated(&mut self, name: &'static str, f: AssocFn) -> Result<(), Infallible> {
+        self.assoc.push((name, f));
+        Ok(())
+    }
+
+    fn associated_async(&mut self, name: &'static str, f: AsyncAssocFn) -> Result<(), Infallible> {
+        self.assoc_async.push((name, f));
+        Ok(())
+    }
+
+    fn associated_generic(
+        &mut self,
+        name: &'static str,
+        type_args: &'static [TypeDescriptor<'static>],
+        f: AssocFn,
+    ) -> Result<(), Infallible> {
+        self.assoc_generic.push(((name, type_args), f));
+        Ok(())
+    }
+
+    fn associated_generic_async(
+        &mut self,
+        name: &'static str,
+        type_args: &'static [TypeDescriptor<'static>],
+        f: AsyncAssocFn,
+    ) -> Result<(), Infallible> {
+        self.assoc_generic_async.push(((name, type_args), f));
+        Ok(())
+    }
+
+    // Like the method twins: dyn candidates are collected for the
+    // synthesized dispatcher; without the feature the core defaults stand,
+    // safely, because the capability check rejects dyn declarations before
+    // any bind.
+    #[cfg(feature = "dyn-generics")]
+    fn associated_dyn(
+        &mut self,
+        descriptor: &'static haphe::FunctionDescriptor<'static>,
+        type_args: &'static [TypeDescriptor<'static>],
+        self_inst: haphe::SelfInstantiation,
+        f: AssocFn,
+    ) -> Result<(), Infallible> {
+        self.assoc_dyn.push(((descriptor, type_args, self_inst), f));
+        Ok(())
+    }
+
+    #[cfg(feature = "dyn-generics")]
+    fn associated_dyn_async(
+        &mut self,
+        descriptor: &'static haphe::FunctionDescriptor<'static>,
+        type_args: &'static [TypeDescriptor<'static>],
+        self_inst: haphe::SelfInstantiation,
+        f: AsyncAssocFn,
+    ) -> Result<(), Infallible> {
+        self.assoc_dyn_async
+            .push(((descriptor, type_args, self_inst), f));
+        Ok(())
+    }
+
     fn constructor_async(
         &mut self,
         name: &'static str,
@@ -572,6 +649,14 @@ pub(crate) enum EMethod {
     AsyncMut(EAsyncMut),
 }
 
+/// An associated function's dispatch entry. Receiver-less, so no erasure is
+/// needed — the wrapper fn pointers carry no `U`.
+#[derive(Clone, Copy)]
+pub(crate) enum EAssoc {
+    Sync(AssocFn),
+    Async(AsyncAssocFn),
+}
+
 pub(crate) struct EField {
     pub get: EGet,
     pub set: Option<ESet>,
@@ -608,6 +693,14 @@ pub(crate) struct ResourceEntry {
     pub props: HashMap<&'static str, EProp>,
     pub ctors: HashMap<&'static str, ECtor>,
     pub ctors_async: HashMap<&'static str, EAsyncCtor>,
+    /// Associated functions (receiver-less), sync or async.
+    pub assoc: HashMap<&'static str, EAssoc>,
+    /// Statically dispatched generic associated-fn monomorphs, keyed like
+    /// [`generic_methods`](Self::generic_methods).
+    pub generic_assoc: Vec<(GenericKey, EAssoc)>,
+    /// `dyn`-dispatched generic associated-fn candidates.
+    #[cfg(feature = "dyn-generics")]
+    pub dyn_assoc: Vec<(DynKey, EAssoc)>,
     pub methods: HashMap<&'static str, EMethod>,
     /// Statically dispatched generic-method monomorphs, one per declared
     /// instantiation, keyed by `(name, type_args)`.
@@ -689,6 +782,33 @@ where
                 Box::pin(async move { Ok(Box::new(f(args).await?) as AnyBox) }) as EAsyncCtorFut<'_>
             }),
         );
+    }
+
+    let mut assoc: HashMap<&'static str, EAssoc> = HashMap::new();
+    for (name, f) in raw.assoc {
+        assoc.insert(name, EAssoc::Sync(f));
+    }
+    for (name, f) in raw.assoc_async {
+        assoc.insert(name, EAssoc::Async(f));
+    }
+
+    let mut generic_assoc: Vec<(GenericKey, EAssoc)> = Vec::new();
+    for (key, f) in raw.assoc_generic {
+        generic_assoc.push((key, EAssoc::Sync(f)));
+    }
+    for (key, f) in raw.assoc_generic_async {
+        generic_assoc.push((key, EAssoc::Async(f)));
+    }
+
+    #[cfg(feature = "dyn-generics")]
+    let mut dyn_assoc: Vec<(DynKey, EAssoc)> = Vec::new();
+    #[cfg(feature = "dyn-generics")]
+    for (key, f) in raw.assoc_dyn {
+        dyn_assoc.push((key, EAssoc::Sync(f)));
+    }
+    #[cfg(feature = "dyn-generics")]
+    for (key, f) in raw.assoc_dyn_async {
+        dyn_assoc.push((key, EAssoc::Async(f)));
     }
 
     let mut props: HashMap<&'static str, EProp> = HashMap::new();
@@ -856,6 +976,10 @@ where
         props,
         ctors,
         ctors_async,
+        assoc,
+        generic_assoc,
+        #[cfg(feature = "dyn-generics")]
+        dyn_assoc,
         methods,
         generic_methods,
         #[cfg(feature = "dyn-generics")]
@@ -897,6 +1021,14 @@ pub(crate) struct ValueEntry {
     #[cfg(feature = "dyn-generics")]
     pub dyn_methods: Vec<(DynKey, ESelfFn)>,
     pub ctors: HashMap<&'static str, EValueCtor>,
+    /// Associated functions (receiver-less), sync or async — companions
+    /// with no `this` parameter.
+    pub assoc: HashMap<&'static str, EAssoc>,
+    /// Statically dispatched generic associated-fn monomorphs.
+    pub generic_assoc: Vec<(GenericKey, EAssoc)>,
+    /// `dyn`-dispatched generic associated-fn candidates.
+    #[cfg(feature = "dyn-generics")]
+    pub dyn_assoc: Vec<(DynKey, EAssoc)>,
     /// Trait projections, keyed by projected member source name. Each takes
     /// the receiver (and, where applicable, further args) as `ScriptValue`s:
     /// `args[0]` is always the receiver.
@@ -995,6 +1127,27 @@ where
         entry
             .ctors
             .insert(name, Box::new(move |args| Ok(f(args)?.into_script())));
+    }
+
+    for (name, f) in raw.assoc {
+        entry.assoc.insert(name, EAssoc::Sync(f));
+    }
+    for (name, f) in raw.assoc_async {
+        entry.assoc.insert(name, EAssoc::Async(f));
+    }
+    for (key, f) in raw.assoc_generic {
+        entry.generic_assoc.push((key, EAssoc::Sync(f)));
+    }
+    for (key, f) in raw.assoc_generic_async {
+        entry.generic_assoc.push((key, EAssoc::Async(f)));
+    }
+    #[cfg(feature = "dyn-generics")]
+    for (key, f) in raw.assoc_dyn {
+        entry.dyn_assoc.push((key, EAssoc::Sync(f)));
+    }
+    #[cfg(feature = "dyn-generics")]
+    for (key, f) in raw.assoc_dyn_async {
+        entry.dyn_assoc.push((key, EAssoc::Async(f)));
     }
 
     // Computed properties: value semantics — getters return the property,

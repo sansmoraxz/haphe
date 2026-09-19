@@ -144,7 +144,9 @@ pub fn gen_dispatched_method_registration(self_ty: &Type, method: &BindMethod) -
             extra_bound: quote! { __T: ::core::clone::Clone, },
             register: format_ident!("method"),
         },
-        // `None` mirrors gen_method_registration's associated-fn handling.
+        // `None` is unreachable here: trait-presence dispatch requires a
+        // receiver (see `is_dispatch_eligible`); the arm only completes the
+        // match.
         ReceiverShape::Ref | ReceiverShape::None => DispatchShape {
             recv_decl: quote! { __t: &Self },
             recv_call: quote! { __t.#ident(#(#call_args),*) },
@@ -236,6 +238,24 @@ pub(crate) fn gen_async_method_registration(self_ty: &Type, method: &BindMethod)
 
     let extractions = gen_param_extractions(&method.params);
     let call_args = gen_call_args(&method.params);
+
+    if method.receiver == ReceiverShape::None {
+        let result_expr = gen_result_expr(
+            method,
+            &quote! { <#self_ty>::#ident(#(#call_args),*).await },
+        );
+        return quote! {
+            __b.associated_async(
+                #name,
+                (|__args: &[::haphe::ScriptValue]| -> ::haphe::ScriptCallFuture<'_> {
+                    ::std::boxed::Box::pin(async move {
+                        #(#extractions)*
+                        ::core::result::Result::Ok(#result_expr)
+                    })
+                }) as for<'a> fn(&'a [::haphe::ScriptValue]) -> ::haphe::ScriptCallFuture<'a>,
+            )?;
+        };
+    }
 
     let result_expr = gen_result_expr(method, &quote! { __t.#ident(#(#call_args),*).await });
 
@@ -454,9 +474,9 @@ pub(crate) fn gen_method_registration(self_ty: &Type, method: &BindMethod) -> To
             let result_expr =
                 gen_result_expr(method, &quote! { <#self_ty>::#ident(#(#call_args),*) });
             quote! {
-                __b.method(
+                __b.associated(
                     #name,
-                    |_: ::haphe::ScriptCow<'_, #self_ty>, __args: &[::haphe::ScriptValue]| -> ::core::result::Result<::haphe::ScriptValue, ::haphe::ScriptCallError> {
+                    |__args: &[::haphe::ScriptValue]| -> ::core::result::Result<::haphe::ScriptValue, ::haphe::ScriptCallError> {
                         #(#extractions)*
                         ::core::result::Result::Ok(#result_expr)
                     },
@@ -545,6 +565,28 @@ pub fn gen_generic_method_registration(self_ty: &Type, dm: &GenericBindMethod) -
                             }) as fn(&mut #self_ty, &[::haphe::ScriptValue]) -> ::core::result::Result<::haphe::ScriptValue, ::haphe::ScriptCallError>,
                         )?;
                     },
+                    (false, ReceiverShape::None) => quote::quote_spanned! {*span=>
+                        __b.associated_generic(
+                            #name,
+                            #type_args,
+                            (|__args: &[::haphe::ScriptValue]| -> ::core::result::Result<::haphe::ScriptValue, ::haphe::ScriptCallError> {
+                                #(#extractions)*
+                                ::core::result::Result::Ok(#sync_result)
+                            }) as fn(&[::haphe::ScriptValue]) -> ::core::result::Result<::haphe::ScriptValue, ::haphe::ScriptCallError>,
+                        )?;
+                    },
+                    (true, ReceiverShape::None) => quote::quote_spanned! {*span=>
+                        __b.associated_generic_async(
+                            #name,
+                            #type_args,
+                            (|__args: &[::haphe::ScriptValue]| -> ::haphe::ScriptCallFuture<'_> {
+                                ::std::boxed::Box::pin(async move {
+                                    #(#extractions)*
+                                    ::core::result::Result::Ok(#async_result)
+                                })
+                            }) as for<'a> fn(&'a [::haphe::ScriptValue]) -> ::haphe::ScriptCallFuture<'a>,
+                        )?;
+                    },
                     (false, _) => quote::quote_spanned! {*span=>
                         __b.method_generic(
                             #name,
@@ -593,6 +635,30 @@ pub fn gen_generic_method_registration(self_ty: &Type, dm: &GenericBindMethod) -
                             #(#extractions)*
                             ::core::result::Result::Ok(#sync_result)
                         }) as fn(&mut #self_ty, &[::haphe::ScriptValue]) -> ::core::result::Result<::haphe::ScriptValue, ::haphe::ScriptCallError>,
+                    )?;
+                },
+                (false, ReceiverShape::None) => quote::quote_spanned! {*span=>
+                    __b.associated_dyn(
+                        &__HAPHE_DYN_DESC,
+                        #type_args,
+                        #self_inst,
+                        (|__args: &[::haphe::ScriptValue]| -> ::core::result::Result<::haphe::ScriptValue, ::haphe::ScriptCallError> {
+                            #(#extractions)*
+                            ::core::result::Result::Ok(#sync_result)
+                        }) as fn(&[::haphe::ScriptValue]) -> ::core::result::Result<::haphe::ScriptValue, ::haphe::ScriptCallError>,
+                    )?;
+                },
+                (true, ReceiverShape::None) => quote::quote_spanned! {*span=>
+                    __b.associated_dyn_async(
+                        &__HAPHE_DYN_DESC,
+                        #type_args,
+                        #self_inst,
+                        (|__args: &[::haphe::ScriptValue]| -> ::haphe::ScriptCallFuture<'_> {
+                            ::std::boxed::Box::pin(async move {
+                                #(#extractions)*
+                                ::core::result::Result::Ok(#async_result)
+                            })
+                        }) as for<'a> fn(&'a [::haphe::ScriptValue]) -> ::haphe::ScriptCallFuture<'a>,
                     )?;
                 },
                 (false, _) => quote::quote_spanned! {*span=>

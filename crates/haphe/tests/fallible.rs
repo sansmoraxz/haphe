@@ -86,6 +86,22 @@ impl<T> TypeBinder<T> for Collect<T> {
         Ok(())
     }
 
+    fn associated(
+        &mut self,
+        _: &'static str,
+        _: fn(&[ScriptValue]) -> Result<ScriptValue, ScriptCallError>,
+    ) -> Result<(), NeverError> {
+        Ok(())
+    }
+
+    fn associated_async(
+        &mut self,
+        _: &'static str,
+        _: for<'a> fn(&'a [ScriptValue]) -> haphe::ScriptCallFuture<'a>,
+    ) -> Result<(), NeverError> {
+        Ok(())
+    }
+
     fn constructor_async(
         &mut self,
         name: &'static str,

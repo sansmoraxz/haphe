@@ -17,7 +17,7 @@ use wasmtime::component::{
 use wasmtime::{AsContextMut, Store};
 
 use crate::host::{
-    AnyBox, CowAny, EMethod, GuestResource, HostRep, HostResState, HostResource, HostTable,
+    AnyBox, CowAny, EAssoc, EMethod, GuestResource, HostRep, HostResState, HostResource, HostTable,
     RawTable, ResourceEntry, ValueEntry, block_on, erase_resource, erase_value, trap_call,
     trap_convert,
 };
@@ -2799,6 +2799,46 @@ fn define_enum_dyn_companion<T: 'static>(
     Ok(())
 }
 
+/// Defines one live enum-companion dispatcher for a RECEIVER-LESS
+/// associated fn: like [`define_enum_dyn_companion`], but no `this` argument
+/// is split off and the receiver-less wrappers are called.
+#[cfg(feature = "dyn-generics")]
+fn define_enum_dyn_assoc_companion<T: 'static>(
+    inst: &mut LinkerInstance<'_, T>,
+    name: &str,
+    desc: &'static haphe::FunctionDescriptor<'static>,
+    cands: Vec<(DynCand, usize)>,
+    entry: Arc<ValueEntry>,
+    cx: &DispatchCx,
+) -> Result<(), WasmBindError> {
+    let cx = cx.clone();
+    let msg = name.to_string();
+    inst.func_new(name, move |mut store, fty, params, results| {
+        let raw = lift_args(&cx, &mut store, params, 0, &msg)?;
+        let (tag, values) = unwrap_dyn_args(desc, raw, &msg)?;
+        let order = dyn_attempt_order(desc, &cands, tag.as_deref(), &values, &msg)?;
+        let mut last = None;
+        for i in order {
+            let attempt = match entry.dyn_assoc[cands[i].1].1 {
+                EAssoc::Sync(f) => f(&values),
+                EAssoc::Async(f) => block_on(f(&values)),
+            };
+            match attempt {
+                Ok(out) => {
+                    let out = wrap_dyn_result(desc, &cands[i].0.key, out);
+                    return lower_result(&cx, &mut store, fty.results(), &out, results, &msg);
+                }
+                // Convert error: the candidate rejected the arguments — fall
+                // through. A Host error is the implementation's own failure.
+                Err(ScriptCallError::Convert(e)) => last = Some(e),
+                Err(host) => return Err(trap_call(&msg, host)),
+            }
+        }
+        Err(no_candidate_trap(&msg, last))
+    })?;
+    Ok(())
+}
+
 /// Defines a live free-function (or companion-shaped) dispatch.
 fn define_value_fn<T: 'static>(
     inst: &mut LinkerInstance<'_, T>,
@@ -2942,6 +2982,13 @@ enum ValueMethodKey {
     /// A static monomorph served from the dyn candidate table.
     #[cfg(feature = "dyn-generics")]
     Dyn(usize),
+    /// A receiver-less associated fn: no `this` argument to split off.
+    Assoc(String),
+    /// A receiver-less generic monomorph from `generic_assoc`.
+    AssocGeneric(usize),
+    /// A receiver-less static monomorph served from the dyn assoc table.
+    #[cfg(feature = "dyn-generics")]
+    AssocDyn(usize),
 }
 
 /// Linker names + dispatch keys for one enum method's companion functions:
@@ -2958,9 +3005,17 @@ fn enum_companion_defs(
     let mut out = Vec::new();
     if m.generic_params.is_empty() {
         let name = member_names.insert(&format!("{owner}{sep}{}", m.name))?;
-        let key = value
-            .filter(|v| v.methods.contains_key(m.name))
-            .map(|_| ValueMethodKey::Named(m.name.to_string()));
+        let key = value.and_then(|v| {
+            if m.receiver.is_none() {
+                v.assoc
+                    .contains_key(m.name)
+                    .then(|| ValueMethodKey::Assoc(m.name.to_string()))
+            } else {
+                v.methods
+                    .contains_key(m.name)
+                    .then(|| ValueMethodKey::Named(m.name.to_string()))
+            }
+        });
         out.push((name, key));
         return Ok(out);
     }
@@ -2968,6 +3023,21 @@ fn enum_companion_defs(
         let mangled = mangle_generic_name(m.name, args)?;
         let name = member_names.insert(&format!("{owner}{sep}{mangled}"))?;
         let key = value.and_then(|v| {
+            if m.receiver.is_none() {
+                let key = v
+                    .generic_assoc
+                    .iter()
+                    .position(|((n, a), _)| *n == m.name && a[..] == args[..])
+                    .map(ValueMethodKey::AssocGeneric);
+                #[cfg(feature = "dyn-generics")]
+                let key = key.or_else(|| {
+                    v.dyn_assoc
+                        .iter()
+                        .position(|((d, a, _), _)| d.name == m.name && a[..] == args[..])
+                        .map(ValueMethodKey::AssocDyn)
+                });
+                return key;
+            }
             let key = v
                 .generic_methods
                 .iter()
@@ -3004,14 +3074,24 @@ fn bind_enum_dyn_companion<T: 'static>(
         return Ok(());
     }
     let dname = member_names.insert(&format!("{owner}{sep}{}-dyn", m.name))?;
+    let receiverless = m.receiver.is_none();
     let mut resolved = None;
     if let Some(v) = value {
         let mut cands = Vec::new();
         let mut desc = None;
-        for (i, ((d, args, si), _)) in v.dyn_methods.iter().enumerate() {
-            if d.name == m.name {
-                desc = Some(*d);
-                cands.push((DynCand::new(args, *si)?, i));
+        if receiverless {
+            for (i, ((d, args, si), _)) in v.dyn_assoc.iter().enumerate() {
+                if d.name == m.name {
+                    desc = Some(*d);
+                    cands.push((DynCand::new(args, *si)?, i));
+                }
+            }
+        } else {
+            for (i, ((d, args, si), _)) in v.dyn_methods.iter().enumerate() {
+                if d.name == m.name {
+                    desc = Some(*d);
+                    cands.push((DynCand::new(args, *si)?, i));
+                }
             }
         }
         if let Some(desc) = desc {
@@ -3019,6 +3099,9 @@ fn bind_enum_dyn_companion<T: 'static>(
         }
     }
     match resolved {
+        Some((desc, cands, entry)) if receiverless => {
+            define_enum_dyn_assoc_companion(inst, &dname, desc, cands, entry, cx)
+        }
         Some((desc, cands, entry)) => {
             define_enum_dyn_companion(inst, &dname, desc, cands, entry, cx)
         }
@@ -3041,11 +3124,28 @@ fn define_enum_companion<T: 'static>(
     let msg_name = name.to_string();
     inst.func_new(name, move |mut store, fty, params, results| {
         let args = lift_args(&cx, &mut store, params, 0, &msg_name)?;
+        // Receiver-less associated companions take no `this`.
+        let assoc = match &method {
+            ValueMethodKey::Assoc(n) => entry.assoc.get(n.as_str()).copied(),
+            ValueMethodKey::AssocGeneric(i) => entry.generic_assoc.get(*i).map(|(_, a)| *a),
+            #[cfg(feature = "dyn-generics")]
+            ValueMethodKey::AssocDyn(i) => entry.dyn_assoc.get(*i).map(|(_, a)| *a),
+            _ => None,
+        };
+        if let Some(a) = assoc {
+            let out = match a {
+                EAssoc::Sync(f) => f(&args),
+                EAssoc::Async(f) => block_on(f(&args)),
+            }
+            .map_err(|e| trap_call(&msg_name, e))?;
+            return lower_result(&cx, &mut store, fty.results(), &out, results, &msg_name);
+        }
         let m = match &method {
             ValueMethodKey::Named(n) => entry.methods.get(n.as_str()),
             ValueMethodKey::Generic(i) => entry.generic_methods.get(*i).map(|(_, m)| m),
             #[cfg(feature = "dyn-generics")]
             ValueMethodKey::Dyn(i) => entry.dyn_methods.get(*i).map(|(_, m)| m),
+            _ => None,
         }
         .ok_or_else(|| trap(&msg_name, "enum method has no dispatch channel"))?;
         let (this, rest) = args
@@ -3151,13 +3251,38 @@ fn bind_resource_live<T: 'static>(
                 Some(Receiver::Owned) | None => format!("[static]{res}.{name}"),
             };
             if m.receiver.is_none() {
-                // Receiver-less associated functions have no dispatch channel
-                // through `TypeBinder` that carries no value; descriptive trap.
-                stub_func_msg(
-                    inst,
-                    &prefixed,
-                    "associated functions without a receiver are not yet bridged",
-                )?;
+                // Receiver-less associated functions dispatch through the
+                // `associated*` channels — no handle involved.
+                let key = match type_args {
+                    None if entry.assoc.contains_key(m.name) => {
+                        Some(AssocKey::Named(m.name.to_string()))
+                    }
+                    Some(args) => {
+                        let key = entry
+                            .generic_assoc
+                            .iter()
+                            .position(|((n, a), _)| *n == m.name && a[..] == args[..])
+                            .map(AssocKey::Generic);
+                        #[cfg(feature = "dyn-generics")]
+                        let key = key.or_else(|| {
+                            entry
+                                .dyn_assoc
+                                .iter()
+                                .position(|((d, a, _), _)| d.name == m.name && a[..] == args[..])
+                                .map(AssocKey::Dyn)
+                        });
+                        key
+                    }
+                    None => None,
+                };
+                match key {
+                    Some(key) => define_assoc(inst, &prefixed, key, entry, cx)?,
+                    None => stub_func_msg(
+                        inst,
+                        &prefixed,
+                        "declared but not bridgeable (its signature types lack value conversions)",
+                    )?,
+                }
                 continue;
             }
             let key = match type_args {
@@ -3211,11 +3336,24 @@ fn bind_resource_live<T: 'static>(
                 Some(Receiver::Owned) | None => format!("[static]{res}.{dname}"),
             };
             if m.receiver.is_none() {
-                stub_func_msg(
-                    inst,
-                    &prefixed,
-                    "associated functions without a receiver are not yet bridged",
-                )?;
+                let mut cands = Vec::new();
+                let mut desc = None;
+                for (i, ((d, args, si), _)) in entry.dyn_assoc.iter().enumerate() {
+                    if d.name == m.name {
+                        desc = Some(*d);
+                        cands.push((DynCand::new(args, *si)?, i));
+                    }
+                }
+                match desc {
+                    Some(desc) => {
+                        define_dyn_assoc(inst, &prefixed, desc, cands, entry.clone(), cx)?;
+                    }
+                    None => stub_func_msg(
+                        inst,
+                        &prefixed,
+                        "declared but not bridgeable (its signature types lack value conversions)",
+                    )?,
+                }
             } else {
                 let mut cands = Vec::new();
                 let mut desc = None;
@@ -3462,6 +3600,88 @@ enum MethodKey {
     /// registers its wrappers through `method_dyn*` only).
     #[cfg(feature = "dyn-generics")]
     Dyn(usize),
+}
+
+/// Bind-time-resolved dispatch key for one associated function, mirroring
+/// [`MethodKey`] over the entry's `assoc` tables.
+enum AssocKey {
+    Named(String),
+    Generic(usize),
+    #[cfg(feature = "dyn-generics")]
+    Dyn(usize),
+}
+
+/// Defines one live associated function (`[static]{res}.{name}`): lifts the
+/// guest arguments, calls the receiver-less wrapper, lowers the result. No
+/// resource handle is involved.
+fn define_assoc<T: 'static>(
+    inst: &mut LinkerInstance<'_, T>,
+    linker_name: &str,
+    key: AssocKey,
+    entry: &Arc<ResourceEntry>,
+    cx: &DispatchCx,
+) -> Result<(), WasmBindError> {
+    let (entry, cx) = (entry.clone(), cx.clone());
+    let msg = linker_name.to_string();
+    inst.func_new(linker_name, move |mut store, fty, params, results| {
+        let args = lift_args(&cx, &mut store, params, 0, &msg)?;
+        let a = match &key {
+            AssocKey::Named(name) => entry.assoc.get(name.as_str()).copied(),
+            AssocKey::Generic(i) => entry.generic_assoc.get(*i).map(|(_, a)| *a),
+            #[cfg(feature = "dyn-generics")]
+            AssocKey::Dyn(i) => entry.dyn_assoc.get(*i).map(|(_, a)| *a),
+        }
+        .ok_or_else(|| trap(&msg, "associated function has no bridge channel"))?;
+        let out = match a {
+            EAssoc::Sync(f) => f(&args).map_err(|e| trap_call(&msg, e))?,
+            // Driven to completion on this thread, like async methods; no
+            // table lock is held (no receiver), so re-entrancy is safe.
+            EAssoc::Async(f) => block_on(f(&args)).map_err(|e| trap_call(&msg, e))?,
+        };
+        lower_result(&cx, &mut store, fty.results(), &out, results, &msg)
+    })?;
+    Ok(())
+}
+
+/// Defines one live `dyn` dispatcher for a receiver-less associated
+/// function: ranks the candidates like [`define_dyn_method`], but calls the
+/// receiver-less wrappers.
+#[cfg(feature = "dyn-generics")]
+fn define_dyn_assoc<T: 'static>(
+    inst: &mut LinkerInstance<'_, T>,
+    linker_name: &str,
+    desc: &'static haphe::FunctionDescriptor<'static>,
+    cands: Vec<(DynCand, usize)>,
+    entry: Arc<ResourceEntry>,
+    cx: &DispatchCx,
+) -> Result<(), WasmBindError> {
+    let cx = cx.clone();
+    let msg = linker_name.to_string();
+    inst.func_new(linker_name, move |mut store, fty, params, results| {
+        let raw = lift_args(&cx, &mut store, params, 0, &msg)?;
+        let (tag, values) = unwrap_dyn_args(desc, raw, &msg)?;
+        let order = dyn_attempt_order(desc, &cands, tag.as_deref(), &values, &msg)?;
+        let mut last = None;
+        for i in order {
+            let (_, entry_index) = &cands[i];
+            let attempt = match entry.dyn_assoc[*entry_index].1 {
+                EAssoc::Sync(f) => f(&values),
+                EAssoc::Async(f) => block_on(f(&values)),
+            };
+            match attempt {
+                Ok(out) => {
+                    let out = wrap_dyn_result(desc, &cands[i].0.key, out);
+                    return lower_result(&cx, &mut store, fty.results(), &out, results, &msg);
+                }
+                // Convert error: the candidate rejected the arguments — fall
+                // through. A Host error is the implementation's own failure.
+                Err(ScriptCallError::Convert(e)) => last = Some(e),
+                Err(host) => return Err(trap_call(&msg, host)),
+            }
+        }
+        Err(no_candidate_trap(&msg, last))
+    })?;
+    Ok(())
 }
 
 fn define_method<T: 'static>(

@@ -35,6 +35,7 @@ type DynFn<T> =
 type DynMutFn<T> = fn(&mut T, &[ScriptValue]) -> Result<ScriptValue, ScriptCallError>;
 type DynAsyncFn<T> =
     for<'a> fn(haphe::ScriptCow<'a, T>, &'a [ScriptValue]) -> haphe::ScriptCallFuture<'a>;
+type AssocFn = fn(&[ScriptValue]) -> Result<ScriptValue, ScriptCallError>;
 
 #[derive(Default)]
 struct DynBinder<T> {
@@ -47,6 +48,12 @@ struct DynBinder<T> {
     generic_async_methods: Vec<(&'static str, Args, DynAsyncFn<T>)>,
     self_insts: Vec<haphe::SelfInstantiation>,
     plain_methods: Vec<&'static str>,
+    associated: Vec<(&'static str, AssocFn)>,
+    async_associated: Vec<&'static str>,
+    assoc_generic: Vec<(&'static str, Args)>,
+    assoc_generic_async: Vec<(&'static str, Args)>,
+    assoc_dyn: Vec<(Desc, Args, AssocFn)>,
+    assoc_dyn_async: Vec<(Desc, Args)>,
 }
 
 type DynAsyncMutFn<T> = for<'a> fn(&'a mut T, &'a [ScriptValue]) -> haphe::ScriptCallFuture<'a>;
@@ -164,6 +171,68 @@ impl<T> TypeBinder<T> for DynBinder<T> {
         _: &'static str,
         _: fn(&[ScriptValue]) -> Result<T, ScriptCallError>,
     ) -> Result<(), NeverError> {
+        Ok(())
+    }
+
+    fn associated(
+        &mut self,
+        name: &'static str,
+        f: fn(&[ScriptValue]) -> Result<ScriptValue, ScriptCallError>,
+    ) -> Result<(), NeverError> {
+        self.associated.push((name, f));
+        Ok(())
+    }
+
+    fn associated_async(
+        &mut self,
+        name: &'static str,
+        _: for<'a> fn(&'a [ScriptValue]) -> haphe::ScriptCallFuture<'a>,
+    ) -> Result<(), NeverError> {
+        self.async_associated.push(name);
+        Ok(())
+    }
+
+    fn associated_generic(
+        &mut self,
+        name: &'static str,
+        type_args: Args,
+        _: fn(&[ScriptValue]) -> Result<ScriptValue, ScriptCallError>,
+    ) -> Result<(), NeverError> {
+        self.assoc_generic.push((name, type_args));
+        Ok(())
+    }
+
+    fn associated_generic_async(
+        &mut self,
+        name: &'static str,
+        type_args: Args,
+        _: for<'a> fn(&'a [ScriptValue]) -> haphe::ScriptCallFuture<'a>,
+    ) -> Result<(), NeverError> {
+        self.assoc_generic_async.push((name, type_args));
+        Ok(())
+    }
+
+    fn associated_dyn(
+        &mut self,
+        descriptor: Desc,
+        type_args: Args,
+        self_inst: haphe::SelfInstantiation,
+        f: fn(&[ScriptValue]) -> Result<ScriptValue, ScriptCallError>,
+    ) -> Result<(), NeverError> {
+        self.self_insts.push(self_inst);
+        self.assoc_dyn.push((descriptor, type_args, f));
+        Ok(())
+    }
+
+    fn associated_dyn_async(
+        &mut self,
+        descriptor: Desc,
+        type_args: Args,
+        self_inst: haphe::SelfInstantiation,
+        _: for<'a> fn(&'a [ScriptValue]) -> haphe::ScriptCallFuture<'a>,
+    ) -> Result<(), NeverError> {
+        self.self_insts.push(self_inst);
+        self.assoc_dyn_async.push((descriptor, type_args));
         Ok(())
     }
 
@@ -301,6 +370,12 @@ fn bound<T: ScriptBind>() -> DynBinder<T> {
         generic_async_methods: Vec::new(),
         self_insts: Vec::new(),
         plain_methods: Vec::new(),
+        associated: Vec::new(),
+        async_associated: Vec::new(),
+        assoc_generic: Vec::new(),
+        assoc_generic_async: Vec::new(),
+        assoc_dyn: Vec::new(),
+        assoc_dyn_async: Vec::new(),
     };
     T::bind(&mut binder).unwrap();
     binder
@@ -378,6 +453,35 @@ impl Holder {
     /// Non-generic methods still take the plain channel.
     fn get(&self) -> i64 {
         self.total
+    }
+
+    /// Receiver-less associated fn: the dedicated `associated` channel.
+    fn splat(seed: i64) -> i64 {
+        seed * 2
+    }
+
+    /// Async associated fn.
+    async fn fetch_default(tag: String) -> String {
+        tag
+    }
+
+    /// Static generic associated fn: `associated_generic` per monomorph.
+    #[script(instantiate(i64), instantiate(String))]
+    fn first_value<T>(a: T, b: T) -> T {
+        let _ = b;
+        a
+    }
+
+    /// Dyn generic associated fn: `associated_dyn` per candidate.
+    #[script(dyn, instantiate(i64), instantiate(f64))]
+    fn total_of<T: Acc>(value: T) -> i64 {
+        value.acc()
+    }
+
+    /// Async dyn generic associated fn.
+    #[script(dyn, instantiate(String))]
+    async fn tag_of<T: ToString>(value: T) -> String {
+        value.to_string()
     }
 }
 
@@ -715,4 +819,77 @@ fn static_generic_methods_work_on_generic_self_types() {
     };
     let out = wrapper(haphe::ScriptCow::Borrowed(&pair), &[ScriptValue::F64(0.5)]).unwrap();
     assert!(matches!(out, ScriptValue::F64(v) if v == 0.5));
+}
+
+// ---------------------------------------------------------------------------
+// Associated fns: the receiver-less channels
+// ---------------------------------------------------------------------------
+
+#[test]
+fn associated_fn_routes_to_associated_channel_and_calls() {
+    let binder = bound::<Holder>();
+    let (name, f) = binder
+        .associated
+        .iter()
+        .find(|(n, _)| *n == "splat")
+        .expect("splat registered on the associated channel");
+    assert_eq!(*name, "splat");
+    let out = f(&[ScriptValue::I64(21)]).unwrap();
+    assert!(matches!(out, ScriptValue::I64(42)));
+    // Not double-registered as an instance method.
+    assert!(!binder.plain_methods.contains(&"splat"));
+}
+
+#[test]
+fn async_associated_fn_routes_to_async_channel() {
+    let binder = bound::<Holder>();
+    assert!(binder.async_associated.contains(&"fetch_default"));
+    assert!(!binder.plain_methods.contains(&"fetch_default"));
+}
+
+#[test]
+fn static_generic_associated_fn_registers_per_monomorph() {
+    let binder = bound::<Holder>();
+    let firsts: Vec<_> = binder
+        .assoc_generic
+        .iter()
+        .filter(|(n, _)| *n == "first_value")
+        .collect();
+    assert_eq!(firsts.len(), 2);
+    assert_eq!(
+        firsts[0].1[0],
+        TypeDescriptor::Primitive(haphe::PrimitiveType::I64)
+    );
+    assert_eq!(firsts[1].1[0], TypeDescriptor::String);
+}
+
+#[test]
+fn dyn_associated_fn_registers_candidates_and_calls() {
+    let binder = bound::<Holder>();
+    let totals: Vec<_> = binder
+        .assoc_dyn
+        .iter()
+        .filter(|(d, _, _)| d.name == "total_of")
+        .collect();
+    assert_eq!(totals.len(), 2);
+    let (desc, args, f) = totals[0];
+    assert!(desc.receiver.is_none());
+    assert_eq!(
+        args[0],
+        TypeDescriptor::Primitive(haphe::PrimitiveType::I64)
+    );
+    let out = f(&[ScriptValue::I64(7)]).unwrap();
+    assert!(matches!(out, ScriptValue::I64(7)));
+}
+
+#[test]
+fn async_dyn_associated_fn_registers_candidates() {
+    let binder = bound::<Holder>();
+    let tags: Vec<_> = binder
+        .assoc_dyn_async
+        .iter()
+        .filter(|(d, _)| d.name == "tag_of")
+        .collect();
+    assert_eq!(tags.len(), 1);
+    assert_eq!(tags[0].1[0], TypeDescriptor::String);
 }

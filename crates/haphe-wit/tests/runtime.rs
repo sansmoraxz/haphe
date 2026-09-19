@@ -3448,8 +3448,8 @@ fn unregistered_record_properties_trap_descriptively() {
 }
 
 // ---------------------------------------------------------------------------
-// Receiver-less associated functions: emitted, but bridging needs a
-// receiver-less core channel — the stub trap is the pinned contract.
+// Receiver-less associated functions: emitted as `static func` members and
+// live through the `associated` channel — no resource handle involved.
 // ---------------------------------------------------------------------------
 
 #[derive(Script, Clone)]
@@ -3468,6 +3468,14 @@ impl FabricR {
     fn origin() -> i64 {
         0
     }
+
+    fn shift(base: i64, by: i64) -> i64 {
+        base + by
+    }
+
+    async fn beacon(tag: i64) -> i64 {
+        tag + 2
+    }
 }
 
 haphe::registry! {
@@ -3484,30 +3492,222 @@ const FABRIC_GUEST: &str = r#"
   (import "haphe:demo/fabrics" (instance $fb
     (export "fabric-r" (type $f (sub resource)))
     (export "[static]fabric-r.origin" (func (result s64)))
+    (export "[static]fabric-r.shift" (func (param "base" s64) (param "by" s64) (result s64)))
   ))
   (core func $origin (canon lower (func $fb "[static]fabric-r.origin")))
+  (core func $shift (canon lower (func $fb "[static]fabric-r.shift")))
   (core module $m
     (import "fb" "origin" (func $origin (result i64)))
-    (func (export "run") (result i64) (call $origin))
+    (import "fb" "shift" (func $shift (param i64 i64) (result i64)))
+    (func (export "run") (result i64)
+      (i64.add (call $origin) (call $shift (i64.const 40) (i64.const 2))))
   )
   (core instance $mi (instantiate $m
-    (with "fb" (instance (export "origin" (func $origin))))
+    (with "fb" (instance
+      (export "origin" (func $origin))
+      (export "shift" (func $shift))
+    ))
   ))
   (func (export "run") (result s64) (canon lift (core func $mi "run")))
 )
 "#;
 
 #[test]
-fn receiverless_associated_fn_stub_traps_descriptively() {
+fn receiverless_associated_fns_dispatch_without_an_instance() {
     let engine = Engine::default();
     let mut linker = Linker::new(&engine);
     let mut b = WasmBinder::new(WitGenerator::new("haphe:demo"));
     b.register_type::<FabricR>().unwrap();
     haphe::bind(&b, &FABRIC_R_REGISTRY, &mut linker).expect("binding succeeds");
 
-    let err = run_guest(&engine, &linker, (), FABRIC_GUEST).expect_err("stub should trap");
-    let msg = format!("{err:?}");
-    assert!(msg.contains("not yet bridged"), "got: {msg}");
+    let out = run_guest(&engine, &linker, (), FABRIC_GUEST).expect("associated fns dispatch");
+    assert_eq!(out, Val::S64(42));
+}
+
+/// Async associated fn: driven to completion on-thread, no handle involved.
+const FABRIC_ASYNC_GUEST: &str = r#"
+(component
+  (import "haphe:demo/fabrics" (instance $fb
+    (export "fabric-r" (type $f (sub resource)))
+    (export "[static]fabric-r.beacon" (func (param "tag" s64) (result s64)))
+  ))
+  (core func $beacon (canon lower (func $fb "[static]fabric-r.beacon")))
+  (core module $m
+    (import "fb" "beacon" (func $beacon (param i64) (result i64)))
+    (func (export "run") (result i64) (call $beacon (i64.const 40)))
+  )
+  (core instance $mi (instantiate $m
+    (with "fb" (instance (export "beacon" (func $beacon))))
+  ))
+  (func (export "run") (result s64) (canon lift (core func $mi "run")))
+)
+"#;
+
+#[test]
+fn async_associated_fn_dispatches_without_an_instance() {
+    let engine = Engine::default();
+    let mut linker = Linker::new(&engine);
+    let mut b = WasmBinder::new(WitGenerator::new("haphe:demo"));
+    b.register_type::<FabricR>().unwrap();
+    haphe::bind(&b, &FABRIC_R_REGISTRY, &mut linker).expect("binding succeeds");
+
+    let out = run_guest(&engine, &linker, (), FABRIC_ASYNC_GUEST).expect("async assoc dispatches");
+    assert_eq!(out, Val::S64(42));
+}
+
+/// A resource with generic associated fns: static monomorphs and a `dyn`
+/// dispatcher, all receiver-less.
+#[cfg(feature = "generics")]
+#[derive(Script, Clone)]
+#[script(thread_safety = send_sync, methods)]
+struct AssocBox {
+    n: i64,
+}
+
+#[cfg(feature = "generics")]
+#[script]
+impl AssocBox {
+    #[script(constructor)]
+    fn new(n: i64) -> Self {
+        AssocBox { n }
+    }
+
+    /// Picks the first of two values, no receiver.
+    #[script(instantiate(i64), instantiate(String))]
+    fn first_val<T>(a: T, b: T) -> T {
+        let _ = b;
+        a
+    }
+}
+
+#[cfg(feature = "generics")]
+haphe::registry! {
+    static ASSOC_GENERIC_REGISTRY = {
+        structs: [AssocBox],
+        modules: [
+            mod assocboxes { types: [AssocBox] },
+        ],
+    };
+}
+
+#[cfg(feature = "generics")]
+const ASSOC_GENERIC_GUEST: &str = r#"
+(component
+  (import "haphe:demo/assocboxes" (instance $bx
+    (export "assoc-box" (type $ab (sub resource)))
+    (export "[static]assoc-box.first-val-s64" (func (param "a" s64) (param "b" s64) (result s64)))
+  ))
+  (core func $first (canon lower (func $bx "[static]assoc-box.first-val-s64")))
+  (core module $m
+    (import "bx" "first" (func $first (param i64 i64) (result i64)))
+    (func (export "run") (result i64) (call $first (i64.const 42) (i64.const 7)))
+  )
+  (core instance $mi (instantiate $m
+    (with "bx" (instance (export "first" (func $first))))
+  ))
+  (func (export "run") (result s64) (canon lift (core func $mi "run")))
+)
+"#;
+
+/// Generic associated monomorphs dispatch through the mangled `[static]`
+/// member names with no receiver.
+#[cfg(feature = "generics")]
+#[test]
+fn generic_associated_monomorphs_dispatch_live() {
+    let engine = Engine::default();
+    let mut linker = Linker::new(&engine);
+    let mut b = WasmBinder::new(WitGenerator::new("haphe:demo"));
+    b.register_type::<AssocBox>().unwrap();
+    haphe::bind(&b, &ASSOC_GENERIC_REGISTRY, &mut linker).expect("binding succeeds");
+
+    let result = run_guest(&engine, &linker, (), ASSOC_GENERIC_GUEST).expect("guest runs");
+    assert!(matches!(result, Val::S64(42)), "got: {result:?}");
+}
+
+/// A resource with a `dyn` generic associated fn (two candidates).
+#[cfg(feature = "dyn-generics")]
+#[derive(Script, Clone)]
+#[script(thread_safety = send_sync, methods)]
+struct DynAssocBox {
+    n: i64,
+}
+
+#[cfg(feature = "dyn-generics")]
+#[script]
+impl DynAssocBox {
+    #[script(constructor)]
+    fn new(n: i64) -> Self {
+        DynAssocBox { n }
+    }
+
+    /// Picks the first of two values, no receiver, dyn-dispatched.
+    #[script(dyn, instantiate(i64), instantiate(f64))]
+    fn choose<T>(a: T, b: T) -> T {
+        let _ = b;
+        a
+    }
+}
+
+#[cfg(feature = "dyn-generics")]
+haphe::registry! {
+    static DYN_ASSOC_REGISTRY = {
+        structs: [DynAssocBox],
+        modules: [
+            mod dynassoc { types: [DynAssocBox] },
+        ],
+    };
+}
+
+/// choose-dyn(s64(3), s64(4)) = 3; the static monomorph choose-s64(39, 6)
+/// = 39 (served from the same dyn candidate table). Total 42.
+#[cfg(feature = "dyn-generics")]
+const DYN_ASSOC_GUEST: &str = r#"
+(component
+  (type $pvt (variant (case "s64" s64) (case "f64" f64)))
+  (import "haphe:demo/dynassoc" (instance $bx
+    (export "dyn-assoc-box" (type $db (sub resource)))
+    (export "dyn-assoc-box-choose-dyn-a" (type $pv (eq $pvt)))
+    (export "[static]dyn-assoc-box.choose-dyn" (func (param "a" $pv) (param "b" $pv) (result $pv)))
+    (export "[static]dyn-assoc-box.choose-s64" (func (param "a" s64) (param "b" s64) (result s64)))
+  ))
+  (core module $libc (memory (export "mem") 1))
+  (core instance $li (instantiate $libc))
+  (core func $choosedyn (canon lower (func $bx "[static]dyn-assoc-box.choose-dyn") (memory (core memory $li "mem"))))
+  (core func $choose64 (canon lower (func $bx "[static]dyn-assoc-box.choose-s64")))
+  (core module $m
+    (import "libc" "mem" (memory 1))
+    (import "bx" "choosedyn" (func $choosedyn (param i32 i64 i32 i64 i32)))
+    (import "bx" "choose64" (func $choose64 (param i64 i64) (result i64)))
+    (func (export "run") (result i64) (local $acc i64)
+      (call $choosedyn (i32.const 0) (i64.const 3) (i32.const 0) (i64.const 4) (i32.const 16))
+      (local.set $acc (i64.load offset=8 (i32.const 16)))
+      (local.set $acc (i64.add (local.get $acc) (call $choose64 (i64.const 39) (i64.const 6))))
+      (local.get $acc))
+  )
+  (core instance $mi (instantiate $m
+    (with "libc" (instance (export "mem" (memory $li "mem"))))
+    (with "bx" (instance
+      (export "choosedyn" (func $choosedyn))
+      (export "choose64" (func $choose64))))
+  ))
+  (func (export "run") (result s64) (canon lift (core func $mi "run")))
+)
+"#;
+
+/// The receiver-less dispatcher unwraps the variant params, resolves through
+/// the core scan, and calls the winning monomorph; the static monomorph
+/// member serves from the same candidate table.
+#[cfg(feature = "dyn-generics")]
+#[test]
+fn dyn_associated_dispatcher_executes_live() {
+    let engine = Engine::default();
+    let mut linker = Linker::new(&engine);
+    let mut b = WasmBinder::new(WitGenerator::new("haphe:demo"));
+    b.register_type::<DynAssocBox>().unwrap();
+    haphe::bind(&b, &DYN_ASSOC_REGISTRY, &mut linker).expect("binding succeeds");
+
+    let result = run_guest(&engine, &linker, (), DYN_ASSOC_GUEST).expect("guest runs");
+    assert!(matches!(result, Val::S64(42)), "got: {result:?}");
 }
 
 // ---------------------------------------------------------------------------

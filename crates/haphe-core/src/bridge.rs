@@ -746,6 +746,89 @@ pub trait TypeBinder<T>: Sized {
         f: for<'a> fn(&'a [ScriptValue]) -> ScriptCtorFuture<'a, T>,
     ) -> Result<(), Self::Error>;
 
+    /// Register an associated function (no receiver, declared in the type's
+    /// impl block). It dispatches with no instance at hand, so backends
+    /// surface it on the TYPE, not on instances — next to
+    /// [`constructor`](Self::constructor)s, whose channel shape this
+    /// mirrors.
+    fn associated(
+        &mut self,
+        name: &'static str,
+        f: fn(&[ScriptValue]) -> Result<ScriptValue, ScriptCallError>,
+    ) -> Result<(), Self::Error>;
+
+    /// Register an `async` associated function. The returned future may
+    /// borrow the argument slice; async-capability gating applies, like
+    /// [`method_async`](Self::method_async).
+    fn associated_async(
+        &mut self,
+        name: &'static str,
+        f: for<'a> fn(&'a [ScriptValue]) -> ScriptCallFuture<'a>,
+    ) -> Result<(), Self::Error>;
+
+    /// Register one declared instantiation of a STATICALLY dispatched
+    /// generic associated function; keying follows
+    /// [`method_generic`](Self::method_generic).
+    ///
+    /// The default delegates to [`associated`](Self::associated) — safe
+    /// because the capability check rejects generic registrations before
+    /// binding on backends without
+    /// [`generics`](crate::BackendCapabilities::generics); a backend that
+    /// declares the capability MUST override, or same-named monomorphs
+    /// would collide.
+    fn associated_generic(
+        &mut self,
+        name: &'static str,
+        type_args: &'static [crate::types::TypeDescriptor<'static>],
+        f: fn(&[ScriptValue]) -> Result<ScriptValue, ScriptCallError>,
+    ) -> Result<(), Self::Error> {
+        let _ = type_args;
+        self.associated(name, f)
+    }
+
+    /// Async sibling of [`associated_generic`](Self::associated_generic).
+    fn associated_generic_async(
+        &mut self,
+        name: &'static str,
+        type_args: &'static [crate::types::TypeDescriptor<'static>],
+        f: for<'a> fn(&'a [ScriptValue]) -> ScriptCallFuture<'a>,
+    ) -> Result<(), Self::Error> {
+        let _ = type_args;
+        self.associated_async(name, f)
+    }
+
+    /// Register one candidate of a `dyn`-dispatched generic associated
+    /// function; candidate semantics follow [`method_dyn`](Self::method_dyn)
+    /// (`self_inst` carries a generic self type's identity — associated fns
+    /// may reference the type's parameters alongside their own).
+    ///
+    /// The default delegates to [`associated`](Self::associated) — safe
+    /// because the capability check rejects `dyn` methods before binding on
+    /// backends without
+    /// [`dyn_generics`](crate::BackendCapabilities::dyn_generics).
+    fn associated_dyn(
+        &mut self,
+        descriptor: &'static crate::function::FunctionDescriptor<'static>,
+        type_args: &'static [crate::types::TypeDescriptor<'static>],
+        self_inst: SelfInstantiation,
+        f: fn(&[ScriptValue]) -> Result<ScriptValue, ScriptCallError>,
+    ) -> Result<(), Self::Error> {
+        let _ = (type_args, self_inst);
+        self.associated(descriptor.name, f)
+    }
+
+    /// Async sibling of [`associated_dyn`](Self::associated_dyn).
+    fn associated_dyn_async(
+        &mut self,
+        descriptor: &'static crate::function::FunctionDescriptor<'static>,
+        type_args: &'static [crate::types::TypeDescriptor<'static>],
+        self_inst: SelfInstantiation,
+        f: for<'a> fn(&'a [ScriptValue]) -> ScriptCallFuture<'a>,
+    ) -> Result<(), Self::Error> {
+        let _ = (type_args, self_inst);
+        self.associated_async(descriptor.name, f)
+    }
+
     /// Register a computed-property getter, from `#[script(getter)]`.
     /// Conversion is infallible on the way out; the setter side converts
     /// fallibly.

@@ -531,7 +531,13 @@ impl WitGenerator {
                         let sig = dyn_cx.dispatcher(p, m, Some(&enum_name), plan, None)?;
                         let fn_name =
                             member_names.insert(&format!("{}_{}", e.name, sig.raw_name))?;
-                        emit_companion_dispatcher(p, &sig, &fn_name, &enum_name);
+                        emit_companion_dispatcher(
+                            p,
+                            &sig,
+                            &fn_name,
+                            &enum_name,
+                            m.receiver.is_some(),
+                        );
                     }
                 }
             }
@@ -560,7 +566,13 @@ impl WitGenerator {
                             dyn_cx.dispatcher(p, m, Some(&inst.wit_name), plan, Some(&env))?;
                         let fn_name =
                             member_names.insert(&format!("{}-{}", inst.wit_name, sig.raw_name))?;
-                        emit_companion_dispatcher(p, &sig, &fn_name, &inst.wit_name);
+                        emit_companion_dispatcher(
+                            p,
+                            &sig,
+                            &fn_name,
+                            &inst.wit_name,
+                            m.receiver.is_some(),
+                        );
                     }
                 }
             }
@@ -687,21 +699,28 @@ impl WitGenerator {
 }
 
 /// Prints one enum-companion dispatcher line: interface-level, `this` (the
-/// enum value) prepended to the dispatcher's own parameters.
+/// enum value) prepended to the dispatcher's own parameters — except for a
+/// receiver-less associated fn, whose companion takes no `this`.
 fn emit_companion_dispatcher(
     p: &mut Printer,
     sig: &dyn_gen::DispatcherSig,
     fn_name: &str,
     enum_name: &str,
+    has_receiver: bool,
 ) {
     p.doc(Some(&sig.marker));
     let params = sig.param_list();
-    let sep = if params.is_empty() { "" } else { ", " };
-    p.line(&format!(
-        "{fn_name}: {}(this: {enum_name}{sep}{params}){};",
-        sig.keyword(),
-        sig.arrow()
-    ));
+    let line = if has_receiver {
+        let sep = if params.is_empty() { "" } else { ", " };
+        format!(
+            "{fn_name}: {}(this: {enum_name}{sep}{params}){};",
+            sig.keyword(),
+            sig.arrow()
+        )
+    } else {
+        format!("{fn_name}: {}({params}){};", sig.keyword(), sig.arrow())
+    };
+    p.line(&line);
 }
 
 /// Builds the dispatcher signatures for a resource's `dyn` methods, emitting
@@ -1229,7 +1248,8 @@ fn emit_function(
     p.doc(f.doc);
 
     let mut params = Vec::new();
-    if let Some(enum_name) = enum_receiver {
+    // A receiver-less associated fn's companion takes no `this`.
+    if let (Some(enum_name), Some(_)) = (enum_receiver, f.receiver) {
         params.push(format!("this: {enum_name}"));
     }
     let mut param_names = NameMap::new();

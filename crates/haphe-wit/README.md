@@ -297,10 +297,10 @@ every linker definition against the guest component at instantiation.
   (`haphe::GenerateError::Incompatible`).
 - WIT `constructor` cannot be `async`, so an async constructor is emitted as a
   `static async func` returning the resource instead.
-- Receiver-less associated functions emit as `static func` members but their
-  runtime binding traps descriptively ("not yet bridged"): the typed bridge
-  erasure cannot fabricate a receiver, so bridging them needs a
-  receiver-less `TypeBinder` channel in haphe-core (tracked upstream).
+- Receiver-less associated functions emit as `static func` members and
+  dispatch live through the receiver-less `associated*` channels — no
+  resource handle involved (sync, async, generic monomorphs, and the `dyn`
+  dispatcher alike). Enum companions for them take no `this` parameter.
 - Declared `trait_impls` are PROJECTED into WIT-native named functions
   (interusability: every trait a type declares is reachable from guests).
   On resources they are members; on records they are interface-level

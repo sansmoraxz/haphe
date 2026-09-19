@@ -382,6 +382,18 @@ pub(crate) struct LuaTypeBinder<T: 'static> {
     call_async: Option<AsyncCowFn<T>>,
     prop_gets: Vec<(&'static str, PropGetFn<T>)>,
     prop_sets: Vec<(&'static str, PropSetFn<T>)>,
+    associated: Vec<(&'static str, ScriptFnPtr)>,
+    #[cfg(all(feature = "async", not(feature = "send")))]
+    async_associated: Vec<(&'static str, AsyncFnPtr)>,
+    /// Static generic associated monomorphs, keyed by mangled name.
+    #[cfg(feature = "generics")]
+    generic_associated: Vec<(String, ScriptFnPtr)>,
+    #[cfg(all(feature = "generics", feature = "async", not(feature = "send")))]
+    generic_async_associated: Vec<(String, AsyncFnPtr)>,
+    #[cfg(feature = "generics")]
+    dyn_associated: Vec<(&'static str, Vec<DynFn<ScriptFnPtr>>)>,
+    #[cfg(all(feature = "generics", feature = "async", not(feature = "send")))]
+    dyn_async_associated: Vec<(&'static str, Vec<DynFn<AsyncFnPtr>>)>,
     #[cfg(all(feature = "async", not(feature = "send")))]
     async_ctors: Vec<(&'static str, AsyncCtorFn<T>)>,
     #[cfg(all(feature = "async", not(feature = "send")))]
@@ -434,6 +446,17 @@ impl<T: 'static + Clone + mlua::MaybeSend + mlua::MaybeSync> LuaTypeBinder<T> {
             call_async: None,
             prop_gets: Vec::new(),
             prop_sets: Vec::new(),
+            associated: Vec::new(),
+            #[cfg(all(feature = "async", not(feature = "send")))]
+            async_associated: Vec::new(),
+            #[cfg(feature = "generics")]
+            generic_associated: Vec::new(),
+            #[cfg(all(feature = "generics", feature = "async", not(feature = "send")))]
+            generic_async_associated: Vec::new(),
+            #[cfg(feature = "generics")]
+            dyn_associated: Vec::new(),
+            #[cfg(all(feature = "generics", feature = "async", not(feature = "send")))]
+            dyn_async_associated: Vec::new(),
             #[cfg(all(feature = "async", not(feature = "send")))]
             async_ctors: Vec::new(),
             #[cfg(all(feature = "async", not(feature = "send")))]
@@ -546,20 +569,40 @@ impl<T: 'static + Clone + mlua::MaybeSend + mlua::MaybeSync> LuaTypeBinder<T> {
                 return Err(LuaBindError::ReservedMethod { name: reserved });
             }
         }
-        // Constructors land on the type table by name; a duplicate (e.g. a
-        // user constructor named `default` next to the implicit one from
-        // `traits(Default)`) would silently overwrite. Sync and async
-        // constructors share the namespace.
+        // Constructors and associated fns land on the type table by name; a
+        // duplicate (e.g. a user constructor named `default` next to the
+        // implicit one from `traits(Default)`, or an associated fn shadowing
+        // a constructor) would silently overwrite. Sync, async, dyn, and
+        // mangled-generic entries all share the namespace.
         {
             let mut seen: Vec<&'static str> = Vec::new();
             let names = self.constructors.iter().map(|c| c.name);
             #[cfg(all(feature = "async", not(feature = "send")))]
             let names = names.chain(self.async_ctors.iter().map(|(n, _)| *n));
+            let names = names.chain(self.associated.iter().map(|(n, _)| *n));
+            #[cfg(all(feature = "async", not(feature = "send")))]
+            let names = names.chain(self.async_associated.iter().map(|(n, _)| *n));
+            #[cfg(feature = "generics")]
+            let names = names.chain(self.dyn_associated.iter().map(|(n, _)| *n));
             for name in names {
                 if seen.contains(&name) {
                     return Err(LuaBindError::DuplicateConstructor { name });
                 }
                 seen.push(name);
+            }
+            #[cfg(feature = "generics")]
+            {
+                let mut seen: Vec<&str> = seen;
+                let generic_names = self.generic_associated.iter().map(|(n, _)| n);
+                #[cfg(all(feature = "async", not(feature = "send")))]
+                let generic_names =
+                    generic_names.chain(self.generic_async_associated.iter().map(|(n, _)| n));
+                for name in generic_names {
+                    if seen.contains(&name.as_str()) {
+                        return Err(LuaBindError::DuplicateMethod { name: name.clone() });
+                    }
+                    seen.push(name.as_str());
+                }
             }
         }
         // Computed properties share the field namespace; mlua would let the
@@ -605,6 +648,131 @@ impl<T: 'static + Clone + mlua::MaybeSend + mlua::MaybeSync> LuaTypeBinder<T> {
                     lua.create_any_userdata(value)
                 })?;
             type_table.set(*name, lua_fn)?;
+        }
+
+        // Associated fns → Lua functions on the type table, next to
+        // constructors: no receiver, so `Type.assoc(...)` with no instance.
+        for (name, f) in &self.associated {
+            let f = *f;
+            let lua_fn = lua.create_function(move |lua, args: mlua::MultiValue| {
+                let sv_args: Vec<ScriptValue> = args
+                    .into_vec()
+                    .iter()
+                    .map(lua_to_script)
+                    .collect::<mlua::Result<_>>()?;
+                let result = f(&sv_args).map_err(|e| mlua::Error::runtime(e.to_string()))?;
+                script_to_lua(lua, result)
+            })?;
+            type_table.set(*name, lua_fn)?;
+        }
+        // Async associated fns: same surface, awaited body.
+        #[cfg(all(feature = "async", not(feature = "send")))]
+        for (name, f) in &self.async_associated {
+            let f = *f;
+            let lua_fn = lua.create_async_function(move |lua, args: mlua::MultiValue| {
+                let sv_args: mlua::Result<Vec<ScriptValue>> =
+                    args.into_vec().iter().map(lua_to_script).collect();
+                async move {
+                    let sv_args = sv_args?;
+                    let out = f(&sv_args)
+                        .await
+                        .map_err(|e| mlua::Error::runtime(e.to_string()))?;
+                    script_to_lua(&lua, out)
+                }
+            })?;
+            type_table.set(*name, lua_fn)?;
+        }
+        // Static generic associated monomorphs: one entry per declared
+        // instantiation under its mangled name — dispatch is exact, no scan.
+        #[cfg(feature = "generics")]
+        for (name, f) in &self.generic_associated {
+            let f = *f;
+            let lua_fn = lua.create_function(move |lua, args: mlua::MultiValue| {
+                let sv_args: Vec<ScriptValue> = args
+                    .into_vec()
+                    .iter()
+                    .map(lua_to_script)
+                    .collect::<mlua::Result<_>>()?;
+                let result = f(&sv_args).map_err(|e| mlua::Error::runtime(e.to_string()))?;
+                script_to_lua(lua, result)
+            })?;
+            type_table.set(name.as_str(), lua_fn)?;
+        }
+        #[cfg(all(feature = "generics", feature = "async", not(feature = "send")))]
+        for (name, f) in &self.generic_async_associated {
+            let f = *f;
+            let lua_fn = lua.create_async_function(move |lua, args: mlua::MultiValue| {
+                let sv_args: mlua::Result<Vec<ScriptValue>> =
+                    args.into_vec().iter().map(lua_to_script).collect();
+                async move {
+                    let sv_args = sv_args?;
+                    let out = f(&sv_args)
+                        .await
+                        .map_err(|e| mlua::Error::runtime(e.to_string()))?;
+                    script_to_lua(&lua, out)
+                }
+            })?;
+            type_table.set(name.as_str(), lua_fn)?;
+        }
+        // Dyn generic associated fns: one type-table callable per name scans
+        // the monomorph candidates at call time — core's shared resolver
+        // ranks (a generic SELF instantiation merges in, like dyn methods),
+        // a rejected conversion falls through in declaration order, and a
+        // Host error propagates immediately.
+        #[cfg(feature = "generics")]
+        for (name, candidates) in &self.dyn_associated {
+            let name = *name;
+            let candidates = candidates.clone();
+            let scan = DynMethodScan::build(&candidates);
+            let signatures = dyn_signatures(&candidates);
+            let lua_fn = lua.create_function(move |lua, args: mlua::MultiValue| {
+                let sv_args: Vec<ScriptValue> = args
+                    .into_vec()
+                    .iter()
+                    .map(lua_to_script)
+                    .collect::<mlua::Result<_>>()?;
+                let mut last_err = None;
+                for i in scan.call_order(&sv_args) {
+                    match (candidates[i].wrapper)(&sv_args) {
+                        Ok(out) => return script_to_lua(lua, out),
+                        Err(haphe::ScriptCallError::Convert(e)) => last_err = Some(e),
+                        Err(host) => {
+                            return Err(mlua::Error::runtime(host.to_string()));
+                        }
+                    }
+                }
+                Err(dyn_no_match_error(name, &signatures, last_err))
+            })?;
+            type_table.set(name, lua_fn)?;
+        }
+        #[cfg(all(feature = "generics", feature = "async", not(feature = "send")))]
+        for (name, candidates) in &self.dyn_async_associated {
+            let name = *name;
+            let candidates = std::sync::Arc::new(candidates.clone());
+            let scan = std::sync::Arc::new(DynMethodScan::build(&candidates));
+            let signatures = dyn_signatures(&candidates);
+            let lua_fn = lua.create_async_function(move |lua, args: mlua::MultiValue| {
+                let sv_args: mlua::Result<Vec<ScriptValue>> =
+                    args.into_vec().iter().map(lua_to_script).collect();
+                let candidates = candidates.clone();
+                let scan = scan.clone();
+                let signatures = signatures.clone();
+                async move {
+                    let sv_args = sv_args?;
+                    let mut last_err = None;
+                    for i in scan.call_order(&sv_args) {
+                        match (candidates[i].wrapper)(&sv_args).await {
+                            Ok(out) => return script_to_lua(&lua, out),
+                            Err(haphe::ScriptCallError::Convert(e)) => last_err = Some(e),
+                            Err(host) => {
+                                return Err(mlua::Error::runtime(host.to_string()));
+                            }
+                        }
+                    }
+                    Err(dyn_no_match_error(name, &signatures, last_err))
+                }
+            })?;
+            type_table.set(name, lua_fn)?;
         }
 
         // UserData registration.
@@ -1386,6 +1554,174 @@ impl<T: 'static + Clone + mlua::MaybeSend + mlua::MaybeSync> TypeBinder<T> for L
         #[cfg(all(feature = "async", not(feature = "send")))]
         {
             self.async_ctors.push((name, f));
+            Ok(())
+        }
+    }
+
+    fn associated(&mut self, name: &'static str, f: ScriptFnPtr) -> Result<(), Self::Error> {
+        self.associated.push((name, f));
+        Ok(())
+    }
+
+    fn associated_async(
+        &mut self,
+        name: &'static str,
+        f: for<'a> fn(&'a [ScriptValue]) -> ScriptCallFuture<'a>,
+    ) -> Result<(), Self::Error> {
+        #[cfg(not(feature = "async"))]
+        {
+            let _ = f;
+            Err(LuaBindError::UnsupportedAsyncFunction {
+                name,
+                reason: "enable this backend's `async` feature",
+            })
+        }
+        #[cfg(all(feature = "async", feature = "send"))]
+        {
+            let _ = f;
+            Err(LuaBindError::UnsupportedAsyncFunction {
+                name,
+                reason: "the `send` feature demands `Send` futures, and async function \
+                         futures are deliberately not Send",
+            })
+        }
+        #[cfg(all(feature = "async", not(feature = "send")))]
+        {
+            self.async_associated.push((name, f));
+            Ok(())
+        }
+    }
+
+    fn associated_generic(
+        &mut self,
+        name: &'static str,
+        type_args: &'static [haphe::TypeDescriptor<'static>],
+        f: ScriptFnPtr,
+    ) -> Result<(), Self::Error> {
+        #[cfg(not(feature = "generics"))]
+        {
+            let _ = (type_args, f);
+            Err(LuaBindError::GenericFunction { name })
+        }
+        #[cfg(feature = "generics")]
+        {
+            self.generic_associated
+                .push((mangle_generic_name(name, type_args), f));
+            Ok(())
+        }
+    }
+
+    fn associated_generic_async(
+        &mut self,
+        name: &'static str,
+        type_args: &'static [haphe::TypeDescriptor<'static>],
+        f: for<'a> fn(&'a [ScriptValue]) -> ScriptCallFuture<'a>,
+    ) -> Result<(), Self::Error> {
+        #[cfg(not(feature = "generics"))]
+        {
+            let _ = (type_args, f);
+            Err(LuaBindError::GenericFunction { name })
+        }
+        #[cfg(all(feature = "generics", not(feature = "async")))]
+        {
+            let _ = (type_args, f);
+            Err(LuaBindError::UnsupportedAsyncFunction {
+                name,
+                reason: "enable this backend's `async` feature",
+            })
+        }
+        #[cfg(all(feature = "generics", feature = "async", feature = "send"))]
+        {
+            let _ = (type_args, f);
+            Err(LuaBindError::UnsupportedAsyncFunction {
+                name,
+                reason: "the `send` feature demands `Send` futures, and async function \
+                         futures are deliberately not Send",
+            })
+        }
+        #[cfg(all(feature = "generics", feature = "async", not(feature = "send")))]
+        {
+            self.generic_async_associated
+                .push((mangle_generic_name(name, type_args), f));
+            Ok(())
+        }
+    }
+
+    fn associated_dyn(
+        &mut self,
+        descriptor: &'static haphe::FunctionDescriptor<'static>,
+        type_args: &'static [haphe::TypeDescriptor<'static>],
+        self_inst: haphe::SelfInstantiation,
+        f: ScriptFnPtr,
+    ) -> Result<(), Self::Error> {
+        #[cfg(not(feature = "generics"))]
+        {
+            let _ = (type_args, self_inst, f);
+            Err(LuaBindError::UnsupportedDynFunction {
+                name: descriptor.name,
+                reason: "enable this backend's `generics` feature",
+            })
+        }
+        #[cfg(feature = "generics")]
+        {
+            push_dyn_candidate(
+                &mut self.dyn_associated,
+                DynFn {
+                    descriptor,
+                    type_args,
+                    self_params: self_inst.params,
+                    self_args: self_inst.args,
+                    wrapper: f,
+                },
+            );
+            Ok(())
+        }
+    }
+
+    fn associated_dyn_async(
+        &mut self,
+        descriptor: &'static haphe::FunctionDescriptor<'static>,
+        type_args: &'static [haphe::TypeDescriptor<'static>],
+        self_inst: haphe::SelfInstantiation,
+        f: for<'a> fn(&'a [ScriptValue]) -> ScriptCallFuture<'a>,
+    ) -> Result<(), Self::Error> {
+        #[cfg(not(feature = "generics"))]
+        {
+            let _ = (type_args, self_inst, f);
+            Err(LuaBindError::UnsupportedDynFunction {
+                name: descriptor.name,
+                reason: "enable this backend's `generics` feature",
+            })
+        }
+        #[cfg(all(feature = "generics", not(feature = "async")))]
+        {
+            let _ = (type_args, self_inst, f);
+            Err(LuaBindError::UnsupportedDynFunction {
+                name: descriptor.name,
+                reason: "enable this backend's `async` feature",
+            })
+        }
+        #[cfg(all(feature = "generics", feature = "async", feature = "send"))]
+        {
+            let _ = (type_args, self_inst, f);
+            Err(LuaBindError::UnsupportedDynFunction {
+                name: descriptor.name,
+                reason: "the `send` feature demands `Send` futures, and async function \
+                         futures are deliberately not Send",
+            })
+        }
+        #[cfg(all(feature = "generics", feature = "async", not(feature = "send")))]
+        {
+            push_dyn_candidate(
+                &mut self.dyn_async_associated,
+                DynFn {
+                    descriptor,
+                    type_args,
+                    self_params: self_inst.params,
+                    self_args: self_inst.args,
+                    wrapper: f,
+                },
+            );
             Ok(())
         }
     }
