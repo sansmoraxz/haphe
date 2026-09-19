@@ -821,6 +821,132 @@ fn transparent_newtype_free_fn_binds() {
     assert!(matches!(out, ScriptValue::Bool(true)));
 }
 
+/// Async twin of `Machine`: newtype-typed async methods bind through
+/// trait-presence dispatch onto the async channels.
+#[derive(Script, Clone)]
+#[script(thread_safety = send_sync, methods)]
+struct AsyncMachine {
+    powered: Flag,
+}
+
+#[haphe::script]
+impl AsyncMachine {
+    async fn toggled_later(&self, next: Flag) -> Flag {
+        Flag(self.powered.0 != next.0)
+    }
+
+    async fn set_later(&mut self, next: Flag) -> Flag {
+        self.powered = next;
+        self.powered
+    }
+
+    async fn into_flag(self) -> Flag {
+        self.powered
+    }
+
+    #[allow(
+        dead_code,
+        reason = "a described struct return stays descriptor-only (dispatch no-op), so the method is never invoked"
+    )]
+    async fn twin_later(&self) -> AsyncMachine {
+        self.clone()
+    }
+}
+
+#[haphe::script]
+async fn invert_later(flag: Flag) -> Flag {
+    Flag(!flag.0)
+}
+
+#[test]
+fn transparent_newtype_async_methods_bind_via_dispatch() {
+    let binder = bound::<AsyncMachine>();
+
+    let get = |name: &str| {
+        binder
+            .async_methods
+            .iter()
+            .find(|(n, _)| *n == name)
+            .unwrap_or_else(|| panic!("{name} bound via async dispatch"))
+            .1
+    };
+
+    let m = AsyncMachine {
+        powered: Flag(true),
+    };
+    let out = poll_ready(get("toggled_later")(
+        ScriptCow::Borrowed(&m),
+        &[ScriptValue::Bool(true)],
+    ))
+    .unwrap();
+    assert!(matches!(out, ScriptValue::Bool(false)));
+
+    // Owned receiver goes through the Clone-bounded dispatch shape.
+    let out = poll_ready(get("into_flag")(
+        ScriptCow::Owned(AsyncMachine {
+            powered: Flag(true),
+        }),
+        &[],
+    ))
+    .unwrap();
+    assert!(matches!(out, ScriptValue::Bool(true)));
+
+    // `&mut self`: the future holds the borrow, mutation writes back.
+    let (_, set) = binder
+        .async_mut_methods
+        .iter()
+        .find(|(n, _)| *n == "set_later")
+        .expect("mutable async dispatch");
+    let mut m = AsyncMachine {
+        powered: Flag(false),
+    };
+    let out = poll_ready(set(&mut m, &[ScriptValue::Bool(true)])).unwrap();
+    assert!(matches!(out, ScriptValue::Bool(true)));
+    assert!(m.powered.0);
+
+    // The struct-returning async method stays descriptor-only.
+    assert!(!binder.async_methods.iter().any(|(n, _)| *n == "twin_later"));
+}
+
+#[test]
+fn transparent_newtype_async_free_fn_binds() {
+    use haphe::{FnBinder, ScriptBindFn};
+
+    type AsyncFnEntry = (
+        &'static str,
+        for<'a> fn(&'a [ScriptValue]) -> haphe::ScriptCallFuture<'a>,
+    );
+    struct CollectAsyncFns(Vec<AsyncFnEntry>);
+    impl FnBinder for CollectAsyncFns {
+        type Error = NeverError;
+        fn function(
+            &mut self,
+            _: &'static str,
+            _: &'static [haphe::TypeDescriptor<'static>],
+            _: fn(&[ScriptValue]) -> Result<ScriptValue, ScriptCallError>,
+        ) -> Result<(), NeverError> {
+            Ok(())
+        }
+
+        fn function_async(
+            &mut self,
+            name: &'static str,
+            _: &'static [haphe::TypeDescriptor<'static>],
+            f: for<'a> fn(&'a [ScriptValue]) -> haphe::ScriptCallFuture<'a>,
+        ) -> Result<(), NeverError> {
+            self.0.push((name, f));
+            Ok(())
+        }
+    }
+
+    let mut binder = CollectAsyncFns(Vec::new());
+    <invert_later as ScriptBindFn>::bind(&mut binder).unwrap();
+    let (name, f) = binder.0[0];
+    assert_eq!(name, "invert_later");
+    let out = poll_ready(f(&[ScriptValue::Bool(false)])).unwrap();
+    assert!(matches!(out, ScriptValue::Bool(true)));
+}
+
 // ---------------------------------------------------------------------------
 // Call / AsyncCall
 // ---------------------------------------------------------------------------

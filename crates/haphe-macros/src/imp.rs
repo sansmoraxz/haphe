@@ -456,11 +456,13 @@ pub fn expand(mut item: ItemImpl) -> TokenStream {
                     // Async methods bridge through the ScriptCow receiver
                     // path (borrowed guard or backend-acquired value);
                     // `&mut self` uses the dedicated borrowed-mutable
-                    // channel, so mutation writes back in place. The
-                    // syntactic whitelist is the criterion (the dispatch
-                    // machinery stays sync-only for now).
+                    // channel, so mutation writes back in place. Types the
+                    // whitelist can't judge fall back to trait-presence
+                    // dispatch, like sync methods.
                     if !has_type_params && is_bind_compatible(func, &info) {
                         async_methods.push(extract_bind_method(func, &info, fallible, &fn_args));
+                    } else if !has_type_params && !fallible && is_dispatch_eligible(func, &info) {
+                        dispatch_methods.push(extract_bind_method(func, &info, fallible, &fn_args));
                     }
                 } else if has_type_params || is_bind_compatible(func, &info) {
                     bind_methods.push(extract_bind_method(func, &info, fallible, &fn_args));
@@ -708,6 +710,7 @@ fn extract_bind_method(
         return_ty: info.return_ty.clone(),
         fallible,
         error_kind: fn_args.error_kind.as_ref().map(syn::LitStr::value),
+        is_async: info.is_async,
     }
 }
 

@@ -3939,3 +3939,110 @@ fn async_dyn_foreign_dispatches_through_async_caller() {
     let f: f64 = block_on(codec.bump(2.0f64));
     assert_eq!(f, 2.5);
 }
+
+// ---------------------------------------------------------------------------
+// Trait-presence dispatch: async surfaces over transparent newtypes
+// ---------------------------------------------------------------------------
+
+/// A transparent bool newtype: crosses as a native boolean.
+#[derive(Script, Clone, Copy)]
+#[script(transparent)]
+struct FlagT(bool);
+
+/// Newtype-typed async methods bind through trait-presence dispatch onto the
+/// async channels; WIT sees plain `bool`s.
+#[derive(Script, Clone)]
+#[script(thread_safety = send_sync, methods)]
+struct Toggle {
+    powered: FlagT,
+}
+
+#[script]
+impl Toggle {
+    #[script(constructor)]
+    fn new(on: bool) -> Self {
+        Toggle { powered: FlagT(on) }
+    }
+
+    async fn toggled_later(&self, next: FlagT) -> FlagT {
+        FlagT(self.powered.0 != next.0)
+    }
+}
+
+#[script]
+async fn invert_later(flag: FlagT) -> FlagT {
+    FlagT(!flag.0)
+}
+
+haphe::registry! {
+    static TOGGLE_REGISTRY = {
+        structs: [Toggle],
+        modules: [
+            mod toggles { functions: [invert_later], types: [Toggle] },
+        ],
+    };
+}
+
+/// toggled-later(toggle(true), false) = true; toggled-later(.., true) =
+/// false; invert-later(false) = true — all three must hold.
+const TOGGLE_GUEST: &str = r#"
+(component
+  (import "haphe:demo/toggles" (instance $tg
+    (export "toggle" (type $t (sub resource)))
+    (export "[constructor]toggle" (func (param "on" bool) (result (own $t))))
+    (export "[method]toggle.toggled-later" (func (param "self" (borrow $t)) (param "next" bool) (result bool)))
+    (export "invert-later" (func (param "flag" bool) (result bool)))
+  ))
+  (core func $ctor (canon lower (func $tg "[constructor]toggle")))
+  (core func $tog (canon lower (func $tg "[method]toggle.toggled-later")))
+  (core func $inv (canon lower (func $tg "invert-later")))
+  (core module $m
+    (import "tg" "ctor" (func $ctor (param i32) (result i32)))
+    (import "tg" "tog" (func $tog (param i32 i32) (result i32)))
+    (import "tg" "inv" (func $inv (param i32) (result i32)))
+    (func (export "run") (result i32) (local $p i32)
+      (local.set $p (call $ctor (i32.const 1)))
+      (i32.and
+        (i32.and
+          (call $tog (local.get $p) (i32.const 0))
+          (i32.eqz (call $tog (local.get $p) (i32.const 1))))
+        (call $inv (i32.const 0))))
+  )
+  (core instance $mi (instantiate $m
+    (with "tg" (instance
+      (export "ctor" (func $ctor))
+      (export "tog" (func $tog))
+      (export "inv" (func $inv))))
+  ))
+  (func (export "run") (result bool) (canon lift (core func $mi "run")))
+)
+"#;
+
+#[test]
+fn transparent_newtype_async_dispatch_executes_live() {
+    let engine = Engine::default();
+    let mut linker = Linker::new(&engine);
+    let mut b = WasmBinder::new(WitGenerator::new("haphe:demo"));
+    b.register_type::<Toggle>().unwrap();
+    b.register_fn::<invert_later>().unwrap();
+    haphe::bind(&b, &TOGGLE_REGISTRY, &mut linker).expect("binding succeeds");
+
+    let out = run_guest(&engine, &linker, (), TOGGLE_GUEST).expect("newtype async dispatch");
+    assert_eq!(out, Val::Bool(true));
+}
+
+/// The WIT text renders the newtype-typed async surfaces as plain `bool`.
+#[test]
+fn transparent_newtype_async_signatures_render_as_bool() {
+    let generator = WitGenerator::new("haphe:demo");
+    let output = haphe::generate(&generator, &TOGGLE_REGISTRY).expect("generation succeeds");
+    let text = String::from_utf8(output.files[0].content.clone()).unwrap();
+    assert!(
+        text.contains("toggled-later: async func(next: bool) -> bool;"),
+        "got:\n{text}"
+    );
+    assert!(
+        text.contains("invert-later: async func(flag: bool) -> bool;"),
+        "got:\n{text}"
+    );
+}

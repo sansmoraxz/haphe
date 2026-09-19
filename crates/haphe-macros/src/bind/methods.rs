@@ -164,23 +164,90 @@ pub fn gen_dispatched_method_registration(self_ty: &Type, method: &BindMethod) -
         wrapper_prep,
         cast_ty,
         extra_bound,
-        register,
+        mut register,
     } = shape;
     let recv_decl2 = recv_decl.clone();
+
+    // Async twin: the probe's `__invoke` becomes an `async fn` (the trait is
+    // block-local and single-implementor, so executor/`Send` agnosticism is
+    // fine), the wrapper boxes the future, and registration goes through the
+    // async channels. Bounds are unchanged — conditionality is the point.
+    let asyncness = method.is_async.then(|| quote! { async });
+    let trait_allow = method
+        .is_async
+        .then(|| quote! { #[allow(async_fn_in_trait)] });
+    let recv_call = if method.is_async {
+        quote! { #recv_call.await }
+    } else {
+        recv_call
+    };
+    if method.is_async {
+        register = if matches!(method.receiver, ReceiverShape::RefMut) {
+            format_ident!("method_async_mut")
+        } else {
+            format_ident!("method_async")
+        };
+    }
+    let registration = if method.is_async {
+        let cast_ty = if matches!(method.receiver, ReceiverShape::RefMut) {
+            quote! { for<'a> fn(&'a mut __T, &'a [::haphe::ScriptValue]) -> ::haphe::ScriptCallFuture<'a> }
+        } else {
+            quote! { for<'a> fn(::haphe::ScriptCow<'a, __T>, &'a [::haphe::ScriptValue]) -> ::haphe::ScriptCallFuture<'a> }
+        };
+        quote! {
+            __b.#register(
+                #name,
+                (|#wrapper_sig, __args: &[::haphe::ScriptValue]|
+                    -> ::haphe::ScriptCallFuture<'_> {
+                    ::std::boxed::Box::pin(async move {
+                        #wrapper_prep
+                        #(
+                            let #p_vars = <__T::#p_assoc as ::haphe::FromScript>::from_script(
+                                __args.get(#idx).cloned().unwrap_or(::haphe::ScriptValue::Unit)
+                            )?;
+                        )*
+                        ::core::result::Result::Ok(::haphe::ScriptValue::from(
+                            __T::__invoke(__t, #( #p_vars ),*).await
+                        ))
+                    })
+                }) as #cast_ty,
+            )
+        }
+    } else {
+        quote! {
+            __b.#register(
+                #name,
+                (|#wrapper_sig, __args: &[::haphe::ScriptValue]|
+                    -> ::core::result::Result<::haphe::ScriptValue, ::haphe::ScriptCallError> {
+                    #wrapper_prep
+                    #(
+                        let #p_vars = <__T::#p_assoc as ::haphe::FromScript>::from_script(
+                            __args.get(#idx).cloned().unwrap_or(::haphe::ScriptValue::Unit)
+                        )?;
+                    )*
+                    ::core::result::Result::Ok(::haphe::ScriptValue::from(
+                        __T::__invoke(__t, #( #p_vars ),*)
+                    ))
+                }) as #cast_ty
+                    -> ::core::result::Result<::haphe::ScriptValue, ::haphe::ScriptCallError>,
+            )
+        }
+    };
 
     quote! {
         {
             #[allow(non_camel_case_types)]
+            #trait_allow
             trait __Call {
                 #( type #p_assoc; )*
                 type __R;
-                fn __invoke(#recv_decl, #( #p_vars: Self::#p_assoc ),*) -> Self::__R;
+                #asyncness fn __invoke(#recv_decl, #( #p_vars: Self::#p_assoc ),*) -> Self::__R;
             }
             impl __Call for #self_ty {
                 #( type #p_assoc = #stripped; )*
                 type __R = #ret_ty;
                 #[allow(unused_variables)]
-                fn __invoke(#recv_decl2, #( #p_vars: #stripped ),*) -> #ret_ty {
+                #asyncness fn __invoke(#recv_decl2, #( #p_vars: #stripped ),*) -> #ret_ty {
                     #recv_call
                 }
             }
@@ -202,22 +269,7 @@ pub fn gen_dispatched_method_registration(self_ty: &Type, method: &BindMethod) -
                     &self,
                     __b: &mut __B,
                 ) -> ::core::result::Result<(), __B::Error> {
-                    __b.#register(
-                        #name,
-                        (|#wrapper_sig, __args: &[::haphe::ScriptValue]|
-                            -> ::core::result::Result<::haphe::ScriptValue, ::haphe::ScriptCallError> {
-                            #wrapper_prep
-                            #(
-                                let #p_vars = <__T::#p_assoc as ::haphe::FromScript>::from_script(
-                                    __args.get(#idx).cloned().unwrap_or(::haphe::ScriptValue::Unit)
-                                )?;
-                            )*
-                            ::core::result::Result::Ok(::haphe::ScriptValue::from(
-                                __T::__invoke(__t, #( #p_vars ),*)
-                            ))
-                        }) as #cast_ty
-                            -> ::core::result::Result<::haphe::ScriptValue, ::haphe::ScriptCallError>,
-                    )
+                    #registration
                 }
             }
             #[allow(unused_imports)]

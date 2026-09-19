@@ -341,7 +341,7 @@ pub fn expand(mut item: ItemFn) -> TokenStream {
                     && (crate::bind::is_bridge_compatible_type(t)
                         || crate::bind::is_dispatchable_path(t))
             });
-        let can = cfgs.is_empty() && (whitelisted || (!info.is_async && dispatch_eligible));
+        let can = cfgs.is_empty() && (whitelisted || dispatch_eligible);
         let body = if info.is_async && whitelisted {
             // Async free functions register through the async channel; the
             // boxed future borrows the argument slice.
@@ -441,6 +441,10 @@ use crate::bind::substitute_type_params;
 /// `FromScript` and the return converts to `ScriptValue`, no-ops otherwise.
 /// Mirrors `bind::gen_dispatched_method_registration`; the hidden descriptor
 /// struct doubles as the dispatch carrier. Non-generic functions only.
+#[allow(
+    clippy::too_many_lines,
+    reason = "expansion drivers assemble one `quote!` output from many interdependent pieces; splitting them hurts locality more than length hurts readability"
+)]
 fn gen_dispatched_fn_registration(
     carrier: &syn::Ident,
     fn_ident: &syn::Ident,
@@ -475,20 +479,72 @@ fn gen_dispatched_fn_registration(
     };
     let idx: Vec<usize> = (0..stripped.len()).collect();
 
+    // Async twin: async `__invoke` on the probe trait, boxed-future wrapper,
+    // `function_async` registration — bounds unchanged.
+    let asyncness = info.is_async.then(|| quote! { async });
+    let trait_allow = info
+        .is_async
+        .then(|| quote! { #[allow(async_fn_in_trait)] });
+    let invoke_body = if info.is_async {
+        quote! { #fn_ident(#(#call_args),*).await }
+    } else {
+        quote! { #fn_ident(#(#call_args),*) }
+    };
+    let registration = if info.is_async {
+        quote! {
+            __b.function_async(
+                #exposed_name,
+                &[],
+                (|__args: &[::haphe::ScriptValue]| -> ::haphe::ScriptCallFuture<'_> {
+                    ::std::boxed::Box::pin(async move {
+                        #(
+                            let #p_vars = <__T::#p_assoc as ::haphe::FromScript>::from_script(
+                                __args.get(#idx).cloned().unwrap_or(::haphe::ScriptValue::Unit)
+                            )?;
+                        )*
+                        ::core::result::Result::Ok(::haphe::ScriptValue::from(
+                            __T::__invoke(#( #p_vars ),*).await
+                        ))
+                    })
+                }) as for<'a> fn(&'a [::haphe::ScriptValue]) -> ::haphe::ScriptCallFuture<'a>,
+            )
+        }
+    } else {
+        quote! {
+            __b.function(
+                #exposed_name,
+                &[],
+                (|__args: &[::haphe::ScriptValue]|
+                    -> ::core::result::Result<::haphe::ScriptValue, ::haphe::ScriptCallError> {
+                    #(
+                        let #p_vars = <__T::#p_assoc as ::haphe::FromScript>::from_script(
+                            __args.get(#idx).cloned().unwrap_or(::haphe::ScriptValue::Unit)
+                        )?;
+                    )*
+                    ::core::result::Result::Ok(::haphe::ScriptValue::from(
+                        __T::__invoke(#( #p_vars ),*)
+                    ))
+                }) as fn(&[::haphe::ScriptValue])
+                    -> ::core::result::Result<::haphe::ScriptValue, ::haphe::ScriptCallError>,
+            )
+        }
+    };
+
     quote! {
         {
             #[allow(non_camel_case_types)]
+            #trait_allow
             trait __Call {
                 #( type #p_assoc; )*
                 type __R;
-                fn __invoke(#( #p_vars: Self::#p_assoc ),*) -> Self::__R;
+                #asyncness fn __invoke(#( #p_vars: Self::#p_assoc ),*) -> Self::__R;
             }
             impl __Call for #carrier {
                 #( type #p_assoc = #stripped; )*
                 type __R = #ret_ty;
                 #[allow(unused_variables)]
-                fn __invoke(#( #p_vars: #stripped ),*) -> #ret_ty {
-                    #fn_ident(#(#call_args),*)
+                #asyncness fn __invoke(#( #p_vars: #stripped ),*) -> #ret_ty {
+                    #invoke_body
                 }
             }
             #[allow(non_camel_case_types)]
@@ -508,22 +564,7 @@ fn gen_dispatched_fn_registration(
                     &self,
                     __b: &mut __B,
                 ) -> ::core::result::Result<(), __B::Error> {
-                    __b.function(
-                        #exposed_name,
-                        &[],
-                        (|__args: &[::haphe::ScriptValue]|
-                            -> ::core::result::Result<::haphe::ScriptValue, ::haphe::ScriptCallError> {
-                            #(
-                                let #p_vars = <__T::#p_assoc as ::haphe::FromScript>::from_script(
-                                    __args.get(#idx).cloned().unwrap_or(::haphe::ScriptValue::Unit)
-                                )?;
-                            )*
-                            ::core::result::Result::Ok(::haphe::ScriptValue::from(
-                                __T::__invoke(#( #p_vars ),*)
-                            ))
-                        }) as fn(&[::haphe::ScriptValue])
-                            -> ::core::result::Result<::haphe::ScriptValue, ::haphe::ScriptCallError>,
-                    )
+                    #registration
                 }
             }
             #[allow(unused_imports)]

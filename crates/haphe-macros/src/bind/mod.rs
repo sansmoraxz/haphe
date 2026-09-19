@@ -36,6 +36,7 @@ pub struct BindMethod {
     pub fallible: bool,
     /// The `error_kind = "..."` hint, carried into `Host` errors.
     pub error_kind: Option<String>,
+    pub is_async: bool,
 }
 
 /// A generic method: one monomorphized wrapper per declared instantiation.
