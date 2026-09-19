@@ -84,6 +84,9 @@ pub(crate) fn gen_call_args(params: &[(Ident, Type)]) -> Vec<TokenStream> {
     reason = "expansion drivers assemble one `quote!` output from many interdependent pieces; splitting them hurts locality more than length hurts readability"
 )]
 pub fn gen_dispatched_method_registration(self_ty: &Type, method: &BindMethod) -> TokenStream {
+    if method.receiver == ReceiverShape::None {
+        return gen_dispatched_associated_registration(self_ty, method);
+    }
     let name = &method.name;
     let ident = &method.ident;
 
@@ -145,9 +148,8 @@ pub fn gen_dispatched_method_registration(self_ty: &Type, method: &BindMethod) -
             extra_bound: quote! { __T: ::core::clone::Clone, },
             register: format_ident!("method"),
         },
-        // `None` is unreachable here: trait-presence dispatch requires a
-        // receiver (see `is_dispatch_eligible`); the arm only completes the
-        // match.
+        // `None` is unreachable here (routed to the associated twin by the
+        // early return above); the arm only completes the match.
         ReceiverShape::Ref | ReceiverShape::None => DispatchShape {
             recv_decl: quote! { __t: &Self },
             recv_call: quote! { __t.#ident(#(#call_args),*) },
@@ -289,6 +291,158 @@ pub fn gen_dispatched_method_registration(self_ty: &Type, method: &BindMethod) -
             where
                 __T: __Call,
                 #extra_bound
+                #( __T::#p_assoc: ::haphe::FromScript, )*
+                ::haphe::ScriptValue: ::core::convert::From<__T::__R>,
+            {
+                fn __haphe_bind<__B: ::haphe::TypeBinder<__T>>(
+                    &self,
+                    __b: &mut __B,
+                ) -> ::core::result::Result<(), __B::Error> {
+                    #registration
+                }
+            }
+            #[allow(unused_imports)]
+            use ::haphe::SkipBind as _;
+            (&&::haphe::BridgeProbe::<#self_ty>(::core::marker::PhantomData))
+                .__haphe_bind(__b)?;
+        }
+    }
+}
+
+/// Receiver-less twin of [`gen_dispatched_method_registration`]: the probe's
+/// `__invoke` takes only the parameters, and registration goes through the
+/// `associated` channels. Sync/async and fallible twins mirror the method
+/// shapes.
+#[allow(
+    clippy::too_many_lines,
+    reason = "expansion drivers assemble one `quote!` output from many interdependent pieces; splitting them hurts locality more than length hurts readability"
+)]
+fn gen_dispatched_associated_registration(self_ty: &Type, method: &BindMethod) -> TokenStream {
+    let name = &method.name;
+    let ident = &method.ident;
+
+    let stripped: Vec<Type> = method.params.iter().map(|(_, t)| strip_ref(t)).collect();
+    let p_assoc: Vec<Ident> = (0..stripped.len())
+        .map(|i| format_ident!("__P{i}"))
+        .collect();
+    let p_vars: Vec<Ident> = (0..stripped.len())
+        .map(|i| format_ident!("__p{i}"))
+        .collect();
+    let call_args: Vec<TokenStream> = method
+        .params
+        .iter()
+        .zip(&p_vars)
+        .map(|((_, t), v)| {
+            if is_reference(t) {
+                quote! { &#v }
+            } else {
+                quote! { #v }
+            }
+        })
+        .collect();
+    let ret_ty: TokenStream = if let (Some(t), true) = (&method.return_ty, method.has_return) {
+        quote! { #t }
+    } else {
+        quote! { () }
+    };
+    let idx: Vec<usize> = (0..stripped.len()).collect();
+
+    let asyncness = method.is_async.then(|| quote! { async });
+    let trait_allow = method
+        .is_async
+        .then(|| quote! { #[allow(async_fn_in_trait)] });
+    let call = if method.is_async {
+        quote! { <#self_ty>::#ident(#(#call_args),*).await }
+    } else {
+        quote! { <#self_ty>::#ident(#(#call_args),*) }
+    };
+    let (invoke_ret_trait, invoke_ret_impl, invoke_body, try_op) = if method.fallible {
+        let kind = crate::attrs::option_str_tokens(method.error_kind.as_deref());
+        (
+            quote! { ::core::result::Result<Self::__R, ::haphe::ScriptCallError> },
+            quote! { ::core::result::Result<#ret_ty, ::haphe::ScriptCallError> },
+            quote! {
+                #call.map_err(|__e| ::haphe::ScriptCallError::Callee {
+                    type_name: ::core::any::type_name_of_val(&__e),
+                    error: ::std::sync::Arc::new(__e),
+                    kind: #kind,
+                })
+            },
+            quote! { ? },
+        )
+    } else {
+        (
+            quote! { Self::__R },
+            ret_ty.clone(),
+            call,
+            TokenStream::new(),
+        )
+    };
+    let registration = if method.is_async {
+        quote! {
+            __b.associated_async(
+                #name,
+                (|__args: &[::haphe::ScriptValue]| -> ::haphe::ScriptCallFuture<'_> {
+                    ::std::boxed::Box::pin(async move {
+                        #(
+                            let #p_vars = <__T::#p_assoc as ::haphe::FromScript>::from_script(
+                                __args.get(#idx).cloned().unwrap_or(::haphe::ScriptValue::Unit)
+                            )?;
+                        )*
+                        ::core::result::Result::Ok(::haphe::ScriptValue::from(
+                            __T::__invoke(#( #p_vars ),*).await #try_op
+                        ))
+                    })
+                }) as for<'a> fn(&'a [::haphe::ScriptValue]) -> ::haphe::ScriptCallFuture<'a>,
+            )
+        }
+    } else {
+        quote! {
+            __b.associated(
+                #name,
+                (|__args: &[::haphe::ScriptValue]|
+                    -> ::core::result::Result<::haphe::ScriptValue, ::haphe::ScriptCallError> {
+                    #(
+                        let #p_vars = <__T::#p_assoc as ::haphe::FromScript>::from_script(
+                            __args.get(#idx).cloned().unwrap_or(::haphe::ScriptValue::Unit)
+                        )?;
+                    )*
+                    ::core::result::Result::Ok(::haphe::ScriptValue::from(
+                        __T::__invoke(#( #p_vars ),*) #try_op
+                    ))
+                }) as fn(&[::haphe::ScriptValue])
+                    -> ::core::result::Result<::haphe::ScriptValue, ::haphe::ScriptCallError>,
+            )
+        }
+    };
+
+    quote! {
+        {
+            #[allow(non_camel_case_types)]
+            #trait_allow
+            trait __Call {
+                #( type #p_assoc; )*
+                type __R;
+                #asyncness fn __invoke(#( #p_vars: Self::#p_assoc ),*) -> #invoke_ret_trait;
+            }
+            impl __Call for #self_ty {
+                #( type #p_assoc = #stripped; )*
+                type __R = #ret_ty;
+                #[allow(unused_variables)]
+                #asyncness fn __invoke(#( #p_vars: #stripped ),*) -> #invoke_ret_impl {
+                    #invoke_body
+                }
+            }
+            #[allow(non_camel_case_types)]
+            trait __Go<__T> {
+                fn __haphe_bind<__B: ::haphe::TypeBinder<__T>>(
+                    &self,
+                    __b: &mut __B,
+                ) -> ::core::result::Result<(), __B::Error>;
+            }
+            impl<__T> __Go<__T> for &::haphe::BridgeProbe<__T>
+            where
+                __T: __Call,
                 #( __T::#p_assoc: ::haphe::FromScript, )*
                 ::haphe::ScriptValue: ::core::convert::From<__T::__R>,
             {

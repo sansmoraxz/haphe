@@ -36,6 +36,8 @@ type PropSetAsyncFn<T> = for<'a> fn(&'a mut T, ScriptValue) -> haphe::ScriptCall
 type AsyncCtorFn<T> = for<'a> fn(&'a [ScriptValue]) -> haphe::ScriptCtorFuture<'a, T>;
 type CowMethodFn<T> =
     for<'a> fn(haphe::ScriptCow<'a, T>, &[ScriptValue]) -> Result<ScriptValue, ScriptCallError>;
+type AssocFn = fn(&[ScriptValue]) -> Result<ScriptValue, ScriptCallError>;
+type AsyncAssocFn = for<'a> fn(&'a [ScriptValue]) -> haphe::ScriptCallFuture<'a>;
 
 #[derive(Default)]
 struct MockBinder<T> {
@@ -60,6 +62,8 @@ struct MockBinder<T> {
     prop_gets_async: Vec<(&'static str, PropGetAsyncFn<T>)>,
     prop_sets_async: Vec<(&'static str, PropSetAsyncFn<T>)>,
     async_ctors: Vec<(&'static str, AsyncCtorFn<T>)>,
+    associated: Vec<(&'static str, AssocFn)>,
+    async_associated: Vec<(&'static str, AsyncAssocFn)>,
 }
 
 impl<T> TypeBinder<T> for MockBinder<T> {
@@ -124,17 +128,19 @@ impl<T> TypeBinder<T> for MockBinder<T> {
 
     fn associated(
         &mut self,
-        _: &'static str,
-        _: fn(&[ScriptValue]) -> Result<ScriptValue, ScriptCallError>,
+        name: &'static str,
+        f: fn(&[ScriptValue]) -> Result<ScriptValue, ScriptCallError>,
     ) -> Result<(), NeverError> {
+        self.associated.push((name, f));
         Ok(())
     }
 
     fn associated_async(
         &mut self,
-        _: &'static str,
-        _: for<'a> fn(&'a [ScriptValue]) -> haphe::ScriptCallFuture<'a>,
+        name: &'static str,
+        f: for<'a> fn(&'a [ScriptValue]) -> haphe::ScriptCallFuture<'a>,
     ) -> Result<(), NeverError> {
+        self.async_associated.push((name, f));
         Ok(())
     }
 
@@ -374,6 +380,8 @@ fn bound<T: ScriptBind>() -> MockBinder<T> {
         prop_gets_async: Vec::new(),
         prop_sets_async: Vec::new(),
         async_ctors: Vec::new(),
+        associated: Vec::new(),
+        async_associated: Vec::new(),
     };
     T::bind(&mut binder).unwrap();
     binder
@@ -780,6 +788,31 @@ impl Machine {
     fn twin_checked(&self) -> Result<Machine, TextError> {
         Ok(self.clone())
     }
+
+    /// Receiver-less + newtype-typed: `associated` channel via dispatch.
+    fn flipped(flag: Flag) -> Flag {
+        Flag(!flag.0)
+    }
+
+    #[script(error_kind = "MakeError")]
+    fn checked_flip(flag: Flag) -> Result<Flag, TextError> {
+        if flag.0 {
+            Ok(Flag(false))
+        } else {
+            Err(TextError("already off".into()))
+        }
+    }
+
+    #[allow(
+        dead_code,
+        reason = "a described struct return stays descriptor-only (dispatch no-op), so the fn is never invoked"
+    )]
+    fn assemble(flag: Flag) -> Machine {
+        Machine {
+            powered: flag,
+            label: String::new(),
+        }
+    }
 }
 
 #[haphe::script]
@@ -877,6 +910,11 @@ impl AsyncMachine {
     )]
     async fn twin_later(&self) -> AsyncMachine {
         self.clone()
+    }
+
+    /// Receiver-less async + newtype-typed: `associated_async` via dispatch.
+    async fn flipped_later(flag: Flag) -> Flag {
+        Flag(!flag.0)
     }
 
     #[script(error_kind = "ToggleError")]
@@ -1504,3 +1542,61 @@ impl std::fmt::Display for TextError {
 }
 
 impl std::error::Error for TextError {}
+
+// ---------------------------------------------------------------------------
+// Receiver-less trait-presence dispatch: the associated channels
+// ---------------------------------------------------------------------------
+
+#[test]
+fn dispatched_associated_fns_bind_and_call() {
+    let binder = bound::<Machine>();
+
+    // Sync: registered on `associated`, not on the method channel.
+    let (_, f) = binder
+        .associated
+        .iter()
+        .find(|(n, _)| *n == "flipped")
+        .expect("flipped bound via associated dispatch");
+    assert!(!binder.methods.iter().any(|(n, _)| *n == "flipped"));
+    let out = f(&[ScriptValue::Bool(false)]).unwrap();
+    assert!(matches!(out, ScriptValue::Bool(true)));
+
+    // Fallible: Ok converts, Err carries the callee error with the kind.
+    let (_, checked) = binder
+        .associated
+        .iter()
+        .find(|(n, _)| *n == "checked_flip")
+        .expect("checked_flip bound via associated dispatch");
+    let out = checked(&[ScriptValue::Bool(true)]).unwrap();
+    assert!(matches!(out, ScriptValue::Bool(false)));
+    match checked(&[ScriptValue::Bool(false)]).unwrap_err() {
+        ScriptCallError::Callee { error, kind, .. } => {
+            assert_eq!(error.to_string(), "already off");
+            assert_eq!(kind, Some("MakeError"));
+        }
+        other @ haphe::ScriptCallError::Convert(_) => {
+            panic!("expected Callee error, got {other:?}")
+        }
+    }
+
+    // A described struct return stays descriptor-only.
+    assert!(!binder.associated.iter().any(|(n, _)| *n == "assemble"));
+}
+
+#[test]
+fn dispatched_async_associated_fn_binds_and_awaits() {
+    let binder = bound::<AsyncMachine>();
+    let (_, f) = binder
+        .async_associated
+        .iter()
+        .find(|(n, _)| *n == "flipped_later")
+        .expect("flipped_later bound via associated_async dispatch");
+    let out = poll_ready(f(&[ScriptValue::Bool(true)])).unwrap();
+    assert!(matches!(out, ScriptValue::Bool(false)));
+    assert!(
+        !binder
+            .async_methods
+            .iter()
+            .any(|(n, _)| *n == "flipped_later")
+    );
+}

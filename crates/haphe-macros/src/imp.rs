@@ -648,18 +648,11 @@ pub fn expand(mut item: ItemImpl) -> TokenStream {
 /// (primitives that implement IntoScript/FromScript).
 /// A signature the syntactic whitelist rejected but whose bridgeability can
 /// be decided by trait presence: every param (stripped of one reference) and
-/// the return type is either whitelisted or an owned bare-ident path type,
-/// and the method has a receiver.
+/// the return type is either whitelisted or an owned bare-ident path type.
+/// Receiver-less fns are eligible like methods; they register through the
+/// `associated` channels.
 fn is_dispatch_eligible(func: &syn::ImplItemFn, info: &crate::fn_desc::FnInfo) -> bool {
     use crate::bind::{is_bridge_compatible_type, is_dispatchable_path};
-    let has_receiver = func
-        .sig
-        .inputs
-        .first()
-        .is_some_and(|a| matches!(a, syn::FnArg::Receiver(_)));
-    if !has_receiver {
-        return false;
-    }
     for input in &func.sig.inputs {
         if let syn::FnArg::Typed(pat_ty) = input
             && !is_bridge_compatible_type(&pat_ty.ty)

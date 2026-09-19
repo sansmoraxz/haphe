@@ -950,8 +950,14 @@ fn generic_self_dyn_dispatcher_passes_self_typed_positions_through() {
 
 // ---------------------------------------------------------------------------
 // Receiver-less associated functions: emitted as `static func` members;
-// their runtime stub is pinned in tests/runtime.rs.
+// their live dispatch is pinned in tests/runtime.rs. Newtype-typed ones
+// register through trait-presence dispatch and render over the carried type.
 // ---------------------------------------------------------------------------
+
+/// A transparent bool newtype: crosses as a native boolean.
+#[derive(Script, Clone, Copy)]
+#[script(transparent)]
+struct Woven(bool);
 
 #[derive(Script, Clone)]
 #[script(methods)]
@@ -967,6 +973,19 @@ impl Fabric {
 
     fn read(&self) -> i64 {
         self.n
+    }
+
+    fn flipped(flag: Woven) -> Woven {
+        Woven(!flag.0)
+    }
+
+    #[script(error_kind = "MakeError")]
+    fn checked_flip(flag: Woven) -> Result<Woven, TextError> {
+        if flag.0 {
+            Ok(Woven(false))
+        } else {
+            Err(TextError("already off".into()))
+        }
     }
 }
 
@@ -985,6 +1004,16 @@ fn receiverless_associated_fns_emit_as_static_members() {
     let output = haphe::generate(&generator, &FABRIC_REGISTRY).expect("generation succeeds");
     let wit = String::from_utf8_lossy(&output.files[0].content).to_string();
     assert!(wit.contains("origin: static func() -> s64;"), "got:\n{wit}");
+    // Newtype-typed receiver-less fns render over the carried bool; the
+    // fallible one is guest-visible.
+    assert!(
+        wit.contains("flipped: static func(flag: bool) -> bool;"),
+        "got:\n{wit}"
+    );
+    assert!(
+        wit.contains("checked-flip: static func(flag: bool) -> result<bool, script-error>;"),
+        "got:\n{wit}"
+    );
 }
 
 /// A message-only fixture error: `String` itself no longer crosses (host

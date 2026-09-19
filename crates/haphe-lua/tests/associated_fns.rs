@@ -17,6 +17,12 @@ use haphe::{Script, script};
 use haphe_lua::bind_type;
 use mlua::Lua;
 
+/// A transparent bool newtype: not on the syntactic whitelist, so
+/// receiver-less fns over it register through trait-presence dispatch.
+#[derive(Script, Clone, Copy)]
+#[script(transparent)]
+struct Flag(bool);
+
 #[derive(Script, Clone)]
 #[script(thread_safety = send_sync, methods)]
 struct Meter {
@@ -47,12 +53,30 @@ impl Meter {
             .parse::<i64>()
             .map_err(|e| TextError(e.to_string()))
     }
+
+    /// Newtype-typed receiver-less fn: registered via trait-presence
+    /// dispatch onto the `associated` channel.
+    fn flipped(flag: Flag) -> Flag {
+        Flag(!flag.0)
+    }
+
+    /// Fallible dispatched associated fn: `Err` crosses as a Callee error
+    /// tagged with the declared kind.
+    #[script(error_kind = "MakeError")]
+    fn checked_flip(flag: Flag) -> Result<Flag, TextError> {
+        if flag.0 {
+            Ok(Flag(false))
+        } else {
+            Err(TextError("already off".into()))
+        }
+    }
 }
 
 fn env(lua: &Lua) {
     let tbl = lua.create_table().unwrap();
     bind_type::<Meter>(lua, &tbl).unwrap();
     lua.globals().set("Meter", &tbl).unwrap();
+    haphe_lua::install_error_info(lua).unwrap();
 }
 
 #[test]
@@ -92,6 +116,50 @@ fn associated_fn_is_not_an_instance_method() {
     );
 }
 
+#[test]
+fn dispatched_associated_fn_called_without_instance() {
+    let lua = Lua::new();
+    env(&lua);
+    let (out, is_bool): (bool, bool) = lua
+        .load("local v = Meter.flipped(false) return v, type(v) == 'boolean'")
+        .eval()
+        .unwrap();
+    assert!(out);
+    assert!(is_bool, "crosses as a native boolean");
+    // Not on instances either.
+    lua.load("m = Meter.new(5)").exec().unwrap();
+    let err = lua
+        .load("return m:flipped(true)")
+        .eval::<bool>()
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("flipped"),
+        "expected an unknown-method error, got: {err}"
+    );
+}
+
+#[test]
+fn fallible_dispatched_associated_fn_ok_and_err() {
+    let lua = Lua::new();
+    env(&lua);
+    let out: bool = lua.load("return Meter.checked_flip(true)").eval().unwrap();
+    assert!(!out);
+    let (ok, rendered, kind): (bool, String, String) = lua
+        .load(
+            "local ok, e = pcall(function() return Meter.checked_flip(false) end) \
+             local info = haphe_error(e) \
+             return ok, tostring(e), info.kind",
+        )
+        .eval()
+        .unwrap();
+    assert!(!ok);
+    assert!(
+        rendered.contains("MakeError: already off"),
+        "kind-prefixed message, got {rendered:?}"
+    );
+    assert_eq!(kind, "MakeError");
+}
+
 #[cfg(all(feature = "async", not(feature = "send")))]
 mod with_async {
     use super::*;
@@ -108,6 +176,12 @@ mod with_async {
         async fn lookup(path: String) -> String {
             format!("db/{path}")
         }
+
+        /// Newtype-typed async receiver-less fn: `associated_async` via
+        /// trait-presence dispatch.
+        async fn flip_later(flag: Flag) -> Flag {
+            Flag(!flag.0)
+        }
     }
 
     #[tokio::test]
@@ -122,6 +196,21 @@ mod with_async {
             .await
             .unwrap();
         assert_eq!(out, "db/users");
+    }
+
+    #[tokio::test]
+    async fn dispatched_async_associated_fn_called_without_instance() {
+        let lua = Lua::new();
+        let tbl = lua.create_table().unwrap();
+        bind_type::<Fetcher>(&lua, &tbl).unwrap();
+        lua.globals().set("Fetcher", &tbl).unwrap();
+        let (out, is_bool): (bool, bool) = lua
+            .load("local v = Fetcher.flip_later(false) return v, type(v) == 'boolean'")
+            .eval_async()
+            .await
+            .unwrap();
+        assert!(out);
+        assert!(is_bool, "crosses as a native boolean");
     }
 }
 

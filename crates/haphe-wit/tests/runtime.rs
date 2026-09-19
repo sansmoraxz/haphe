@@ -4203,6 +4203,27 @@ impl Toggle {
             Err(TextError("off is not allowed".into()))
         }
     }
+
+    /// Receiver-less over the newtype: trait-presence dispatch registers it
+    /// through the `associated` channel; WIT sees a `static func`.
+    fn flipped(flag: FlagT) -> FlagT {
+        FlagT(!flag.0)
+    }
+
+    /// Async receiver-less twin.
+    async fn flipped_later(flag: FlagT) -> FlagT {
+        FlagT(!flag.0)
+    }
+
+    /// Fallible receiver-less: the err arm is guest-visible.
+    #[script(error_kind = "MakeError")]
+    fn checked_flip(flag: FlagT) -> Result<FlagT, TextError> {
+        if flag.0 {
+            Ok(FlagT(false))
+        } else {
+            Err(TextError("already off".into()))
+        }
+    }
 }
 
 #[script]
@@ -4288,6 +4309,34 @@ const TOGGLE_GUEST: &str = r#"
 )
 "#;
 
+/// Receiver-less newtype statics dispatch with no instance at hand:
+/// flipped(false) and flipped-later(false) must both come back true.
+const TOGGLE_STATIC_GUEST: &str = r#"
+(component
+  (import "haphe:demo/toggles" (instance $tg
+    (export "toggle" (type $t (sub resource)))
+    (export "[static]toggle.flipped" (func (param "flag" bool) (result bool)))
+    (export "[static]toggle.flipped-later" (func (param "flag" bool) (result bool)))
+  ))
+  (core func $flip (canon lower (func $tg "[static]toggle.flipped")))
+  (core func $flipl (canon lower (func $tg "[static]toggle.flipped-later")))
+  (core module $m
+    (import "tg" "flip" (func $flip (param i32) (result i32)))
+    (import "tg" "flipl" (func $flipl (param i32) (result i32)))
+    (func (export "run") (result i32)
+      (i32.and
+        (call $flip (i32.const 0))
+        (call $flipl (i32.const 0))))
+  )
+  (core instance $mi (instantiate $m
+    (with "tg" (instance
+      (export "flip" (func $flip))
+      (export "flipl" (func $flipl))))
+  ))
+  (func (export "run") (result bool) (canon lift (core func $mi "run")))
+)
+"#;
+
 /// Result-shaped trampolines over the fallible toggle surfaces (see
 /// `FALLIBLE_TRAMPOLINE_GUEST` for the shape), driven directly by the test
 /// with structured err-arm assertions host-side.
@@ -4303,6 +4352,7 @@ const TOGGLE_CHECKED_GUEST: &str = r#"
     (export "toggle" (type $t (sub resource)))
     (export "[constructor]toggle" (func (param "on" bool) (result (own $t))))
     (export "[method]toggle.checked-toggle" (func (param "self" (borrow $t)) (param "next" bool) (result (result bool (error $se)))))
+    (export "[static]toggle.checked-flip" (func (param "flag" bool) (result (result bool (error $se)))))
     (export "flip-deep" (func (param "flag" bool) (result (result bool (error $se)))))
   ))
   (alias export $tg "toggle" (type $t-t))
@@ -4323,12 +4373,15 @@ const TOGGLE_CHECKED_GUEST: &str = r#"
     (memory (core memory $li "mem")) (realloc (core func $li "realloc"))))
   (core func $deep (canon lower (func $tg "flip-deep")
     (memory (core memory $li "mem")) (realloc (core func $li "realloc"))))
+  (core func $cflip (canon lower (func $tg "[static]toggle.checked-flip")
+    (memory (core memory $li "mem")) (realloc (core func $li "realloc"))))
   (core func $dropt (canon resource.drop $t-t))
   (core module $m
     (import "libc" "realloc" (func $ra (param i32 i32 i32 i32) (result i32)))
     (import "tg" "ctor" (func $ctor (param i32) (result i32)))
     (import "tg" "chk" (func $chk (param i32 i32 i32)))
     (import "tg" "deep" (func $deep (param i32 i32)))
+    (import "tg" "cflip" (func $cflip (param i32 i32)))
     (import "tg" "drop" (func $dropt (param i32)))
     (func $area (result i32) (call $ra (i32.const 0) (i32.const 0) (i32.const 8) (i32.const 256)))
     (func (export "make") (param i32) (result i32) (call $ctor (local.get 0)))
@@ -4341,6 +4394,10 @@ const TOGGLE_CHECKED_GUEST: &str = r#"
       (local.set $p (call $area))
       (call $deep (local.get 0) (local.get $p))
       (local.get $p))
+    (func (export "checked-flip") (param i32) (result i32) (local $p i32)
+      (local.set $p (call $area))
+      (call $cflip (local.get 0) (local.get $p))
+      (local.get $p))
   )
   (core instance $mi (instantiate $m
     (with "libc" (instance
@@ -4349,6 +4406,7 @@ const TOGGLE_CHECKED_GUEST: &str = r#"
       (export "ctor" (func $ctor))
       (export "chk" (func $chk))
       (export "deep" (func $deep))
+      (export "cflip" (func $cflip))
       (export "drop" (func $dropt))))
   ))
   (func $make' (param "on" bool) (result (own $t-t))
@@ -4357,9 +4415,12 @@ const TOGGLE_CHECKED_GUEST: &str = r#"
     (canon lift (core func $mi "checked-toggle") (memory (core memory $li "mem"))))
   (func $deep' (param "flag" bool) (result (result bool (error $se-t)))
     (canon lift (core func $mi "flip-deep") (memory (core memory $li "mem"))))
+  (func $cflip' (param "flag" bool) (result (result bool (error $se-t)))
+    (canon lift (core func $mi "checked-flip") (memory (core memory $li "mem"))))
   (export "make" (func $make'))
   (export "checked-toggle" (func $chk'))
   (export "flip-deep" (func $deep'))
+  (export "checked-flip" (func $cflip'))
 )
 "#;
 
@@ -4457,6 +4518,55 @@ fn fallible_err_carries_the_rendered_source_chain() {
 }
 
 #[test]
+fn receiverless_newtype_dispatch_executes_live() {
+    let engine = Engine::default();
+    let mut linker = Linker::new(&engine);
+    let mut b = WasmBinder::new(WitGenerator::new("haphe:demo"));
+    b.register_type::<Toggle>().unwrap();
+    b.register_fn::<invert_later>().unwrap();
+    b.register_fn::<flip_deep>().unwrap();
+    haphe::bind(&b, &TOGGLE_REGISTRY, &mut linker).expect("binding succeeds");
+
+    let out = run_guest(&engine, &linker, (), TOGGLE_STATIC_GUEST)
+        .expect("receiver-less newtype dispatch");
+    assert_eq!(out, Val::Bool(true));
+}
+
+#[test]
+fn fallible_receiverless_dispatch_is_guest_visible() {
+    let (engine, mut store, instance, linker) = toggle_checked_instance();
+    // Ok arm: checked-flip(true) = Ok(false).
+    let out = call_export(
+        &engine,
+        &linker,
+        &mut store,
+        &instance,
+        "checked-flip",
+        &[Val::Bool(true)],
+    )
+    .expect("Ok path dispatches");
+    assert!(
+        matches!(&out, Val::Result(Ok(Some(v))) if matches!(v.as_ref(), Val::Bool(false))),
+        "got: {out:?}"
+    );
+    // Err arm: a value, not a trap, carrying the declared kind.
+    let out = call_export(
+        &engine,
+        &linker,
+        &mut store,
+        &instance,
+        "checked-flip",
+        &[Val::Bool(false)],
+    )
+    .expect("Err is a value, not a trap");
+    let (kind, message, type_name, chain) = unpack_script_error(&out);
+    assert_eq!(kind.as_deref(), Some("MakeError"));
+    assert_eq!(message, "already off");
+    assert!(type_name.ends_with("TextError"), "got: {type_name}");
+    assert!(chain.is_empty(), "got: {chain:?}");
+}
+
+#[test]
 fn transparent_newtype_async_dispatch_executes_live() {
     let engine = Engine::default();
     let mut linker = Linker::new(&engine);
@@ -4490,6 +4600,19 @@ fn transparent_newtype_async_signatures_render_as_bool() {
         "got:\n{text}"
     );
     assert!(text.contains("record script-error {"), "got:\n{text}");
+    // Receiver-less newtype surfaces render as statics over the carried bool.
+    assert!(
+        text.contains("flipped: static func(flag: bool) -> bool;"),
+        "got:\n{text}"
+    );
+    assert!(
+        text.contains("flipped-later: static async func(flag: bool) -> bool;"),
+        "got:\n{text}"
+    );
+    assert!(
+        text.contains("checked-flip: static func(flag: bool) -> result<bool, script-error>;"),
+        "got:\n{text}"
+    );
 }
 
 /// A message-only fixture error: `String` itself no longer crosses (host
