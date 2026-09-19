@@ -1,0 +1,5 @@
+error: registry closure parameters need explicit types, e.g. `|x: i64|` (descriptors cannot infer them)
+ --> tests/ui/registry_closure_untyped_param.rs:6:30
+  |
+6 |                     double: |x| -> i64 { x * 2 },
+  |                              ^

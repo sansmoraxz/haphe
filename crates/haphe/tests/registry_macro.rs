@@ -65,7 +65,17 @@ haphe::registry! {
         modules: [
             mod geometry {
                 doc: "Geometry utilities",
-                functions: [add, math::mul],
+                functions: [
+                    add,
+                    math::mul,
+                    /// Doubles a value.
+                    double: |x: i64| -> i64 { x * 2 },
+                    halve_later: async |x: i64| -> i64 { x / 2 },
+                    #[script(error_kind = "SignError")]
+                    checked_neg: |x: i64| -> Result<i64, NegError> {
+                        x.checked_neg().ok_or(NegError)
+                    },
+                ],
                 types: [Point, Color],
                 constants: [
                     /// Default scale factor.
@@ -115,9 +125,10 @@ fn registry_contents() {
     let module = &REGISTRY.modules()[0];
     assert_eq!(module.name, "geometry");
     assert_eq!(module.doc, Some("Geometry utilities"));
-    assert_eq!(module.functions.len(), 2);
+    assert_eq!(module.functions.len(), 5);
     assert_eq!(module.functions[0].name, "add");
     assert_eq!(module.functions[1].name, "mul");
+    assert_eq!(module.functions[2].name, "double");
     assert_eq!(module.type_ids.len(), 2);
     assert_eq!(module.submodules.len(), 1);
     assert_eq!(module.submodules[0].functions[0].name, "add");
@@ -152,4 +163,110 @@ fn capability_check_catches_thread_safety() {
         2,
         "only Color and Notifier (both `none`) should fail: {errors:?}"
     );
+}
+
+#[derive(Debug)]
+struct NegError;
+
+impl std::fmt::Display for NegError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("i64::MIN has no negation")
+    }
+}
+
+impl std::error::Error for NegError {}
+
+/// Registry closures expand into ordinary free fns inside generated Rust
+/// modules mirroring the registry tree (`geometry::double`): descriptors
+/// carry the entry's docs and options, and the generated carriers bind
+/// through the standard `ScriptBindFn` machinery.
+#[test]
+fn registry_closures_describe_and_bind() {
+    use haphe::{FnBinder, ScriptBindFn, ScriptCallError, ScriptValue};
+
+    #[derive(Debug)]
+    struct NeverError;
+    impl std::fmt::Display for NeverError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("never")
+        }
+    }
+    impl std::error::Error for NeverError {}
+
+    type SyncFn = fn(&[ScriptValue]) -> Result<ScriptValue, ScriptCallError>;
+    type AsyncFreeFn = for<'a> fn(&'a [ScriptValue]) -> haphe::ScriptCallFuture<'a>;
+    #[derive(Default)]
+    struct Collect {
+        sync: Vec<(&'static str, SyncFn)>,
+        asynchronous: Vec<&'static str>,
+    }
+    impl FnBinder for Collect {
+        type Error = NeverError;
+        fn function(
+            &mut self,
+            name: &'static str,
+            _: &'static [haphe::TypeDescriptor<'static>],
+            f: SyncFn,
+        ) -> Result<(), NeverError> {
+            self.sync.push((name, f));
+            Ok(())
+        }
+
+        fn function_async(
+            &mut self,
+            name: &'static str,
+            _: &'static [haphe::TypeDescriptor<'static>],
+            _: AsyncFreeFn,
+        ) -> Result<(), NeverError> {
+            self.asynchronous.push(name);
+            Ok(())
+        }
+    }
+
+    let module = &REGISTRY.modules()[0];
+    let double_desc = module
+        .functions
+        .iter()
+        .find(|f| f.name == "double")
+        .expect("closure described");
+    assert_eq!(double_desc.doc, Some("Doubles a value."));
+    assert!(!double_desc.fallible);
+    let halve_desc = module
+        .functions
+        .iter()
+        .find(|f| f.name == "halve_later")
+        .expect("async closure described");
+    assert!(halve_desc.is_async);
+    let neg_desc = module
+        .functions
+        .iter()
+        .find(|f| f.name == "checked_neg")
+        .expect("fallible closure described");
+    assert!(neg_desc.fallible);
+    assert_eq!(neg_desc.error_kind, Some("SignError"));
+
+    let mut binder = Collect::default();
+    <geometry::double as ScriptBindFn>::bind(&mut binder).unwrap();
+    <geometry::halve_later as ScriptBindFn>::bind(&mut binder).unwrap();
+    <geometry::checked_neg as ScriptBindFn>::bind(&mut binder).unwrap();
+
+    let (_, f) = binder.sync.iter().find(|(n, _)| *n == "double").unwrap();
+    let out = f(&[ScriptValue::I64(21)]).unwrap();
+    assert!(matches!(out, ScriptValue::I64(42)));
+    assert!(binder.asynchronous.contains(&"halve_later"));
+
+    let (_, checked) = binder
+        .sync
+        .iter()
+        .find(|(n, _)| *n == "checked_neg")
+        .unwrap();
+    let out = checked(&[ScriptValue::I64(5)]).unwrap();
+    assert!(matches!(out, ScriptValue::I64(-5)));
+    match checked(&[ScriptValue::I64(i64::MIN)]).unwrap_err() {
+        ScriptCallError::Callee { error, kind, .. } => {
+            assert_eq!(kind, Some("SignError"));
+            assert!(error.downcast_ref::<NegError>().is_some());
+        }
+        other @ ScriptCallError::Convert(_) => panic!("expected Callee error, got {other:?}"),
+    }
 }

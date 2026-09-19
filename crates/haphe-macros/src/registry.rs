@@ -25,7 +25,7 @@ pub struct RegistryInput {
 struct ModuleInput {
     name: Ident,
     doc: Option<LitStr>,
-    functions: Option<Vec<Path>>,
+    functions: Option<Vec<FnEntry>>,
     types: Option<Vec<Type>>,
     constants: Option<Vec<ConstantInput>>,
     modules: Option<Vec<ModuleInput>>,
@@ -48,6 +48,113 @@ fn bracketed_list<T: Parse>(input: ParseStream) -> syn::Result<Vec<T>> {
 
 fn duplicate_section(key: &Ident) -> syn::Error {
     syn::Error::new(key.span(), format!("duplicate `{key}` section"))
+}
+
+/// One entry of a module's `functions: [...]` list: a path to a `#[script]`
+/// fn, or an inline closure (`double: |x: i64| -> i64 { x * 2 }`) the macro
+/// expands into an equivalent free fn at the registry's scope.
+enum FnEntry {
+    Named(Path),
+    Closure(ClosureInput),
+}
+
+struct ClosureInput {
+    attrs: Vec<Attribute>,
+    name: Ident,
+    closure: syn::ExprClosure,
+}
+
+impl Parse for FnEntry {
+    fn parse(input: ParseStream) -> syn::Result<Self> {
+        let attrs = input.call(Attribute::parse_outer)?;
+        // A lone ident followed by a single `:` names a closure; `::` is a
+        // path separator and stays on the named branch.
+        if input.peek(Ident) && input.peek2(Token![:]) && !input.peek2(Token![::]) {
+            let name: Ident = input.parse()?;
+            input.parse::<Token![:]>()?;
+            let closure: syn::ExprClosure = input.parse()?;
+            if let Some(kw) = &closure.capture {
+                return Err(syn::Error::new(
+                    kw.span(),
+                    "`move` has no meaning here: registry closures cannot capture — \
+                     state belongs in a described type",
+                ));
+            }
+            if let Some(lts) = &closure.lifetimes {
+                return Err(syn::Error::new(
+                    lts.span(),
+                    "registry closures do not take `for<...>` binders",
+                ));
+            }
+            if let Some(kw) = &closure.constness {
+                return Err(syn::Error::new(
+                    kw.span(),
+                    "`const` closures cannot become registry functions",
+                ));
+            }
+            for pat in &closure.inputs {
+                if !matches!(pat, syn::Pat::Type(_)) {
+                    return Err(syn::Error::new(
+                        pat.span(),
+                        "registry closure parameters need explicit types, e.g. `|x: i64|` \
+                         (descriptors cannot infer them)",
+                    ));
+                }
+            }
+            return Ok(Self::Closure(ClosureInput {
+                attrs,
+                name,
+                closure,
+            }));
+        }
+        if let Some(attr) = attrs.first() {
+            return Err(syn::Error::new(
+                attr.span(),
+                "attributes go on the function's own declaration; only closure entries \
+                 (`name: |...| ...`) take them here",
+            ));
+        }
+        Ok(Self::Named(input.parse()?))
+    }
+}
+
+/// The free fn a closure entry expands to: the closure's annotated signature
+/// and body as a plain `fn` named by the entry, carrying the entry's
+/// attributes (docs, `#[script(...)]` options). A body referencing outer
+/// locals fails with rustc's own can't-capture error at the offending
+/// identifier.
+fn closure_item_fn(closure: &ClosureInput) -> syn::ItemFn {
+    let mut inputs: Punctuated<syn::FnArg, Token![,]> = Punctuated::new();
+    for pat in &closure.closure.inputs {
+        if let syn::Pat::Type(pt) = pat {
+            inputs.push(syn::FnArg::Typed(pt.clone()));
+        }
+    }
+    let body: syn::Block = match closure.closure.body.as_ref() {
+        syn::Expr::Block(b) if b.attrs.is_empty() && b.label.is_none() => b.block.clone(),
+        expr => syn::parse_quote!({ #expr }),
+    };
+    syn::ItemFn {
+        attrs: closure.attrs.clone(),
+        // Items sit inside the generated mirror module; the module carries
+        // the registry's visibility, the items are pub through it.
+        vis: syn::parse_quote!(pub),
+        modifiers: syn::FnModifiers::default(),
+        sig: syn::Signature {
+            constness: None,
+            asyncness: closure.closure.asyncness,
+            safety: syn::Safety::Default,
+            abi: None,
+            fn_token: syn::token::Fn(closure.name.span()),
+            ident: closure.name.clone(),
+            generics: syn::Generics::default(),
+            paren_token: syn::token::Paren::default(),
+            inputs,
+            variadic: None,
+            output: closure.closure.output.clone(),
+        },
+        block: Box::new(body),
+    }
 }
 
 impl Parse for ConstantInput {
@@ -233,7 +340,17 @@ impl Parse for RegistryInput {
     clippy::too_many_lines,
     reason = "expansion drivers assemble one `quote!` output from many interdependent pieces; splitting them hurts locality more than length hurts readability"
 )]
-fn module_expr(module: &ModuleInput) -> TokenStream {
+/// Builds one module's descriptor expression, and — when the module (or a
+/// submodule) declares closures — a mirroring Rust `mod` item holding their
+/// expanded free fns, pushed to `closure_mods`. Each generated module opens
+/// with a hidden `pub use super::*;` so closure bodies resolve names from
+/// the registry's own scope.
+fn module_expr(
+    module: &ModuleInput,
+    vis: &Visibility,
+    mod_path: &[Ident],
+    closure_mods: &mut Vec<TokenStream>,
+) -> TokenStream {
     let name = module.name.unraw().to_string();
     let doc = if let Some(text) = &module.doc {
         quote! { ::core::option::Option::Some(#text) }
@@ -250,7 +367,35 @@ fn module_expr(module: &ModuleInput) -> TokenStream {
     let mut seen_fn_insts = std::collections::HashSet::new();
     let mut functions = Vec::new();
     let mut fn_instantiations = Vec::new();
-    for path in module.functions.iter().flatten() {
+    let own_path: Vec<Ident> = mod_path
+        .iter()
+        .cloned()
+        .chain([module.name.clone()])
+        .collect();
+    let mut own_closures = Vec::new();
+    let mut seen_closures = std::collections::HashSet::new();
+    for entry in module.functions.iter().flatten() {
+        let path = match entry {
+            FnEntry::Named(path) => path,
+            FnEntry::Closure(closure) => {
+                let name = &closure.name;
+                if !seen_closures.insert(name.unraw().to_string()) {
+                    functions.push(
+                        syn::Error::new(
+                            name.span(),
+                            format!("closure `{name}` is declared twice in this module"),
+                        )
+                        .to_compile_error(),
+                    );
+                    continue;
+                }
+                own_closures.push(crate::freefn::expand(closure_item_fn(closure)));
+                functions.push(quote_spanned! {name.span()=>
+                    <#(#own_path::)*#name as ::haphe::ScriptFunction>::DESCRIPTOR
+                });
+                continue;
+            }
+        };
         let mut stripped: Path = path.clone();
         let args = stripped
             .segments
@@ -319,7 +464,24 @@ fn module_expr(module: &ModuleInput) -> TokenStream {
         .flatten()
         .map(|ty| quote_spanned! {ty.span()=> <#ty as ::haphe::ScriptType>::ID })
         .collect();
-    let submodules: Vec<_> = module.modules.iter().flatten().map(module_expr).collect();
+    let mut child_mods = Vec::new();
+    let submodules: Vec<_> = module
+        .modules
+        .iter()
+        .flatten()
+        .map(|m| module_expr(m, vis, &own_path, &mut child_mods))
+        .collect();
+    if !own_closures.is_empty() || !child_mods.is_empty() {
+        let mod_name = &module.name;
+        closure_mods.push(quote! {
+            #vis mod #mod_name {
+                #[doc(hidden)]
+                pub use super::*;
+                #(#own_closures)*
+                #(#child_mods)*
+            }
+        });
+    }
     let constants: Vec<_> = module
         .constants
         .iter()
@@ -487,7 +649,12 @@ pub fn expand(input: &RegistryInput) -> TokenStream {
         .flatten()
         .map(|ty| quote_spanned! {ty.span()=> <#ty as ::haphe::ScriptAlias>::DESCRIPTOR })
         .collect();
-    let module_descs: Vec<_> = modules.iter().flatten().map(module_expr).collect();
+    let mut closure_mods = Vec::new();
+    let module_descs: Vec<_> = modules
+        .iter()
+        .flatten()
+        .map(|m| module_expr(m, vis, &[], &mut closure_mods))
+        .collect();
     let foreign_descs = descs_and_instantiations(
         foreign.as_deref(),
         &quote!(ScriptForeign),
@@ -495,6 +662,8 @@ pub fn expand(input: &RegistryInput) -> TokenStream {
         &mut instantiations,
     );
     quote! {
+        #(#closure_mods)*
+
         #(#attrs)*
         #vis static #name: ::haphe::TypeRegistry<'static> = ::haphe::TypeRegistry::new(
             &[#(#struct_descs),*],
