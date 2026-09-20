@@ -1,8 +1,8 @@
 use haphe::script;
 
 #[script]
-fn identity<T>(value: T) -> T {
-    value
+trait Hooks {
+    fn ping(&self);
 }
 
 fn main() {}

@@ -1,10 +1,21 @@
-//! Full integration test: derive macros → registry! → validate → LuaBinder → Lua.
+//! Full integration test: derive macros → registry! → validate → `LuaBinder` → Lua.
 //!
 //! Exercises the exact workflow an external user would follow. Every type is
 //! defined with `#[derive(Script)]` and `#[script]`, assembled by
 //! `registry!`, and bound into a live Lua runtime.
 
-#![allow(dead_code, clippy::approx_constant)]
+#![allow(
+    clippy::needless_pass_by_value,
+    clippy::unused_self,
+    clippy::doc_markdown,
+    clippy::trivially_copy_pass_by_ref,
+    reason = "fixture shapes are dictated by the bridge surface under test: `#[script]` functions receive OWNED values (the boundary contract), methods keep their declared receivers (`&self` on Copy enums included), and docs name fixture idents verbatim"
+)]
+#![allow(
+    dead_code,
+    clippy::approx_constant,
+    reason = "fixtures are exercised through generated bindings, and the PI fixture constant deliberately spells out the approximate value under test"
+)]
 
 use haphe::{RuntimeBinder, Script, script};
 use haphe_lua::LuaBinder;
@@ -107,7 +118,7 @@ haphe::registry! {
                 types: [Point, Color],
                 constants: [
                     /// The ratio of a circle's circumference to its diameter.
-                    PI: f64 = 3.141592653589793,
+                    PI: f64 = 3.141_592_653_589_793,
                     /// Maximum number of vertices.
                     MAX_VERTICES: i32 = 1024,
                     /// Whether debug drawing is on.
@@ -249,7 +260,7 @@ fn function_stubs_error_on_call() {
         .exec()
         .expect_err("stub should error");
     let msg = err.to_string();
-    assert!(msg.contains("not yet implemented"), "got: {msg}");
+    assert!(msg.contains("not bound"), "got: {msg}");
 }
 
 #[test]
@@ -261,7 +272,7 @@ fn submodule_function_stubs_error_on_call() {
         .exec()
         .expect_err("stub should error");
     let msg = err.to_string();
-    assert!(msg.contains("not yet implemented"), "got: {msg}");
+    assert!(msg.contains("not bound"), "got: {msg}");
 }
 
 #[test]
@@ -306,14 +317,14 @@ fn lua_table_iteration() {
     // Collect all keys from the geometry module table.
     let keys: Vec<String> = lua
         .load(
-            r#"
+            r"
             local keys = {}
             for k, _ in pairs(geometry) do
                 keys[#keys + 1] = k
             end
             table.sort(keys)
             return keys
-            "#,
+            ",
         )
         .eval()
         .unwrap();

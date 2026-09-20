@@ -1,0 +1,5 @@
+error[E0080]: evaluation panicked: function `plain` is not generic but is given type arguments
+  --> tests/ui/registry_inst_non_generic.rs:11:36
+   |
+11 |             mod util { functions: [plain<i64>] },
+   |                                    ^^^^^ evaluation of `REGISTRY::_` failed here

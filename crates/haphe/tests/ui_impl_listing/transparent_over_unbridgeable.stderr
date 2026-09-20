@@ -1,0 +1,93 @@
+error[E0277]: the trait bound `ScriptValue: From<Point>` is not satisfied
+  --> tests/ui_impl_listing/transparent_over_unbridgeable.rs:10:10
+   |
+10 | #[derive(Script)]
+   |          ^^^^^^ the trait `From<Point>` is not implemented for `ScriptValue`
+   |
+   = help: `ScriptValue` implements trait `From<T>`:
+             From<&Path>
+             From<&[T]>
+             From<&str>
+             From<()>
+             From<(A, B)>
+             From<(A, B, C)>
+             From<(A, B, C, D)>
+             From<(A, B, C, D, E)>
+             From<(A, B, C, D, E, F)>
+             From<(A, B, C, D, E, F, G)>
+             From<(A, B, C, D, E, F, G, H)>
+             From<(A, B, C, D, E, F, G, H, I)>
+             From<(A, B, C, D, E, F, G, H, I, J)>
+             From<(A, B, C, D, E, F, G, H, I, J, K)>
+             From<(A, B, C, D, E, F, G, H, I, J, K, L)>
+             From<(A,)>
+             From<Arc<T>>
+             From<BTreeMap<std::string::String, V>>
+             From<BTreeSet<T>>
+             From<Box<T>>
+             From<Cow<'_, T>>
+             From<Duration>
+             From<HashMap<std::string::String, V, S>>
+             From<HashSet<T, S>>
+             From<IpAddr>
+             From<Ipv4Addr>
+             From<Ipv6Addr>
+             From<NonZero<i16>>
+             From<NonZero<i32>>
+             From<NonZero<i64>>
+             From<NonZero<i8>>
+             From<NonZero<isize>>
+             From<NonZero<u16>>
+             From<NonZero<u32>>
+             From<NonZero<u64>>
+             From<NonZero<u8>>
+             From<NonZero<usize>>
+             From<PathBuf>
+             From<Rc<T>>
+             From<SocketAddrV4>
+             From<SocketAddrV6>
+             From<SystemTime>
+             From<Vec<T>>
+             From<VecDeque<T>>
+             From<Wrapped>
+             From<[T; N]>
+             From<bool>
+             From<char>
+             From<f32>
+             From<f64>
+             From<i16>
+             From<i32>
+             From<i64>
+             From<i8>
+             From<isize>
+             From<std::net::SocketAddr>
+             From<std::option::Option<T>>
+             From<std::string::String>
+             From<u16>
+             From<u32>
+             From<u64>
+             From<u8>
+             From<usize>
+   = note: this error originates in the derive macro `Script` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0277]: the trait bound `Point: FromScript` is not satisfied
+  --> tests/ui_impl_listing/transparent_over_unbridgeable.rs:12:20
+   |
+12 | pub struct Wrapped(Point);
+   |                    ^^^^^ unsatisfied trait bound
+   |
+help: the trait `FromScript` is not implemented for `Point`
+  --> tests/ui_impl_listing/transparent_over_unbridgeable.rs:4:1
+   |
+ 4 | pub struct Point {
+   | ^^^^^^^^^^^^^^^^
+   = help: the following other types implement trait `FromScript`:
+             ()
+             (A, B)
+             (A, B, C)
+             (A, B, C, D)
+             (A, B, C, D, E)
+             (A, B, C, D, E, F)
+             (A, B, C, D, E, F, G)
+             (A, B, C, D, E, F, G, H)
+           and $N others

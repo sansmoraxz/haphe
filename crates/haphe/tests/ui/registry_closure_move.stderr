@@ -1,0 +1,5 @@
+error: `move` has no meaning here: registry closures cannot capture — state belongs in a described type
+ --> tests/ui/registry_closure_move.rs:6:29
+  |
+6 |                     double: move |x: i64| -> i64 { x * 2 },
+  |                             ^^^^

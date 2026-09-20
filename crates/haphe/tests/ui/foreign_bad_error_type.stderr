@@ -1,0 +1,11 @@
+error[E0277]: the trait bound `MyError: From<ForeignError>` is not satisfied
+ --> tests/ui/foreign_bad_error_type.rs:7:34
+  |
+7 |     fn get(&self) -> Result<i64, MyError>;
+  |                                  ^^^^^^^ unsatisfied trait bound
+  |
+help: the trait `From<ForeignError>` is not implemented for `MyError`
+ --> tests/ui/foreign_bad_error_type.rs:3:1
+  |
+3 | pub struct MyError;
+  | ^^^^^^^^^^^^^^^^^^

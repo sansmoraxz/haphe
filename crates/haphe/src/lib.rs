@@ -2,7 +2,8 @@
 //!
 //! # Quickstart
 //!
-//! ```
+#![cfg_attr(feature = "macros", doc = "```")]
+#![cfg_attr(not(feature = "macros"), doc = "```ignore")]
 //! use haphe::{Script, script};
 //!
 //! /// A 2D point.

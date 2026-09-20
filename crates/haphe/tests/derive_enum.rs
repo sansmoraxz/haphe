@@ -2,7 +2,10 @@
 //! would write by hand.
 
 #![cfg(feature = "macros")]
-#![allow(dead_code)]
+#![allow(
+    dead_code,
+    reason = "fixtures are exercised through their generated descriptors and bridge wrappers, not direct calls"
+)]
 
 use haphe::{
     EnumDescriptor, EnumVariant, FieldDescriptor, PrimitiveType, Script, ScriptEnum, ScriptImpl,
@@ -45,11 +48,13 @@ static HAND_WRITTEN: EnumDescriptor<'static> = EnumDescriptor {
             name: "Red",
             doc: Some("Pure red."),
             kind: VariantKind::Unit,
+            discriminant: None,
         },
         EnumVariant {
             name: "RGB",
             doc: None,
             kind: VariantKind::Tuple(&[U8, U8, U8]),
+            discriminant: None,
         },
         EnumVariant {
             name: "Named",
@@ -68,12 +73,14 @@ static HAND_WRITTEN: EnumDescriptor<'static> = EnumDescriptor {
                     readonly: true,
                 },
             ]),
+            discriminant: None,
         },
     ],
     methods: <Color as ScriptImpl>::METHODS,
     trait_impls: &[TraitImpl::Clone],
     thread_safety: ThreadSafety::SEND_SYNC,
     generic_params: &[],
+    repr: None,
     is_flags: false,
 };
 
@@ -106,4 +113,44 @@ fn flags_enum_descriptor() {
             .iter()
             .all(|v| matches!(v.kind, haphe::VariantKind::Unit))
     );
+}
+
+/// `i64::MIN` as an explicit discriminant is recorded exactly — its inner
+/// literal overflows i64 before negation, which must not silently fall back
+/// to the implicit chain.
+#[derive(Script)]
+#[repr(i64)]
+enum Extremes {
+    Min = -9_223_372_036_854_775_808,
+    NegOne = -1,
+    Max = 9_223_372_036_854_775_807,
+}
+
+#[test]
+fn extreme_discriminants_record_exactly() {
+    use haphe::ScriptEnum;
+    let desc = <Extremes as ScriptEnum>::DESCRIPTOR;
+    let discs: Vec<Option<i64>> = desc.variants.iter().map(|v| v.discriminant).collect();
+    assert_eq!(
+        discs,
+        [Some(i64::MIN), Some(-1), Some(i64::MAX)],
+        "explicit extreme discriminants must survive parsing"
+    );
+}
+
+/// A `repr(u64)` discriminant above `i64::MAX` follows the bridge's u64
+/// policy: it records as the i64 BIT PATTERN.
+#[derive(Script)]
+#[repr(u64)]
+enum WideBits {
+    Top = 18_446_744_073_709_551_615,
+    Zero = 0,
+}
+
+#[test]
+fn u64_discriminants_record_as_bit_pattern() {
+    use haphe::ScriptEnum;
+    let desc = <WideBits as ScriptEnum>::DESCRIPTOR;
+    let discs: Vec<Option<i64>> = desc.variants.iter().map(|v| v.discriminant).collect();
+    assert_eq!(discs, [Some(-1), Some(0)]);
 }

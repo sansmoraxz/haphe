@@ -1,0 +1,5 @@
+error: generic parameters are not supported on constructors or property accessors
+  --> tests/ui/generic_constructor.rs:12:10
+   |
+12 |     fn of<T: Into<i64>>(value: T) -> Self {
+   |          ^

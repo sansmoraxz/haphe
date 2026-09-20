@@ -1,0 +1,5 @@
+error: closure `double` is declared twice in this module
+ --> tests/ui/registry_closure_duplicate.rs:7:21
+  |
+7 |                     double: |x: f64| -> f64 { x * 2.0 },
+  |                     ^^^^^^

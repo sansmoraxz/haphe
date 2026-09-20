@@ -1,0 +1,5 @@
+error: foreign traits cannot have lifetime parameters
+ --> tests/ui/foreign_lifetime_param.rs:4:13
+  |
+4 | trait Hooks<'a> {
+  |             ^^

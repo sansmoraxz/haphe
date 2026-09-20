@@ -3,6 +3,85 @@ use haphe::{Ownership, PrimitiveType, TypeDescriptor};
 use crate::WitGenError;
 use crate::model::{Env, Plan};
 
+/// Values cross the component boundary by copy: a lifetime-carrying
+/// descriptor (`Cow<'a, T>`) lowers as its carried type, and the lifetime
+/// does not exist in WIT. Applied at the entry of every descriptor match so
+/// nested occurrences normalize uniformly.
+pub(crate) fn peel_borrowed<'b, 'a>(mut ty: &'b TypeDescriptor<'a>) -> &'b TypeDescriptor<'a> {
+    while let TypeDescriptor::Borrowed { inner, .. } = ty {
+        ty = inner;
+    }
+    ty
+}
+
+/// Whether a signature type mentions one of the function's own generic
+/// parameters. Such positions carry the concrete instantiation in dynamic
+/// dispatch: they become case variants in synthesized dispatchers and in
+/// erased (`dyn`) foreign imports.
+#[cfg_attr(
+    not(any(feature = "runtime", feature = "dyn-generics")),
+    allow(dead_code, reason = "only dynamic-dispatch machinery consumes it")
+)]
+pub(crate) fn mentions_generic(ty: &TypeDescriptor<'_>) -> bool {
+    match ty {
+        TypeDescriptor::GenericParam(_) => true,
+        TypeDescriptor::Option(inner)
+        | TypeDescriptor::List(inner)
+        | TypeDescriptor::Stream(inner)
+        | TypeDescriptor::Future(inner)
+        | TypeDescriptor::Borrowed { inner, .. }
+        | TypeDescriptor::Array(inner, _) => mentions_generic(inner),
+        TypeDescriptor::Map(k, v) | TypeDescriptor::Result(k, v) => {
+            mentions_generic(k) || mentions_generic(v)
+        }
+        TypeDescriptor::Tuple(elems) => elems.iter().any(mentions_generic),
+        TypeDescriptor::Callback {
+            params,
+            return_type,
+        } => params.iter().any(mentions_generic) || mentions_generic(return_type),
+        TypeDescriptor::Instance { args, .. } => args.iter().any(mentions_generic),
+        _ => false,
+    }
+}
+
+/// Whether `ty` mentions one of `params` by name — the check dispatcher
+/// machinery uses so that only the METHOD's own generic parameters become
+/// variant cases; a generic SELF type's parameters render concretely per
+/// monomorph and pass through.
+#[cfg_attr(
+    not(feature = "dyn-generics"),
+    allow(dead_code, reason = "only synthesized dispatcher emission consumes it")
+)]
+pub(crate) fn mentions_named_generic(
+    ty: &TypeDescriptor<'_>,
+    params: &[haphe::GenericParam<'_>],
+) -> bool {
+    match ty {
+        TypeDescriptor::GenericParam(name) => params.iter().any(|p| p.name == *name),
+        TypeDescriptor::Option(inner)
+        | TypeDescriptor::List(inner)
+        | TypeDescriptor::Stream(inner)
+        | TypeDescriptor::Future(inner)
+        | TypeDescriptor::Borrowed { inner, .. }
+        | TypeDescriptor::Array(inner, _) => mentions_named_generic(inner, params),
+        TypeDescriptor::Map(k, v) | TypeDescriptor::Result(k, v) => {
+            mentions_named_generic(k, params) || mentions_named_generic(v, params)
+        }
+        TypeDescriptor::Tuple(elems) => elems.iter().any(|e| mentions_named_generic(e, params)),
+        TypeDescriptor::Callback {
+            params: cb_params,
+            return_type,
+        } => {
+            cb_params.iter().any(|p| mentions_named_generic(p, params))
+                || mentions_named_generic(return_type, params)
+        }
+        TypeDescriptor::Instance { args, .. } => {
+            args.iter().any(|a| mentions_named_generic(a, params))
+        }
+        _ => false,
+    }
+}
+
 /// Where a type appears; determines resource handle rendering and whether
 /// Unit is allowed.
 #[derive(Clone, Copy)]
@@ -20,12 +99,15 @@ pub(crate) fn render_return(
     env: Option<&Env<'_, '_>>,
     context: &str,
 ) -> Result<Option<String>, WitGenError> {
-    if matches!(ty, TypeDescriptor::Unit) {
+    if matches!(peel_borrowed(ty), TypeDescriptor::Unit) {
         return Ok(None);
     }
     render_type(ty, Pos::Return(ownership), plan, env, context).map(Some)
 }
-
+#[allow(
+    clippy::too_many_lines,
+    reason = "one exhaustive pass per descriptor/channel shape; splitting the walk would scatter the per-shape rules"
+)]
 pub(crate) fn render_type(
     ty: &TypeDescriptor<'_>,
     pos: Pos,
@@ -33,7 +115,7 @@ pub(crate) fn render_type(
     env: Option<&Env<'_, '_>>,
     context: &str,
 ) -> Result<String, WitGenError> {
-    match ty {
+    match peel_borrowed(ty) {
         TypeDescriptor::Primitive(p) => render_primitive(*p, context),
         TypeDescriptor::String => Ok("string".to_string()),
         TypeDescriptor::Bytes => Ok("list<u8>".to_string()),
@@ -179,8 +261,7 @@ fn render_named(
     }
     match pos {
         Pos::Param(Ownership::Ref | Ownership::RefMut) => Ok(format!("borrow<{name}>")),
-        Pos::Param(_) | Pos::Field => Ok(name),
-        Pos::Return(Ownership::Owned | Ownership::Clone) => Ok(name),
+        Pos::Param(_) | Pos::Field | Pos::Return(Ownership::Owned | Ownership::Clone) => Ok(name),
         Pos::Return(Ownership::Ref | Ownership::RefMut) => {
             Err(WitGenError::BorrowedResourceReturn {
                 type_id: type_id.to_string(),

@@ -1,0 +1,5 @@
+error: generic impl-block functions need `instantiate(...)` declarations (or `dyn` for runtime dispatch)
+  --> tests/ui/generic_method_without_dyn.rs:11:12
+   |
+11 |     fn echo<T>(&self, value: T) -> T {
+   |            ^

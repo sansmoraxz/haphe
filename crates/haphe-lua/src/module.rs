@@ -19,21 +19,65 @@ pub(crate) fn bind_module(
         table.set(constant.name, value)?;
     }
 
-    // Type stubs: an empty table per type, keyed by the type's short name.
+    // Type tables, keyed by the type's short name. Structs and aliases get
+    // an empty stub; enums get a populated CASE TABLE: `Table.Case = value`
+    // for every unit case, where the value is the case-name string for
+    // string-represented enums and the integer discriminant for numeric
+    // ones (a Rust `#[repr]` integer type; flags carry their real bit
+    // values). A case WITH a payload gets a CONSTRUCTOR FUNCTION instead —
+    // `Table.Case(v1, v2)` builds its case table
+    // (`{ case = "Case", v1, v2 }`), arity-checked against the declared
+    // payload shape.
     for type_id in module.type_ids {
-        let name = registry
-            .get_type(type_id)
-            .map(|tk| match tk {
-                haphe::TypeKind::Struct(s) => s.name,
-                haphe::TypeKind::Enum(e) => e.name,
-                haphe::TypeKind::TypeAlias(a) => a.name,
-            })
-            .unwrap_or(type_id.as_str());
+        let type_kind = registry.get_type(type_id);
+        let name = type_kind.as_ref().map_or(type_id.as_str(), |tk| match tk {
+            haphe::TypeKind::Struct(s) => s.name,
+            haphe::TypeKind::Enum(e) => e.name,
+            haphe::TypeKind::TypeAlias(a) => a.name,
+        });
 
         // Only insert if the name isn't already taken by a constant or
         // function with the same name.
         if table.get::<Value>(name)?.is_nil() {
             let type_table = lua.create_table()?;
+            if let Some(haphe::TypeKind::Enum(e)) = type_kind {
+                for variant in e.variants {
+                    if !type_table.get::<Value>(variant.name)?.is_nil() {
+                        return Err(LuaBindError::DuplicateEnumCase {
+                            enum_name: name.to_owned(),
+                            case: variant.name.to_owned(),
+                        });
+                    }
+                    let arity = match &variant.kind {
+                        haphe::VariantKind::Unit => {
+                            match variant.discriminant {
+                                Some(value) => type_table.set(variant.name, value)?,
+                                None => type_table.set(variant.name, variant.name)?,
+                            }
+                            continue;
+                        }
+                        haphe::VariantKind::Tuple(tys) => tys.len(),
+                        haphe::VariantKind::Struct(fields) => fields.len(),
+                    };
+                    let case = variant.name.to_owned();
+                    let enum_name = name.to_owned();
+                    let ctor = lua.create_function(move |lua, args: mlua::MultiValue| {
+                        if args.len() != arity {
+                            return Err(mlua::Error::runtime(format!(
+                                "{enum_name}.{case} expects {arity} value(s), got {}",
+                                args.len()
+                            )));
+                        }
+                        let case_table = lua.create_table()?;
+                        case_table.raw_set("case", case.as_str())?;
+                        for (i, v) in args.into_iter().enumerate() {
+                            case_table.raw_set(i + 1, v)?;
+                        }
+                        Ok(case_table)
+                    })?;
+                    type_table.set(variant.name, ctor)?;
+                }
+            }
             table.set(name, type_table)?;
         }
     }
@@ -44,16 +88,16 @@ pub(crate) fn bind_module(
         table.set(submodule.name, sub_table)?;
     }
 
-    // Free functions: stubs for now. Module-level free functions need
-    // a FnBinder (analogous to TypeBinder for types) which is not yet
-    // implemented. Each function gets a placeholder that errors with a
-    // helpful message.
+    // Free functions: descriptive stubs. Live dispatch is installed by
+    // `bind_fn::<f>` onto this table AFTER `bind()` — `bind()` (re)creates
+    // the module tables, so it must run FIRST; running it after would wipe
+    // earlier `bind_fn`/`bind_type` refinements.
     for function in module.functions {
         let fn_name = function.name.to_owned();
         let mod_name = module.name.to_owned();
         let stub = lua.create_function(move |_, _args: mlua::MultiValue| -> mlua::Result<()> {
             Err(mlua::Error::runtime(format!(
-                "{mod_name}.{fn_name}: free function binding not yet implemented"
+                "{mod_name}.{fn_name}: not bound — register it with `bind_fn` after `bind()`"
             )))
         })?;
         table.set(function.name, stub)?;
@@ -72,15 +116,15 @@ fn constant_to_lua(
     constant: &ConstantDescriptor<'_>,
 ) -> Result<Value, LuaBindError> {
     let value = constant.value;
-    let ty = constant.ty;
+    let ty = crate::peel_borrowed(constant.ty);
 
     match ty {
         TypeDescriptor::Primitive(p) => {
             primitive_to_lua(lua, module_name, constant.name, *p, value)
         }
-        TypeDescriptor::String => Ok(Value::String(lua.create_string(value)?)),
         TypeDescriptor::Unit => Ok(Value::Nil),
-        // For types we can't yet convert, store as a string representation.
+        // Strings, and types we can't yet convert, store as their string
+        // representation.
         _ => Ok(Value::String(lua.create_string(value)?)),
     }
 }

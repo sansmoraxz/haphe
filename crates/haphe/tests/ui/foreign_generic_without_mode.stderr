@@ -1,0 +1,5 @@
+error: generic foreign methods need `instantiate(...)` declarations (or `dyn` for erased dispatch)
+ --> tests/ui/foreign_generic_without_mode.rs:5:15
+  |
+5 |     fn convert<U>(&self, raw: String) -> U;
+  |               ^

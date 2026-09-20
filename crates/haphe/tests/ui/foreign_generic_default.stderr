@@ -1,0 +1,5 @@
+error: type parameter defaults are not supported on foreign traits
+ --> tests/ui/foreign_generic_default.rs:4:13
+  |
+4 | trait Hooks<T = i64> {
+  |             ^

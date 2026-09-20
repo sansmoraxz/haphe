@@ -14,7 +14,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::types::TypeId;
+use crate::types::{TypeDescriptor, TypeId};
 
 // ---------------------------------------------------------------------------
 // Value conversion
@@ -22,27 +22,53 @@ use crate::types::TypeId;
 
 /// Type-erased wrapper for user-defined types flowing through [`ScriptValue`].
 ///
-/// Uses `Arc` internally so that `ScriptValue` remains `Clone`.
+/// Uses `Arc` internally so that `ScriptValue` remains `Clone`. Values
+/// constructed through [`new_typed`](Self::new_typed) carry their haphe
+/// [`TypeId`] so dynamic dispatch can rank them exactly; untagged values
+/// rank as merely coercible and resolve by try-call.
 #[derive(Clone)]
-pub struct OpaqueUserData(pub Arc<dyn std::any::Any + Send + Sync>);
+pub struct OpaqueUserData {
+    inner: Arc<dyn std::any::Any + Send + Sync>,
+    type_tag: Option<TypeId<'static>>,
+}
 
 impl OpaqueUserData {
     pub fn new<T: Send + Sync + 'static>(value: T) -> Self {
-        Self(Arc::new(value))
+        Self {
+            inner: Arc::new(value),
+            type_tag: None,
+        }
+    }
+
+    /// Wraps a described type, capturing its [`TypeId`] for dynamic
+    /// dispatch.
+    pub fn new_typed<T: crate::script::ScriptType + Send + Sync + 'static>(value: T) -> Self {
+        Self {
+            inner: Arc::new(value),
+            type_tag: Some(<T as crate::script::ScriptType>::ID),
+        }
+    }
+
+    /// The described type's id, when constructed via
+    /// [`new_typed`](Self::new_typed).
+    pub fn type_tag(&self) -> Option<TypeId<'static>> {
+        self.type_tag
     }
 
     pub fn downcast_ref<T: 'static>(&self) -> Option<&T> {
-        self.0.downcast_ref()
+        self.inner.downcast_ref()
     }
 
     pub fn downcast_clone<T: Clone + 'static>(&self) -> Option<T> {
-        self.0.downcast_ref::<T>().cloned()
+        self.inner.downcast_ref::<T>().cloned()
     }
 }
 
 impl std::fmt::Debug for OpaqueUserData {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_tuple("UserData").field(&self.0.type_id()).finish()
+        f.debug_tuple("UserData")
+            .field(&self.inner.type_id())
+            .finish()
     }
 }
 
@@ -64,6 +90,113 @@ pub enum ScriptValue {
     Map(Vec<(String, ScriptValue)>),
     Optional(Option<Box<ScriptValue>>),
     UserData(OpaqueUserData),
+    /// A unit-enum value, identified by its declared case name.
+    ///
+    /// The case always carries the *declared* exposed spelling
+    /// (identifier-shaped, Rust conventions: ASCII letters, digits, `_`) and
+    /// is matched exactly. A backend whose native convention spells cases
+    /// differently translates to and from the declared name at its own
+    /// boundary, with a comparison policy of its choosing.
+    Enum {
+        /// The declared case name.
+        case: String,
+        /// The numeric discriminant, when the enum has a numeric script
+        /// representation ([`repr`](crate::EnumDescriptor::repr)); `None`
+        /// for string-represented enums and payload cases. The case NAME
+        /// remains the canonical identity; the discriminant is carried data
+        /// backends may render natively.
+        discriminant: Option<i64>,
+        /// The case's carried values: empty for unit cases; a tuple case's
+        /// values positionally; a struct case's field values in declaration
+        /// order (the descriptor's
+        /// [`VariantKind`](crate::VariantKind) names them).
+        payload: Vec<ScriptValue>,
+    },
+}
+
+/// Error produced by a bridge call wrapper: either an argument/return
+/// conversion mismatch, or an error the called implementation itself
+/// returned (a fallible constructor or `Result`-returning function).
+/// Backends map `Callee` onto their native error construct, rendering data
+/// from the intact error object at THEIR boundary — message via `Display`,
+/// cause chain via [`cause_chain`](Self::cause_chain), `kind` (the
+/// descriptor's [`error_kind`](crate::FunctionDescriptor::error_kind) hint)
+/// to pick an error class where the runtime has them.
+#[derive(Debug, Clone)]
+pub enum ScriptCallError {
+    /// A value didn't convert at the boundary.
+    Convert(ScriptConvertError),
+    /// The called implementation returned its own error, carried intact:
+    /// callers on the Rust side downcast to the concrete type and walk
+    /// `source()`; scripts receive the rendered form. Named for the CALLEE —
+    /// whichever side of the bridge implements the function — not for a
+    /// particular runtime topology.
+    Callee {
+        /// The callee's error itself.
+        error: std::sync::Arc<dyn std::error::Error + Send + Sync>,
+        /// Error-class hint from the descriptor, when declared.
+        kind: Option<&'static str>,
+        /// The concrete error type's name, captured at the boundary.
+        type_name: &'static str,
+    },
+}
+
+impl ScriptCallError {
+    /// A `Callee` error's rendered message (`Display` of the carried error);
+    /// the conversion rendering for `Convert`.
+    pub fn message(&self) -> String {
+        match self {
+            Self::Convert(e) => e.to_string(),
+            Self::Callee { error, .. } => error.to_string(),
+        }
+    }
+
+    /// A `Callee` error's rendered cause chain, outermost first — the carried
+    /// error's `source()` links, NOT including the error's own message.
+    /// Empty for `Convert` and for chain-less errors.
+    pub fn cause_chain(&self) -> Vec<String> {
+        let Self::Callee { error, .. } = self else {
+            return Vec::new();
+        };
+        let mut chain = Vec::new();
+        let mut cause = error.source();
+        while let Some(err) = cause {
+            chain.push(err.to_string());
+            cause = err.source();
+        }
+        chain
+    }
+}
+
+impl From<ScriptConvertError> for ScriptCallError {
+    fn from(e: ScriptConvertError) -> Self {
+        Self::Convert(e)
+    }
+}
+
+impl std::fmt::Display for ScriptCallError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Convert(e) => e.fmt(f),
+            Self::Callee {
+                error,
+                kind: Some(kind),
+                ..
+            } => write!(f, "{kind}: {error}"),
+            Self::Callee {
+                error, kind: None, ..
+            } => error.fmt(f),
+        }
+    }
+}
+
+impl std::error::Error for ScriptCallError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Convert(e) => Some(e),
+            Self::Callee { error, .. } => Some(&**error as &(dyn std::error::Error + 'static)),
+        }
+    }
 }
 
 /// Error returned when a [`ScriptValue`] variant doesn't match the expected
@@ -100,6 +233,7 @@ impl ScriptValue {
             Self::Map(_) => "map",
             Self::Optional(_) => "optional",
             Self::UserData(_) => "userdata",
+            Self::Enum { .. } => "enum",
         }
     }
 }
@@ -154,13 +288,18 @@ macro_rules! impl_int_bridge {
         $(
             impl From<$ty> for ScriptValue {
                 fn from(n: $ty) -> Self {
-                    Self::I64(n as i64)
+                    Self::I64(i64::from(n))
                 }
             }
             impl FromScript for $ty {
                 fn from_script(v: ScriptValue) -> Result<Self, ScriptConvertError> {
                     match v {
-                        ScriptValue::I64(n) => Ok(n as $ty),
+                        // Range-checked: an out-of-range value is a caller
+                        // error, never a silent wrap.
+                        ScriptValue::I64(n) => n.try_into().map_err(|_| ScriptConvertError {
+                            expected: concat!("value in range of ", stringify!($ty)),
+                            got: "out-of-range integer",
+                        }),
                         other => Err(ScriptConvertError {
                             expected: stringify!($ty),
                             got: other.variant_name(),
@@ -172,14 +311,34 @@ macro_rules! impl_int_bridge {
     };
 }
 
-impl_int_bridge!(i8, i16, i32, i64, u8, u16, u32, u64);
+impl_int_bridge!(i8, i16, i32, i64, u8, u16, u32);
+
+// `u64` crosses as the `i64` BIT PATTERN (values above `i64::MAX` wrap) —
+// declared bridge policy, hence the deliberate `as` casts.
+impl From<u64> for ScriptValue {
+    fn from(n: u64) -> Self {
+        Self::I64(n as i64)
+    }
+}
+
+impl FromScript for u64 {
+    fn from_script(v: ScriptValue) -> Result<Self, ScriptConvertError> {
+        match v {
+            ScriptValue::I64(n) => Ok(n as u64),
+            other => Err(ScriptConvertError {
+                expected: "u64",
+                got: other.variant_name(),
+            }),
+        }
+    }
+}
 
 macro_rules! impl_float_bridge {
     ($($ty:ty),*) => {
         $(
             impl From<$ty> for ScriptValue {
                 fn from(n: $ty) -> Self {
-                    Self::F64(n as f64)
+                    Self::F64(f64::from(n))
                 }
             }
             impl FromScript for $ty {
@@ -211,10 +370,22 @@ impl FromScript for char {
     fn from_script(v: ScriptValue) -> Result<Self, ScriptConvertError> {
         match v {
             ScriptValue::Char(c) => Ok(c),
-            ScriptValue::String(s) => s.chars().next().ok_or(ScriptConvertError {
-                expected: "char",
-                got: "empty string",
-            }),
+            // Only a single-character string converts; anything longer would
+            // silently drop data.
+            ScriptValue::String(s) => {
+                let mut chars = s.chars();
+                match (chars.next(), chars.next()) {
+                    (Some(c), None) => Ok(c),
+                    (None, _) => Err(ScriptConvertError {
+                        expected: "char",
+                        got: "empty string",
+                    }),
+                    (Some(_), Some(_)) => Err(ScriptConvertError {
+                        expected: "char",
+                        got: "multi-character string",
+                    }),
+                }
+            }
             other => Err(ScriptConvertError {
                 expected: "char",
                 got: other.variant_name(),
@@ -242,7 +413,7 @@ impl FromScript for String {
 }
 
 impl From<()> for ScriptValue {
-    fn from(_: ()) -> Self {
+    fn from((): ()) -> Self {
         Self::Unit
     }
 }
@@ -276,6 +447,12 @@ impl<T: FromScript> FromScript for Vec<T> {
     fn from_script(v: ScriptValue) -> Result<Self, ScriptConvertError> {
         match v {
             ScriptValue::List(list) => list.into_iter().map(T::from_script).collect(),
+            // The empty-shape rule: an empty sequence and an empty
+            // associative container carry identical information, and
+            // runtimes with one aggregate value type cannot tell them
+            // apart — either empty shape converts, losslessly. Conversions
+            // recurse, so nested positions inherit the rule.
+            ScriptValue::Map(entries) if entries.is_empty() => Ok(Vec::new()),
             other => Err(ScriptConvertError {
                 expected: "list",
                 got: other.variant_name(),
@@ -284,11 +461,11 @@ impl<T: FromScript> FromScript for Vec<T> {
     }
 }
 
-impl<V> From<HashMap<String, V>> for ScriptValue
+impl<V, S> From<HashMap<String, V, S>> for ScriptValue
 where
     ScriptValue: From<V>,
 {
-    fn from(m: HashMap<String, V>) -> Self {
+    fn from(m: HashMap<String, V, S>) -> Self {
         Self::Map(
             m.into_iter()
                 .map(|(k, v)| (k, ScriptValue::from(v)))
@@ -297,19 +474,78 @@ where
     }
 }
 
-impl<V: FromScript> FromScript for HashMap<String, V> {
+impl<V, S> FromScript for HashMap<String, V, S>
+where
+    V: FromScript,
+    S: std::hash::BuildHasher + Default,
+{
     fn from_script(v: ScriptValue) -> Result<Self, ScriptConvertError> {
         match v {
             ScriptValue::Map(pairs) => pairs
                 .into_iter()
                 .map(|(k, v)| V::from_script(v).map(|val| (k, val)))
                 .collect(),
+            // The empty-shape rule (see `Vec`): either empty shape converts.
+            ScriptValue::List(items) if items.is_empty() => Ok(Self::default()),
             other => Err(ScriptConvertError {
                 expected: "map",
                 got: other.variant_name(),
             }),
         }
     }
+}
+
+// Tuples cross the bridge as fixed-length lists, matching their descriptor
+// shape (`TypeDescriptor::Tuple`).
+macro_rules! impl_tuple_bridge {
+    ($( ($($t:ident $idx:tt),+) ),+ $(,)?) => {$(
+        impl<$($t),+> From<($($t,)+)> for ScriptValue
+        where
+            $(ScriptValue: From<$t>,)+
+        {
+            fn from(value: ($($t,)+)) -> Self {
+                Self::List(vec![$(ScriptValue::from(value.$idx)),+])
+            }
+        }
+
+        impl<$($t: FromScript),+> FromScript for ($($t,)+) {
+            fn from_script(v: ScriptValue) -> Result<Self, ScriptConvertError> {
+                const ARITY: usize = 0 $(+ impl_tuple_bridge!(@one $t))+;
+                match v {
+                    ScriptValue::List(items) => {
+                        if items.len() != ARITY {
+                            return Err(ScriptConvertError {
+                                expected: "tuple",
+                                got: "list of mismatched length",
+                            });
+                        }
+                        let mut items = items.into_iter();
+                        Ok(($($t::from_script(items.next().expect("length checked"))?,)+))
+                    }
+                    other => Err(ScriptConvertError {
+                        expected: "tuple",
+                        got: other.variant_name(),
+                    }),
+                }
+            }
+        }
+    )+};
+    (@one $t:ident) => { 1 };
+}
+
+impl_tuple_bridge! {
+    (A 0),
+    (A 0, B 1),
+    (A 0, B 1, C 2),
+    (A 0, B 1, C 2, D 3),
+    (A 0, B 1, C 2, D 3, E 4),
+    (A 0, B 1, C 2, D 3, E 4, F 5),
+    (A 0, B 1, C 2, D 3, E 4, F 5, G 6),
+    (A 0, B 1, C 2, D 3, E 4, F 5, G 6, H 7),
+    (A 0, B 1, C 2, D 3, E 4, F 5, G 6, H 7, I 8),
+    (A 0, B 1, C 2, D 3, E 4, F 5, G 6, H 7, I 8, J 9),
+    (A 0, B 1, C 2, D 3, E 4, F 5, G 6, H 7, I 8, J 9, K 10),
+    (A 0, B 1, C 2, D 3, E 4, F 5, G 6, H 7, I 8, J 9, K 10, L 11),
 }
 
 impl<T> From<Option<T>> for ScriptValue
@@ -346,6 +582,27 @@ pub trait ScriptBind: Sized {
     fn bind<B: TypeBinder<Self>>(binder: &mut B) -> Result<(), B::Error>;
 }
 
+/// The self type's generic identity, for `dyn` method registrations on a
+/// generic self type: the declared parameters and this monomorph's concrete
+/// arguments (both empty on a non-generic self type). Backends merge these
+/// with each candidate's own parameters and `type_args` into one
+/// [`GenericSubst`](crate::dispatch::GenericSubst) before ranking.
+#[derive(Debug, Clone, Copy)]
+pub struct SelfInstantiation {
+    /// The self type's declared generic parameters, in order.
+    pub params: &'static [crate::types::GenericParam<'static>],
+    /// This monomorph's concrete type arguments, in the same order.
+    pub args: &'static [crate::types::TypeDescriptor<'static>],
+}
+
+impl SelfInstantiation {
+    /// A non-generic self type.
+    pub const NONE: Self = Self {
+        params: &[],
+        args: &[],
+    };
+}
+
 /// Backend-provided registrar for a specific Rust type `T`.
 ///
 /// Each method receives a concrete fn pointer with fully monomorphized
@@ -366,38 +623,343 @@ pub trait TypeBinder<T>: Sized {
         setter: Option<fn(&mut T, V)>,
     ) -> Result<(), Self::Error>;
 
-    /// Register a `&self` method. The wrapper converts arguments from
-    /// `ScriptValue` and returns the result as `ScriptValue` — the macro
-    /// generates the conversion code with concrete types.
-    fn method_ref(
+    /// Register a READ-ONLY field whose type converts outbound only —
+    /// e.g. `Vec<&'static str>`, which has `IntoScript` element conversions
+    /// but no inbound counterpart. Surfaced exactly like a read-only
+    /// [`field`](Self::field); there is never a setter.
+    fn field_get<V: IntoScript + Clone + 'static>(
         &mut self,
         name: &'static str,
-        f: fn(&T, &[ScriptValue]) -> Result<ScriptValue, ScriptConvertError>,
+        getter: fn(&T) -> V,
+    ) -> Result<(), Self::Error>;
+
+    /// Register a non-mutating method (`&self` or consuming `self`). The
+    /// wrapper converts arguments from `ScriptValue` and returns the result
+    /// as `ScriptValue` — the macro generates the conversion code with
+    /// concrete types. The receiver arrives as a [`ScriptCow`]: pass
+    /// `Borrowed` while holding the runtime's guard for zero-clone dispatch,
+    /// or `Owned` with a value acquired by the backend's own policy (a
+    /// consuming method clones a borrowed carrier at the boundary).
+    fn method(
+        &mut self,
+        name: &'static str,
+        f: for<'a> fn(ScriptCow<'a, T>, &[ScriptValue]) -> Result<ScriptValue, ScriptCallError>,
     ) -> Result<(), Self::Error>;
 
     /// Register a `&mut self` method.
     fn method_mut(
         &mut self,
         name: &'static str,
-        f: fn(&mut T, &[ScriptValue]) -> Result<ScriptValue, ScriptConvertError>,
+        f: fn(&mut T, &[ScriptValue]) -> Result<ScriptValue, ScriptCallError>,
     ) -> Result<(), Self::Error>;
 
-    /// Register a consuming `self` method.
-    fn method_owned(
+    /// Register a non-mutating `async` method (`&self` or consuming
+    /// `self`).
+    ///
+    /// The receiver arrives as a [`ScriptCow`] and the returned future may
+    /// borrow it: a backend that can hold its runtime's guard across
+    /// `await`s passes `Borrowed` (zero clones); one that cannot passes
+    /// `Owned`. Only reachable when the backend's capabilities declare
+    /// async support — others reject the registration with a descriptive
+    /// error.
+    fn method_async(
         &mut self,
         name: &'static str,
-        f: fn(T, &[ScriptValue]) -> Result<ScriptValue, ScriptConvertError>,
+        f: for<'a> fn(ScriptCow<'a, T>, &'a [ScriptValue]) -> ScriptCallFuture<'a>,
+    ) -> Result<(), Self::Error>;
+
+    /// Register a `&mut self` `async` method.
+    ///
+    /// The future borrows the receiver mutably for its whole run, so
+    /// mutation writes back in place. A backend that cannot hold a mutable
+    /// guard across `await`s rejects the registration with a descriptive
+    /// error — it must never substitute an acquired copy, whose mutations
+    /// would be silently lost.
+    fn method_async_mut(
+        &mut self,
+        name: &'static str,
+        f: for<'a> fn(&'a mut T, &'a [ScriptValue]) -> ScriptCallFuture<'a>,
+    ) -> Result<(), Self::Error>;
+
+    /// Register one declared instantiation of a STATICALLY dispatched
+    /// generic method (`&self`, consuming `self`, or receiver-less):
+    /// `type_args` carries that instantiation's concrete type arguments (in
+    /// declaration order, matching an entry of the descriptor's
+    /// [`instantiations`](crate::FunctionDescriptor::instantiations)) and
+    /// `f` is the corresponding monomorphized wrapper. Backends key the
+    /// registration on `(name, type_args)` — typically a mangled per-monomorph
+    /// method name, mirroring their static generic free-function scheme.
+    ///
+    /// The default delegates to [`method`](Self::method) — safe because the
+    /// capability check rejects generic registrations before binding on
+    /// backends without [`generics`](crate::BackendCapabilities::generics);
+    /// a backend that declares the capability MUST override, or same-named
+    /// monomorphs would collide.
+    fn method_generic(
+        &mut self,
+        name: &'static str,
+        type_args: &'static [crate::types::TypeDescriptor<'static>],
+        f: for<'a> fn(ScriptCow<'a, T>, &[ScriptValue]) -> Result<ScriptValue, ScriptCallError>,
+    ) -> Result<(), Self::Error> {
+        let _ = type_args;
+        self.method(name, f)
+    }
+
+    /// `&mut self` sibling of [`method_generic`](Self::method_generic).
+    fn method_generic_mut(
+        &mut self,
+        name: &'static str,
+        type_args: &'static [crate::types::TypeDescriptor<'static>],
+        f: fn(&mut T, &[ScriptValue]) -> Result<ScriptValue, ScriptCallError>,
+    ) -> Result<(), Self::Error> {
+        let _ = type_args;
+        self.method_mut(name, f)
+    }
+
+    /// Async sibling of [`method_generic`](Self::method_generic);
+    /// async-capability gating applies, like
+    /// [`method_async`](Self::method_async).
+    fn method_generic_async(
+        &mut self,
+        name: &'static str,
+        type_args: &'static [crate::types::TypeDescriptor<'static>],
+        f: for<'a> fn(ScriptCow<'a, T>, &'a [ScriptValue]) -> ScriptCallFuture<'a>,
+    ) -> Result<(), Self::Error> {
+        let _ = type_args;
+        self.method_async(name, f)
+    }
+
+    /// Async `&mut self` sibling of
+    /// [`method_generic`](Self::method_generic).
+    fn method_generic_async_mut(
+        &mut self,
+        name: &'static str,
+        type_args: &'static [crate::types::TypeDescriptor<'static>],
+        f: for<'a> fn(&'a mut T, &'a [ScriptValue]) -> ScriptCallFuture<'a>,
+    ) -> Result<(), Self::Error> {
+        let _ = type_args;
+        self.method_async_mut(name, f)
+    }
+
+    /// Register one candidate of a `dyn`-dispatched generic method (`&self`,
+    /// consuming `self`, or receiver-less).
+    ///
+    /// `self_inst` carries the SELF type's generic identity when the method
+    /// lives on a generic self type: candidates' descriptors may reference
+    /// the type's parameters (e.g. `GenericParam("T")`) alongside the
+    /// method's own, so backends merge `self_inst` with the candidate's
+    /// `type_args` into one [`GenericSubst`](crate::dispatch::GenericSubst)
+    /// before ranking. [`SelfInstantiation::NONE`] on non-generic self
+    /// types.
+    ///
+    /// Called once per declared instantiation, like
+    /// [`method`](Self::method); the whole descriptor is provided because
+    /// dynamic resolution ranks candidates against the declared parameter
+    /// types (see
+    /// [`resolve_dyn_candidate`](crate::dispatch::resolve_dyn_candidate)).
+    /// The default delegates to `method` — safe because the capability check
+    /// rejects `dyn` methods before binding on backends without
+    /// [`dyn_generics`](crate::BackendCapabilities::dyn_generics).
+    fn method_dyn(
+        &mut self,
+        descriptor: &'static crate::function::FunctionDescriptor<'static>,
+        type_args: &'static [crate::types::TypeDescriptor<'static>],
+        self_inst: SelfInstantiation,
+        f: for<'a> fn(ScriptCow<'a, T>, &[ScriptValue]) -> Result<ScriptValue, ScriptCallError>,
+    ) -> Result<(), Self::Error> {
+        let _ = (type_args, self_inst);
+        self.method(descriptor.name, f)
+    }
+
+    /// `&mut self` sibling of [`method_dyn`](Self::method_dyn).
+    fn method_dyn_mut(
+        &mut self,
+        descriptor: &'static crate::function::FunctionDescriptor<'static>,
+        type_args: &'static [crate::types::TypeDescriptor<'static>],
+        self_inst: SelfInstantiation,
+        f: fn(&mut T, &[ScriptValue]) -> Result<ScriptValue, ScriptCallError>,
+    ) -> Result<(), Self::Error> {
+        let _ = (type_args, self_inst);
+        self.method_mut(descriptor.name, f)
+    }
+
+    /// Async sibling of [`method_dyn`](Self::method_dyn).
+    fn method_dyn_async(
+        &mut self,
+        descriptor: &'static crate::function::FunctionDescriptor<'static>,
+        type_args: &'static [crate::types::TypeDescriptor<'static>],
+        self_inst: SelfInstantiation,
+        f: for<'a> fn(ScriptCow<'a, T>, &'a [ScriptValue]) -> ScriptCallFuture<'a>,
+    ) -> Result<(), Self::Error> {
+        let _ = (type_args, self_inst);
+        self.method_async(descriptor.name, f)
+    }
+
+    /// Async `&mut self` sibling of [`method_dyn`](Self::method_dyn).
+    fn method_dyn_async_mut(
+        &mut self,
+        descriptor: &'static crate::function::FunctionDescriptor<'static>,
+        type_args: &'static [crate::types::TypeDescriptor<'static>],
+        self_inst: SelfInstantiation,
+        f: for<'a> fn(&'a mut T, &'a [ScriptValue]) -> ScriptCallFuture<'a>,
+    ) -> Result<(), Self::Error> {
+        let _ = (type_args, self_inst);
+        self.method_async_mut(descriptor.name, f)
+    }
+
+    /// Register an `async` constructor. The returned future may borrow the
+    /// argument slice; async-capability gating applies, like
+    /// [`method_async`](Self::method_async).
+    fn constructor_async(
+        &mut self,
+        name: &'static str,
+        f: for<'a> fn(&'a [ScriptValue]) -> ScriptCtorFuture<'a, T>,
+    ) -> Result<(), Self::Error>;
+
+    /// Register an associated function (no receiver, declared in the type's
+    /// impl block). It dispatches with no instance at hand, so backends
+    /// surface it on the TYPE, not on instances — next to
+    /// [`constructor`](Self::constructor)s, whose channel shape this
+    /// mirrors.
+    fn associated(
+        &mut self,
+        name: &'static str,
+        f: fn(&[ScriptValue]) -> Result<ScriptValue, ScriptCallError>,
+    ) -> Result<(), Self::Error>;
+
+    /// Register an `async` associated function. The returned future may
+    /// borrow the argument slice; async-capability gating applies, like
+    /// [`method_async`](Self::method_async).
+    fn associated_async(
+        &mut self,
+        name: &'static str,
+        f: for<'a> fn(&'a [ScriptValue]) -> ScriptCallFuture<'a>,
+    ) -> Result<(), Self::Error>;
+
+    /// Register one declared instantiation of a STATICALLY dispatched
+    /// generic associated function; keying follows
+    /// [`method_generic`](Self::method_generic).
+    ///
+    /// The default delegates to [`associated`](Self::associated) — safe
+    /// because the capability check rejects generic registrations before
+    /// binding on backends without
+    /// [`generics`](crate::BackendCapabilities::generics); a backend that
+    /// declares the capability MUST override, or same-named monomorphs
+    /// would collide.
+    fn associated_generic(
+        &mut self,
+        name: &'static str,
+        type_args: &'static [crate::types::TypeDescriptor<'static>],
+        f: fn(&[ScriptValue]) -> Result<ScriptValue, ScriptCallError>,
+    ) -> Result<(), Self::Error> {
+        let _ = type_args;
+        self.associated(name, f)
+    }
+
+    /// Async sibling of [`associated_generic`](Self::associated_generic).
+    fn associated_generic_async(
+        &mut self,
+        name: &'static str,
+        type_args: &'static [crate::types::TypeDescriptor<'static>],
+        f: for<'a> fn(&'a [ScriptValue]) -> ScriptCallFuture<'a>,
+    ) -> Result<(), Self::Error> {
+        let _ = type_args;
+        self.associated_async(name, f)
+    }
+
+    /// Register one candidate of a `dyn`-dispatched generic associated
+    /// function; candidate semantics follow [`method_dyn`](Self::method_dyn)
+    /// (`self_inst` carries a generic self type's identity — associated fns
+    /// may reference the type's parameters alongside their own).
+    ///
+    /// The default delegates to [`associated`](Self::associated) — safe
+    /// because the capability check rejects `dyn` methods before binding on
+    /// backends without
+    /// [`dyn_generics`](crate::BackendCapabilities::dyn_generics).
+    fn associated_dyn(
+        &mut self,
+        descriptor: &'static crate::function::FunctionDescriptor<'static>,
+        type_args: &'static [crate::types::TypeDescriptor<'static>],
+        self_inst: SelfInstantiation,
+        f: fn(&[ScriptValue]) -> Result<ScriptValue, ScriptCallError>,
+    ) -> Result<(), Self::Error> {
+        let _ = (type_args, self_inst);
+        self.associated(descriptor.name, f)
+    }
+
+    /// Async sibling of [`associated_dyn`](Self::associated_dyn).
+    fn associated_dyn_async(
+        &mut self,
+        descriptor: &'static crate::function::FunctionDescriptor<'static>,
+        type_args: &'static [crate::types::TypeDescriptor<'static>],
+        self_inst: SelfInstantiation,
+        f: for<'a> fn(&'a [ScriptValue]) -> ScriptCallFuture<'a>,
+    ) -> Result<(), Self::Error> {
+        let _ = (type_args, self_inst);
+        self.associated_async(descriptor.name, f)
+    }
+
+    /// Register a computed-property getter, from `#[script(getter)]`.
+    /// Conversion is infallible on the way out; the setter side converts
+    /// fallibly.
+    fn property_get(
+        &mut self,
+        name: &'static str,
+        f: fn(&T) -> ScriptValue,
+    ) -> Result<(), Self::Error>;
+
+    /// Register a computed-property setter, from `#[script(setter)]`.
+    fn property_set(
+        &mut self,
+        name: &'static str,
+        f: fn(&mut T, ScriptValue) -> Result<(), ScriptConvertError>,
+    ) -> Result<(), Self::Error>;
+
+    /// Register an `async` computed-property getter. The receiver arrives
+    /// as a [`ScriptCow`] the future may borrow (see
+    /// [`method_async`](Self::method_async)); async-capability gating
+    /// applies.
+    fn property_get_async(
+        &mut self,
+        name: &'static str,
+        f: for<'a> fn(ScriptCow<'a, T>) -> ScriptCallFuture<'a>,
+    ) -> Result<(), Self::Error>;
+
+    /// Register an `async` computed-property setter. The future borrows the
+    /// receiver mutably for its whole run, so mutation writes back in place
+    /// (see [`method_async_mut`](Self::method_async_mut)).
+    fn property_set_async(
+        &mut self,
+        name: &'static str,
+        f: for<'a> fn(&'a mut T, ScriptValue) -> ScriptCallFuture<'a>,
     ) -> Result<(), Self::Error>;
 
     /// Register a constructor (no receiver, returns `T`).
     fn constructor(
         &mut self,
         name: &'static str,
-        f: fn(&[ScriptValue]) -> Result<T, ScriptConvertError>,
+        f: fn(&[ScriptValue]) -> Result<T, ScriptCallError>,
     ) -> Result<(), Self::Error>;
 
     /// Register a `Display` / `__tostring` metamethod.
     fn meta_tostring(&mut self, f: fn(&T) -> String) -> Result<(), Self::Error>;
+
+    /// Register a `ToString`-derived concatenation metamethod.
+    ///
+    /// Concatenation is string-producing: the backend formats the value
+    /// operand(s) with `f` and accepts only string-like counterparts
+    /// (strings and numbers), erroring on anything else.
+    fn meta_concat(&mut self, f: fn(&T) -> String) -> Result<(), Self::Error>;
+
+    /// Register a hash accessor, from `std::hash::Hash` (a stable `u64`
+    /// digest via the standard hasher). Backends surface it in their native
+    /// shape — a named function where the runtime has no hashing protocol.
+    fn meta_hash(&mut self, f: fn(&T) -> u64) -> Result<(), Self::Error>;
+
+    /// Register a debug-formatting accessor, from `std::fmt::Debug`.
+    /// Distinct from [`meta_tostring`](Self::meta_tostring): both may be
+    /// registered; backends decide how each surfaces.
+    fn meta_debug(&mut self, f: fn(&T) -> String) -> Result<(), Self::Error>;
 
     /// Register a `PartialEq` / `__eq` metamethod.
     fn meta_eq(&mut self, f: fn(&T, &T) -> bool) -> Result<(), Self::Error>;
@@ -411,16 +973,194 @@ pub trait TypeBinder<T>: Sized {
     /// Register a unary negation metamethod.
     fn meta_unm(&mut self, f: fn(&T) -> T) -> Result<(), Self::Error>;
 
-    /// Register a binary arithmetic metamethod where both operands are `T`.
+    /// Register a bitwise-not metamethod, from `std::ops::Not`.
+    ///
+    /// A backend whose runtime has no bitwise-operator construct (or not in
+    /// the configured version) rejects the registration with a descriptive
+    /// error rather than dropping it.
+    fn meta_bnot(&mut self, f: fn(&T) -> T) -> Result<(), Self::Error>;
+
+    /// Register a binary operator metamethod where both operands are `T`.
+    ///
+    /// `op` is the Rust trait method name: `add`, `sub`, `mul`, `div`, `rem`
+    /// for arithmetic, `idiv` for floor division ([`crate::ops::IDiv`]),
+    /// `mod` for floor modulo ([`crate::ops::Mod`]), `pow` for
+    /// exponentiation ([`crate::ops::Pow`]), and `bitand`, `bitor`,
+    /// `bitxor`, `shl`, `shr` for the bitwise family. A backend whose runtime lacks a construct for an op
+    /// (or not in the configured version) rejects the registration with a
+    /// descriptive error rather than dropping it.
     fn meta_arith_self(&mut self, op: &'static str, f: fn(T, T) -> T) -> Result<(), Self::Error>;
 
-    /// Register a binary arithmetic metamethod where the rhs is a primitive.
+    /// Register a binary operator metamethod where the rhs is a primitive.
     /// The backend handles commutativity (tries `T op rhs` then `rhs op T`).
+    ///
+    /// `rhs` describes the scalar operand's declared type so backends with
+    /// dynamic dispatch can rank overloads (e.g. prefer an exact type match
+    /// over the first lossy conversion that succeeds); the ranking policy is
+    /// the backend's own.
     fn meta_arith_scalar(
         &mut self,
         op: &'static str,
+        rhs: &'static crate::types::TypeDescriptor<'static>,
         f: fn(T, &[ScriptValue]) -> Result<T, ScriptConvertError>,
     ) -> Result<(), Self::Error>;
+
+    /// Register an iteration metamethod, from `IntoIterator`.
+    ///
+    /// `f` consumes an owned value and yields an owned lazy iterator over its
+    /// contents; the backend holds the iterator and drives its runtime's
+    /// native iteration protocol with it. How the backend obtains the owned
+    /// value (cloning, taking) is its own policy — the bridge enforces no
+    /// acquisition strategy.
+    fn meta_iter(&mut self, f: fn(T) -> ScriptIter) -> Result<(), Self::Error>;
+
+    /// Register a length metamethod, derived from the iterator's
+    /// [`size_hint`](Iterator::size_hint) lower bound: exact for standard
+    /// containers (their owned iterators are exact-size), a lower bound
+    /// otherwise. Consuming, like [`meta_iter`](Self::meta_iter).
+    ///
+    /// Computing the length constructs one iterator (plus the backend's
+    /// value-acquisition cost).
+    fn meta_len(&mut self, f: fn(T) -> usize) -> Result<(), Self::Error>;
+
+    /// Register a call metamethod, from [`crate::ops::Call`].
+    ///
+    /// `f` converts the call arguments to the declared tuple, invokes
+    /// through a shared reference, and converts the result back. A backend
+    /// whose runtime has no call construct rejects the registration with a
+    /// descriptive error rather than dropping it.
+    fn meta_call(
+        &mut self,
+        f: fn(&T, &[ScriptValue]) -> Result<ScriptValue, ScriptConvertError>,
+    ) -> Result<(), Self::Error>;
+
+    /// Register an async call metamethod, from [`crate::ops::AsyncCall`].
+    ///
+    /// The receiver arrives as a [`ScriptCow`] like
+    /// [`method_async`](Self::method_async). Only reachable when the
+    /// backend's capabilities declare async support — others reject the
+    /// registration with a descriptive error.
+    fn meta_call_async(
+        &mut self,
+        f: for<'a> fn(ScriptCow<'a, T>, &'a [ScriptValue]) -> ScriptCallFuture<'a>,
+    ) -> Result<(), Self::Error>;
+
+    /// Register an indexed-read metamethod, from `std::ops::Index`.
+    ///
+    /// `f` converts the single key argument to the declared index type,
+    /// indexes, and returns the output clone-at-boundary. The key converts
+    /// verbatim — no base adjustment between the runtime's and Rust's
+    /// indexing conventions. An out-of-bounds Rust panic surfaces as the
+    /// backend's runtime error.
+    fn meta_index(
+        &mut self,
+        f: fn(&T, &[ScriptValue]) -> Result<ScriptValue, ScriptConvertError>,
+    ) -> Result<(), Self::Error>;
+
+    /// Register an indexed-write metamethod, from `std::ops::IndexMut`.
+    ///
+    /// `f` receives `[key, value]`, converts both to the declared index and
+    /// output types, and assigns in place. Same verbatim-key and panic
+    /// semantics as [`meta_index`](Self::meta_index).
+    fn meta_newindex(
+        &mut self,
+        f: fn(&mut T, &[ScriptValue]) -> Result<(), ScriptConvertError>,
+    ) -> Result<(), Self::Error>;
+}
+
+/// Clone-on-write receiver carrier for bridged method and call dispatch.
+///
+/// The backend picks the variant per its own model: one that can hold its
+/// runtime's userdata guard across the invocation (or across `await`s)
+/// passes [`Borrowed`](ScriptCow::Borrowed) — zero clones, and for `&mut`
+/// channels true in-place mutation; one that cannot passes
+/// [`Owned`](ScriptCow::Owned) with a value it acquired by its own policy.
+/// Generated wrappers consume the carrier: shared-receiver methods go
+/// through [`Deref`](core::ops::Deref), consuming ones take the owned value
+/// (cloning a borrowed carrier at the boundary).
+///
+/// Bridge plumbing, not a bridged value type: it never appears in a
+/// descriptor or a script-visible signature, so it deliberately implements
+/// none of the `Script*` description traits.
+pub enum ScriptCow<'a, T> {
+    /// A receiver borrowed from the runtime for the duration of the call.
+    Borrowed(&'a T),
+    /// A receiver the backend acquired and handed over.
+    Owned(T),
+}
+
+impl<T> core::ops::Deref for ScriptCow<'_, T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        match self {
+            Self::Borrowed(t) => t,
+            Self::Owned(t) => t,
+        }
+    }
+}
+
+impl<T: Clone> ScriptCow<'_, T> {
+    /// Extracts an owned value, cloning a borrowed carrier.
+    pub fn into_owned(self) -> T {
+        match self {
+            Self::Borrowed(t) => t.clone(),
+            Self::Owned(t) => t,
+        }
+    }
+}
+
+/// Boxed future produced by async bridged dispatch
+/// ([`TypeBinder::method_async`] and friends). May borrow the receiver
+/// carrier and the argument slice for `'a` — the backend drives it while
+/// holding whatever guard backs a [`ScriptCow::Borrowed`] receiver.
+///
+/// Intentionally not `Send`; a backend whose threading model demands `Send`
+/// handles that at its own boundary.
+pub type ScriptCallFuture<'a> = ::core::pin::Pin<
+    Box<dyn ::core::future::Future<Output = Result<ScriptValue, ScriptCallError>> + 'a>,
+>;
+
+/// Boxed future produced by an async constructor
+/// ([`TypeBinder::constructor_async`]): resolves to the constructed value.
+/// Not `Send`, like [`ScriptCallFuture`].
+pub type ScriptCtorFuture<'a, T> =
+    ::core::pin::Pin<Box<dyn ::core::future::Future<Output = Result<T, ScriptCallError>> + 'a>>;
+
+/// Owned iterator over a value's contents.
+///
+/// Produced from `IntoIterator` on an owned value, so it borrows nothing and
+/// a backend can hold it across its runtime's iteration steps. Items are
+/// plain values — any pairing or enumeration a runtime's iteration protocol
+/// needs is the backend's job.
+///
+/// Intentionally not `Send`; a backend whose threading model demands `Send`
+/// handles that at its own boundary.
+pub struct ScriptIter(Box<dyn Iterator<Item = ScriptValue>>);
+
+impl ScriptIter {
+    /// Wraps an owned iterator whose items are already converted.
+    pub fn new(inner: impl Iterator<Item = ScriptValue> + 'static) -> Self {
+        Self(Box::new(inner))
+    }
+}
+
+impl Iterator for ScriptIter {
+    type Item = ScriptValue;
+
+    fn next(&mut self) -> Option<ScriptValue> {
+        self.0.next()
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.0.size_hint()
+    }
+}
+
+impl std::fmt::Debug for ScriptIter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ScriptIter").finish_non_exhaustive()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -444,16 +1184,248 @@ pub trait FnBinder: Sized {
     /// Register a free function. The wrapper converts arguments from
     /// `ScriptValue` and returns the result as `ScriptValue` — the macro
     /// generates the conversion code with concrete types.
+    ///
+    /// A generic function registers once per declared instantiation:
+    /// `type_args` carries that instantiation's concrete type arguments (in
+    /// declaration order, matching an entry of the descriptor's
+    /// [`instantiations`](crate::FunctionDescriptor::instantiations)) and `f`
+    /// is the corresponding monomorphized wrapper. `type_args` is empty for
+    /// non-generic functions.
     fn function(
         &mut self,
         name: &'static str,
-        f: fn(&[ScriptValue]) -> Result<ScriptValue, ScriptConvertError>,
+        type_args: &'static [crate::types::TypeDescriptor<'static>],
+        f: fn(&[ScriptValue]) -> Result<ScriptValue, ScriptCallError>,
     ) -> Result<(), Self::Error>;
+
+    /// Register an `async` free function. The returned future may borrow the
+    /// argument slice for `'a`. Only reachable when the backend's
+    /// capabilities declare async support — others reject the registration
+    /// with a descriptive error rather than dropping it.
+    fn function_async(
+        &mut self,
+        name: &'static str,
+        type_args: &'static [crate::types::TypeDescriptor<'static>],
+        f: for<'a> fn(&'a [ScriptValue]) -> ScriptCallFuture<'a>,
+    ) -> Result<(), Self::Error>;
+
+    /// Register one candidate of a `dyn`-dispatched generic function.
+    ///
+    /// Called once per declared instantiation, like
+    /// [`function`](Self::function); the whole descriptor is provided
+    /// because dynamic resolution ranks candidates against the declared
+    /// parameter types (see
+    /// [`resolve_dyn_candidate`](crate::dispatch::resolve_dyn_candidate)).
+    /// The default delegates to `function` — safe because the capability
+    /// check rejects `dyn` functions before binding on backends without
+    /// [`dyn_generics`](crate::BackendCapabilities::dyn_generics), and a
+    /// bypassing bind still hits the backend's loud static-generic path.
+    fn function_dyn(
+        &mut self,
+        descriptor: &'static crate::function::FunctionDescriptor<'static>,
+        type_args: &'static [crate::types::TypeDescriptor<'static>],
+        f: fn(&[ScriptValue]) -> Result<ScriptValue, ScriptCallError>,
+    ) -> Result<(), Self::Error> {
+        self.function(descriptor.name, type_args, f)
+    }
+
+    /// Async sibling of [`function_dyn`](Self::function_dyn).
+    fn function_dyn_async(
+        &mut self,
+        descriptor: &'static crate::function::FunctionDescriptor<'static>,
+        type_args: &'static [crate::types::TypeDescriptor<'static>],
+        f: for<'a> fn(&'a [ScriptValue]) -> ScriptCallFuture<'a>,
+    ) -> Result<(), Self::Error> {
+        self.function_async(descriptor.name, type_args, f)
+    }
 }
+
+// ---------------------------------------------------------------------------
+// Compile-time bridgeability dispatch (macro plumbing)
+// ---------------------------------------------------------------------------
+
+/// Carrier for compile-time bridgeability dispatch (autoref
+/// specialization): macro-generated registration code probes whether a
+/// signature's types implement the bridge traits and registers only when
+/// they do, falling back to a no-op otherwise.
+#[doc(hidden)]
+pub struct BridgeProbe<S: ?Sized>(pub core::marker::PhantomData<S>);
+
+/// The no-op fallback arm of bridgeability dispatch. Macro-generated `__Go`
+/// traits on `&BridgeProbe<S>` take precedence when the signature's bridge
+/// bounds hold.
+#[doc(hidden)]
+pub trait SkipBind<T> {
+    fn __haphe_bind<B: TypeBinder<T>>(&self, _b: &mut B) -> Result<(), B::Error> {
+        Ok(())
+    }
+}
+
+impl<S: ?Sized, T> SkipBind<T> for BridgeProbe<S> {}
+
+/// The no-op fallback arm of bridgeability dispatch for free functions
+/// (mirrors [`SkipBind`] against [`FnBinder`]).
+#[doc(hidden)]
+pub trait SkipBindFn {
+    fn __haphe_bind_fn<B: FnBinder>(&self, _b: &mut B) -> Result<(), B::Error> {
+        Ok(())
+    }
+}
+
+impl<S: ?Sized> SkipBindFn for BridgeProbe<S> {}
 
 /// Identifies a type for [`TypeBinder`] dispatch.
 #[derive(Debug, Clone, Copy)]
 pub struct BindTarget<'a> {
     pub type_id: TypeId<'a>,
     pub name: &'a str,
+}
+
+// ---------------------------------------------------------------------------
+// Foreign function calling
+// ---------------------------------------------------------------------------
+
+/// Backend-provided dispatcher for host-supplied functions.
+///
+/// One caller backs one foreign interface (one instantiation of it, for a
+/// generic interface): it resolves `function` to the host's implementation,
+/// invokes it with the given arguments, and converts the result back to a
+/// [`ScriptValue`].
+///
+/// `type_args` carries the concrete type arguments of a function-level
+/// generic call, in declaration order — empty for non-generic functions.
+/// The Rust call site is always concretely typed, so there is never anything
+/// to resolve at runtime; the function's declared
+/// [`dispatch`](crate::FunctionDescriptor::dispatch) mode is an ADDRESSING
+/// contract the caller honors:
+///
+/// - [`Static`](crate::Dispatch::Static): the host provides one handler per
+///   declared instantiation; the caller selects it from `type_args` (by the
+///   backend's per-monomorph mangle or by comparing against the recorded
+///   instantiations), and a call whose `type_args` match no declared
+///   instantiation fails descriptively — never silently.
+/// - [`Dyn`](crate::Dispatch::Dyn): the host provides ONE handler under the
+///   plain name; type arguments are erased at the boundary (crossing as data
+///   at most), and the handler serves every instantiation.
+pub trait ForeignCaller {
+    /// Invokes the named host function synchronously.
+    fn call(
+        &self,
+        function: &'static str,
+        type_args: &[TypeDescriptor<'static>],
+        args: &[ScriptValue],
+    ) -> Result<ScriptValue, ForeignError>;
+
+    /// Invokes the named host function asynchronously.
+    ///
+    /// The default implementation fails with
+    /// [`ForeignErrorKind::AsyncUnsupported`]; backends whose capabilities
+    /// declare `async_fns` must override it. Registries with async foreign
+    /// functions are rejected up front by the capability check when the
+    /// backend does not support async.
+    fn call_async<'a>(
+        &'a self,
+        function: &'static str,
+        type_args: &'a [TypeDescriptor<'static>],
+        args: &'a [ScriptValue],
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<ScriptValue, ForeignError>> + 'a>>
+    {
+        let _ = (type_args, args);
+        Box::pin(std::future::ready(Err(ForeignError {
+            function,
+            kind: ForeignErrorKind::AsyncUnsupported,
+        })))
+    }
+}
+
+/// Error raised while dispatching a foreign function call.
+#[derive(Debug)]
+pub struct ForeignError {
+    /// The foreign function that was being called.
+    pub function: &'static str,
+    /// What went wrong.
+    pub kind: ForeignErrorKind,
+}
+
+/// A structured failure raised by a foreign function's script-side
+/// implementation, carried through [`ForeignErrorKind::Call`].
+///
+/// Backends construct it when the implementation supplies structured error
+/// data (mirroring the fields a fallible provided surface exposes in the
+/// other direction — see [`ScriptCallError::Callee`]); Rust callers recover
+/// it by downcasting the [`Call`](ForeignErrorKind::Call) box. A backend
+/// whose runtime can only convey a rendered message keeps boxing its own
+/// error type instead.
+#[derive(Debug, Clone)]
+pub struct ForeignFailure {
+    /// Error-class hint the implementation supplied, when any.
+    pub kind: Option<String>,
+    /// The failure's rendered message.
+    pub message: String,
+    /// The implementation-side error type's name, as it chose to report it.
+    pub type_name: String,
+    /// Rendered cause chain, outermost first, excluding the message itself.
+    pub chain: Vec<String>,
+}
+
+impl std::fmt::Display for ForeignFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.kind {
+            Some(kind) => write!(f, "{kind}: {}", self.message),
+            None => f.write_str(&self.message),
+        }
+    }
+}
+
+impl std::error::Error for ForeignFailure {}
+
+/// The failure modes of a foreign function call.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum ForeignErrorKind {
+    /// The host raised an error while running the function.
+    Call(Box<dyn std::error::Error + Send + Sync>),
+    /// The host's return value did not convert to the declared Rust type.
+    Convert(ScriptConvertError),
+    /// The caller does not support asynchronous dispatch.
+    AsyncUnsupported,
+}
+
+impl std::fmt::Display for ForeignError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.kind {
+            ForeignErrorKind::Call(e) => {
+                write!(f, "foreign function `{}` failed: {e}", self.function)
+            }
+            ForeignErrorKind::Convert(e) => write!(
+                f,
+                "foreign function `{}` returned an unexpected value: {e}",
+                self.function
+            ),
+            ForeignErrorKind::AsyncUnsupported => write!(
+                f,
+                "foreign function `{}` is async but the caller does not support async dispatch",
+                self.function
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ForeignError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match &self.kind {
+            ForeignErrorKind::Call(e) => Some(e.as_ref()),
+            ForeignErrorKind::Convert(e) => Some(e),
+            ForeignErrorKind::AsyncUnsupported => None,
+        }
+    }
+}
+
+/// A foreign-interface handle constructible from a [`ForeignCaller`].
+///
+/// Implemented by the handle type generated for a foreign trait; backends
+/// use it to hand out trait implementations backed by their runtime.
+pub trait ForeignHandle: Sized {
+    /// Wraps a backend caller into the handle.
+    fn from_caller(caller: Box<dyn ForeignCaller>) -> Self;
 }

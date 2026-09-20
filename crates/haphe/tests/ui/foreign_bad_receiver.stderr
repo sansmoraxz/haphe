@@ -1,0 +1,17 @@
+error: foreign methods must take `&self`
+ --> tests/ui/foreign_bad_receiver.rs:5:5
+  |
+5 |     fn by_value(self, n: i32);
+  |     ^^
+
+error: foreign methods must take `&self`
+ --> tests/ui/foreign_bad_receiver.rs:6:5
+  |
+6 |     fn by_mut(&mut self, n: i32);
+  |     ^^
+
+error: foreign methods must take `&self`
+ --> tests/ui/foreign_bad_receiver.rs:7:5
+  |
+7 |     fn no_receiver(n: i32);
+  |     ^^

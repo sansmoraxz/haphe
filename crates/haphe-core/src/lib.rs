@@ -20,16 +20,27 @@ pub mod __verify;
 pub mod backend;
 #[cfg(feature = "bitflags")]
 mod bitflags_support;
+#[cfg(feature = "chrono")]
+mod chrono_support;
+#[cfg(feature = "jiff")]
+mod jiff_support;
 /// Re-export of the [`bitflags`](https://docs.rs/bitflags) crate for
 /// [`script_bitflags!`] expansions.
 #[cfg(feature = "bitflags")]
 pub use bitflags;
+#[cfg(feature = "bitflags")]
+#[doc(hidden)]
+pub use bitflags_support::bitflags_repr;
 pub mod bridge;
+pub mod dispatch;
+pub mod foreign;
 pub mod function;
 pub mod haphe_type;
 pub mod module;
+pub mod ops;
 pub mod registry;
 pub mod script;
+mod std_types;
 #[cfg(any(feature = "streams", feature = "futures"))]
 pub mod stream;
 /// Re-export of the [`futures-core`](https://docs.rs/futures-core) crate for
@@ -48,17 +59,22 @@ pub use backend::{
     RuntimeBinder,
 };
 pub use bridge::{
-    BindTarget, FnBinder, FromScript, IntoScript, OpaqueUserData, ScriptBind, ScriptBindFn,
-    ScriptConvertError, ScriptValue, TypeBinder,
+    BindTarget, BridgeProbe, FnBinder, ForeignCaller, ForeignError, ForeignErrorKind,
+    ForeignFailure, ForeignHandle, FromScript, IntoScript, OpaqueUserData, ScriptBind,
+    ScriptBindFn, ScriptCallError, ScriptCallFuture, ScriptConvertError, ScriptCow,
+    ScriptCtorFuture, ScriptIter, ScriptValue, SelfInstantiation, SkipBind, SkipBindFn, TypeBinder,
 };
-pub use function::{FunctionDescriptor, Ownership, ParamDescriptor, Receiver, any_async};
+pub use foreign::ForeignInterfaceDescriptor;
+pub use function::{Dispatch, FunctionDescriptor, Ownership, ParamDescriptor, Receiver, any_async};
 pub use haphe_type::HapheType;
-pub use module::{ConstantDescriptor, ModuleDescriptor};
+pub use module::{ConstantDescriptor, FnInstantiation, ModuleDescriptor, union_instantiations};
 pub use registry::{
     Describe, InstantiationDescriptor, RegistryError, TypeKind, TypeRegistry, TypeRegistryBuilder,
     ValidatedRegistry,
 };
-pub use script::{ScriptAlias, ScriptEnum, ScriptFunction, ScriptImpl, ScriptStruct, ScriptType};
+pub use script::{
+    ScriptAlias, ScriptEnum, ScriptForeign, ScriptFunction, ScriptImpl, ScriptStruct, ScriptType,
+};
 pub use types::{
     EnumDescriptor, EnumVariant, FieldDescriptor, GenericParam, PrimitiveType, PropertyDescriptor,
     StructDescriptor, ThreadSafety, TraitImpl, TypeAliasDescriptor, TypeDescriptor, TypeId,

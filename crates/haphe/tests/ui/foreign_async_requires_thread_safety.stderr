@@ -1,0 +1,5 @@
+error: foreign traits with async methods must declare #[script(thread_safety = ...)] explicitly
+ --> tests/ui/foreign_async_requires_thread_safety.rs:4:7
+  |
+4 | trait Hooks {
+  |       ^^^^^

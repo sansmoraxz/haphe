@@ -13,14 +13,14 @@ use crate::attrs::{
 use crate::ty_map::{TyCtx, descriptor_expr, substitute_self};
 use crate::verify;
 
-pub fn expand(input: DeriveInput) -> TokenStream {
+pub fn expand(input: &DeriveInput) -> TokenStream {
     match expand_inner(input) {
         Ok(tokens) => tokens,
         Err(err) => err.to_compile_error(),
     }
 }
 
-fn doc_tokens(doc: &Option<String>) -> TokenStream {
+fn doc_tokens(doc: Option<&str>) -> TokenStream {
     crate::attrs::option_str_tokens(doc)
 }
 
@@ -52,19 +52,20 @@ fn generic_param_exprs(input: &DeriveInput, ctx: &TyCtx, errors: &mut Errors) ->
             .bounds
             .iter()
             .filter_map(|b| match b {
-                syn::TypeParamBound::Trait(t) => Some(stringify_bound(quote!(#t))),
+                syn::TypeParamBound::Trait(t) => Some(stringify_bound(&quote!(#t))),
                 _ => None,
             })
             .collect();
-        let default = match &tp.default {
-            Some((_, ty)) => match descriptor_expr(ty, ctx) {
+        let default = if let Some((_, ty)) = &tp.default {
+            match descriptor_expr(ty, ctx) {
                 Ok(desc) => quote! { ::core::option::Option::Some(&#desc) },
                 Err(err) => {
                     errors.push(err);
                     quote! { ::core::option::Option::None }
                 }
-            },
-            None => quote! { ::core::option::Option::None },
+            }
+        } else {
+            quote! { ::core::option::Option::None }
         };
         exprs.push(quote! {
             ::haphe::GenericParam {
@@ -80,7 +81,7 @@ fn generic_param_exprs(input: &DeriveInput, ctx: &TyCtx, errors: &mut Errors) ->
 /// Renders a trait bound compactly, keeping only the whitespace that
 /// separates words (`for<'a> PartialEq<&'a str>` — not `for < 'a > ...` and
 /// not `for<'a>PartialEq<&'astr>`).
-fn stringify_bound(tokens: TokenStream) -> String {
+pub(crate) fn stringify_bound(tokens: &TokenStream) -> String {
     let raw = tokens.to_string();
     let mut out = String::with_capacity(raw.len());
     let is_wordish = |c: char| c.is_alphanumeric() || c == '_' || c == '\'';
@@ -115,13 +116,28 @@ fn field_expr(field: &syn::Field, ctx: &TyCtx, errors: &mut Errors) -> Option<To
     if args.skip.is_some() {
         return None;
     }
+    // A nested reference has no INBOUND bridge conversion — error at the
+    // declaration instead of leaving the field silently accessor-less. The
+    // exception: a READ-ONLY field of an outbound-convertible type with
+    // `'static` references (`Vec<&'static str>`) registers through the
+    // getter-only channel.
+    let outbound_readonly = args.readonly.is_some()
+        && crate::bind::is_bridge_outbound_type(&field.ty)
+        && crate::bind::nested_refs_all_static(&field.ty);
+    if !outbound_readonly && let Some(span) = crate::bind::nested_reference_span(&field.ty) {
+        errors.spanned(
+            span,
+            "references inside composite types cannot cross the bridge inbound; \
+             use owned element types (e.g. `Vec<String>` instead of `Vec<&str>`), \
+             or mark the field `readonly` with `'static` references",
+        );
+    }
     let ident = field.ident.as_ref().expect("named field");
     let name = args
         .rename
         .as_ref()
-        .map(|r| r.value())
-        .unwrap_or_else(|| ident.unraw().to_string());
-    let doc = doc_tokens(&extract_doc(&field.attrs));
+        .map_or_else(|| ident.unraw().to_string(), syn::LitStr::value);
+    let doc = doc_tokens(extract_doc(&field.attrs).as_deref());
     let readonly = args.readonly.is_some();
     let ty_expr = match args.bytes {
         Some(span) => {
@@ -159,6 +175,10 @@ enum Verifier {
 
 /// Maps a `traits(...)` declaration to its `TraitImpl` literal plus a
 /// [`Verifier`] for the claim.
+#[allow(
+    clippy::too_many_lines,
+    reason = "expansion drivers assemble one `quote!` output from many interdependent pieces; splitting them hurts locality more than length hurts readability"
+)]
 fn trait_impl_expr(
     decl: &TraitDecl,
     self_ty: &Type,
@@ -172,6 +192,7 @@ fn trait_impl_expr(
 
     let markers: &[(&str, TokenStream)] = &[
         ("Display", quote!(::core::fmt::Display)),
+        ("ToString", quote!(::std::string::ToString)),
         ("Debug", quote!(::core::fmt::Debug)),
         ("Hash", quote!(::core::hash::Hash)),
         ("PartialEq", quote!(::core::cmp::PartialEq)),
@@ -221,9 +242,11 @@ fn trait_impl_expr(
             }
         }
         let known_args: &[&str] = match name_str.as_str() {
-            "Add" | "Sub" | "Mul" | "Div" | "Rem" => &["rhs", "output"],
-            "Neg" => &["output"],
+            "Add" | "Sub" | "Mul" | "Div" | "Rem" | "IDiv" | "Mod" | "BitAnd" | "BitOr"
+            | "BitXor" | "Shl" | "Shr" | "Pow" => &["rhs", "output"],
+            "Neg" | "Not" => &["output"],
             "Index" | "IndexMut" => &["index", "output"],
+            "Call" | "AsyncCall" => &["args", "output"],
             "Iterator" | "IntoIterator" => &["item"],
             other => {
                 errors.spanned(
@@ -231,7 +254,8 @@ fn trait_impl_expr(
                     format!(
                         "unsupported trait `{other}` (expected one of: Display, Debug, Hash, \
                          PartialEq, Eq, PartialOrd, Ord, Clone, Default, Add, Sub, Mul, Div, Rem, \
-                         Neg, Index, IndexMut, Iterator, IntoIterator)"
+                         IDiv, Mod, Neg, BitAnd, BitOr, BitXor, Shl, Shr, Not, Pow, Call, \
+                         AsyncCall, Index, IndexMut, Iterator, IntoIterator)"
                     ),
                 );
                 return None;
@@ -261,21 +285,22 @@ fn trait_impl_expr(
         let variant = Ident::new(&name_str, span);
 
         match name_str.as_str() {
-            "Add" | "Sub" | "Mul" | "Div" | "Rem" => {
+            "Add" | "Sub" | "Mul" | "Div" | "Rem" | "IDiv" | "Mod" | "BitAnd" | "BitOr"
+            | "BitXor" | "Shl" | "Shr" | "Pow" => {
                 let rhs_ty = lookup(decl, self_ty, span, errors, "rhs", true)?;
                 let out_ty = lookup(decl, self_ty, span, errors, "output", true)?;
                 let (rhs, output) = (desc(&rhs_ty, errors), desc(&out_ty, errors));
                 let (rhs_sub, out_sub) =
                     (substitute_self(&rhs_ty, ctx), substitute_self(&out_ty, ctx));
                 expr = quote! { ::haphe::TraitImpl::#variant { rhs: #rhs, output: #output } };
-                bound = quote! { ::core::ops::#variant<#rhs_sub, Output = #out_sub> };
+                bound = quote! { ::haphe::ops::#variant<#rhs_sub, Output = #out_sub> };
             }
-            "Neg" => {
+            "Neg" | "Not" => {
                 let out_ty = lookup(decl, self_ty, span, errors, "output", true)?;
                 let output = desc(&out_ty, errors);
                 let out_sub = substitute_self(&out_ty, ctx);
-                expr = quote! { ::haphe::TraitImpl::Neg { output: #output } };
-                bound = quote! { ::core::ops::Neg<Output = #out_sub> };
+                expr = quote! { ::haphe::TraitImpl::#variant { output: #output } };
+                bound = quote! { ::haphe::ops::#variant<Output = #out_sub> };
             }
             "Index" | "IndexMut" => {
                 let idx_ty = lookup(decl, self_ty, span, errors, "index", false)?;
@@ -284,7 +309,32 @@ fn trait_impl_expr(
                 let (idx_sub, out_sub) =
                     (substitute_self(&idx_ty, ctx), substitute_self(&out_ty, ctx));
                 expr = quote! { ::haphe::TraitImpl::#variant { index: #index, output: #output } };
-                bound = quote! { ::core::ops::#variant<#idx_sub, Output = #out_sub> };
+                bound = quote! { ::haphe::ops::#variant<#idx_sub, Output = #out_sub> };
+            }
+            "Call" | "AsyncCall" => {
+                let args_ty = lookup(decl, self_ty, span, errors, "args", false)?;
+                let out_ty = lookup(decl, self_ty, span, errors, "output", true)?;
+                let Type::Tuple(args_tuple) = &args_ty else {
+                    errors.spanned(
+                        span,
+                        format!(
+                            "`{name_str}`'s `args` must be a tuple type like `(i64, String)` \
+                             (use `()` for no parameters)"
+                        ),
+                    );
+                    return None;
+                };
+                let arg_descs: Vec<TokenStream> =
+                    args_tuple.elems.iter().map(|ty| desc(ty, errors)).collect();
+                let output = desc(&out_ty, errors);
+                let (args_sub, out_sub) = (
+                    substitute_self(&args_ty, ctx),
+                    substitute_self(&out_ty, ctx),
+                );
+                expr = quote! {
+                    ::haphe::TraitImpl::#variant { args: &[#(*#arg_descs),*], output: #output }
+                };
+                bound = quote! { ::haphe::ops::#variant<#args_sub, Output = #out_sub> };
             }
             "Iterator" | "IntoIterator" => {
                 let item_ty = lookup(decl, self_ty, span, errors, "item", false)?;
@@ -307,19 +357,34 @@ fn trait_impl_expr(
     Some((expr, verifier))
 }
 
-fn expand_inner(input: DeriveInput) -> syn::Result<TokenStream> {
+#[allow(
+    clippy::too_many_lines,
+    reason = "expansion drivers assemble one `quote!` output from many interdependent pieces; splitting them hurts locality more than length hurts readability"
+)]
+fn expand_inner(input: &DeriveInput) -> syn::Result<TokenStream> {
     let mut errors = Errors::default();
     let container = parse_container_args(&input.attrs, &mut errors);
+
+    // Async callability implies suspension points; mirror the async-methods
+    // rule and demand an explicit thread-safety claim.
+    if container.thread_safety.is_none()
+        && let Some(decl) = container.traits.iter().find(|t| t.name == "AsyncCall")
+    {
+        errors.spanned(
+            decl.name.span(),
+            "types declaring `AsyncCall` must declare #[script(thread_safety = ...)] explicitly",
+        );
+    }
 
     // Newtypes are exposed as type aliases: single-field tuple structs
     // always, and single-field named structs when marked `transparent`.
     if let Data::Struct(data) = &input.data {
         match &data.fields {
             Fields::Unnamed(unnamed) if unnamed.unnamed.len() == 1 => {
-                return expand_newtype(&input, container, &unnamed.unnamed[0], errors);
+                return expand_newtype(input, &container, &unnamed.unnamed[0], errors);
             }
             Fields::Named(named) if named.named.len() == 1 && container.transparent.is_some() => {
-                return expand_newtype(&input, container, &named.named[0], errors);
+                return expand_newtype(input, &container, &named.named[0], errors);
             }
             _ => {}
         }
@@ -330,17 +395,16 @@ fn expand_inner(input: DeriveInput) -> syn::Result<TokenStream> {
             "`transparent` requires a struct with exactly one field (a newtype alias)",
         );
     }
-    let doc = doc_tokens(&extract_doc(&input.attrs));
+    let doc = doc_tokens(extract_doc(&input.attrs).as_deref());
 
     let ident = &input.ident;
     let ident_str = ident.unraw().to_string();
     let display_name = container
         .rename
         .as_ref()
-        .map(|r| r.value())
-        .unwrap_or_else(|| ident_str.clone());
+        .map_or_else(|| ident_str.clone(), syn::LitStr::value);
 
-    let param_names = generic_param_names(&input, &mut errors);
+    let param_names = generic_param_names(input, &mut errors);
     let is_generic = !param_names.is_empty();
     let (impl_g, ty_g, where_c) = input.generics.split_for_impl();
     let self_ty: Type = syn::parse_quote! { #ident #ty_g };
@@ -403,7 +467,7 @@ fn expand_inner(input: DeriveInput) -> syn::Result<TokenStream> {
     }
     let (desc_impl_g, desc_ty_g, desc_where_c) = desc_generics.split_for_impl();
 
-    let generic_params = generic_param_exprs(&input, &ctx, &mut errors);
+    let generic_params = generic_param_exprs(input, &ctx, &mut errors);
 
     // Methods handshake.
     let (methods, constructors, properties) = match container.methods {
@@ -420,7 +484,7 @@ fn expand_inner(input: DeriveInput) -> syn::Result<TokenStream> {
             #[automatically_derived]
             impl #impl_g ::haphe::__verify::HasScriptMethods for #ident #ty_g #where_c {}
         });
-        if container.thread_safety.is_none() {
+        if container.thread_safety.is_none() && input.generics.params.is_empty() {
             handshake.extend(quote_spanned! {span=>
                 const _: () = ::core::assert!(
                     !<#self_ty as ::haphe::ScriptImpl>::HAS_ASYNC,
@@ -471,18 +535,161 @@ fn expand_inner(input: DeriveInput) -> syn::Result<TokenStream> {
         }
         Data::Enum(data) => {
             let is_flags = container.flags.is_some();
+            // Numeric script representation propagates the EXACT Rust
+            // `#[repr]` integer type; without one, the enum crosses as its
+            // declared case names.
+            let repr_prim: Option<&str> = input.attrs.iter().find_map(|attr| {
+                if !attr.path().is_ident("repr") {
+                    return None;
+                }
+                let mut found = None;
+                let _ = attr.parse_nested_meta(|meta| {
+                    if let Some(ident) = meta.path.get_ident() {
+                        let name = ident.to_string();
+                        if matches!(
+                            name.as_str(),
+                            "i8" | "i16" | "i32" | "i64" | "u8" | "u16" | "u32" | "u64"
+                        ) {
+                            found = Some(match name.as_str() {
+                                "i8" => "I8",
+                                "i16" => "I16",
+                                "i32" => "I32",
+                                "i64" => "I64",
+                                "u8" => "U8",
+                                "u16" => "U16",
+                                "u32" => "U32",
+                                _ => "U64",
+                            });
+                        }
+                    }
+                    Ok(())
+                });
+                found
+            });
+            let numeric = repr_prim.is_some() && !is_flags;
+            let repr_expr = if let (Some(prim), false) = (repr_prim, is_flags) {
+                let ident = Ident::new(prim, proc_macro2::Span::call_site());
+                quote! { ::core::option::Option::Some(::haphe::PrimitiveType::#ident) }
+            } else {
+                quote! { ::core::option::Option::None }
+            };
+            let mut next_discriminant: i64 = 0;
             let mut variant_exprs = Vec::new();
+            let mut unit_cases: Vec<(syn::Ident, String, Option<i64>)> = Vec::new();
+            let mut payload_cases: Vec<(syn::Ident, String, Fields)> = Vec::new();
+            let mut any_skipped = false;
             for variant in &data.variants {
+                // Explicit discriminants must be integer literals so the IR
+                // can record them; the implicit chain follows Rust's rules.
+                let explicit: Option<i64> = match &variant.discriminant {
+                    Some((_, expr)) => match expr {
+                        syn::Expr::Lit(syn::ExprLit {
+                            lit: syn::Lit::Int(lit),
+                            ..
+                        }) => {
+                            // Values above `i64::MAX` (a `repr(u64)` chain)
+                            // follow the bridge's u64 policy: they cross as
+                            // the i64 BIT PATTERN.
+                            if let Ok(v) = lit.base10_parse::<u64>() {
+                                Some(v as i64)
+                            } else {
+                                errors.spanned(
+                                    lit.span(),
+                                    "script enum discriminants must fit in 64 bits",
+                                );
+                                None
+                            }
+                        }
+                        syn::Expr::Unary(syn::ExprUnary {
+                            op: syn::UnOp::Neg(_),
+                            expr,
+                            ..
+                        }) => {
+                            if let syn::Expr::Lit(syn::ExprLit {
+                                lit: syn::Lit::Int(lit),
+                                ..
+                            }) = expr.as_ref()
+                            {
+                                // Parsed wide then negated so `i64::MIN`
+                                // (whose inner literal overflows i64) is
+                                // accepted, and genuine overflow errors
+                                // instead of silently falling back to the
+                                // implicit chain.
+                                match lit.base10_parse::<i128>().map(|v| -v) {
+                                    Ok(v) if i64::try_from(v).is_ok() => Some(v as i64),
+                                    _ => {
+                                        errors.spanned(
+                                            lit.span(),
+                                            "script enum discriminants must fit in 64 bits (i64)",
+                                        );
+                                        None
+                                    }
+                                }
+                            } else {
+                                errors.spanned(
+                                    expr.span(),
+                                    "script enums support integer-literal discriminants only",
+                                );
+                                None
+                            }
+                        }
+                        other => {
+                            errors.spanned(
+                                other.span(),
+                                "script enums support integer-literal discriminants only",
+                            );
+                            None
+                        }
+                    },
+                    None => None,
+                };
+                let discriminant: Option<i64> = if numeric {
+                    let value = explicit.unwrap_or(next_discriminant);
+                    next_discriminant = value.wrapping_add(1);
+                    Some(value)
+                } else {
+                    if let Some(value) = explicit {
+                        next_discriminant = value.wrapping_add(1);
+                    } else {
+                        next_discriminant = next_discriminant.wrapping_add(1);
+                    }
+                    None
+                };
                 let args = parse_variant_args(&variant.attrs, &mut errors);
                 if args.skip.is_some() {
+                    any_skipped = true;
                     continue;
+                }
+                // Case names cross backend boundaries: renames must stay
+                // identifier-shaped (Rust conventions) so each backend can
+                // derive its own optimal native spelling deterministically.
+                if let Some(rename) = &args.rename {
+                    let value = rename.value();
+                    let mut chars = value.chars();
+                    let valid = matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_')
+                        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_');
+                    if !valid {
+                        errors.spanned(
+                            rename.span(),
+                            "enum variant renames must follow Rust identifier conventions \
+                             (ASCII letters, digits, and `_`, not starting with a digit)",
+                        );
+                    }
                 }
                 let vname = args
                     .rename
                     .as_ref()
-                    .map(|r| r.value())
-                    .unwrap_or_else(|| variant.ident.unraw().to_string());
-                let vdoc = doc_tokens(&extract_doc(&variant.attrs));
+                    .map_or_else(|| variant.ident.unraw().to_string(), syn::LitStr::value);
+                if matches!(variant.fields, Fields::Unit) {
+                    unit_cases.push((variant.ident.clone(), vname.clone(), discriminant));
+                } else {
+                    payload_cases.push((
+                        variant.ident.clone(),
+                        vname.clone(),
+                        variant.fields.clone(),
+                    ));
+                }
+                let vdoc = doc_tokens(extract_doc(&variant.attrs).as_deref());
                 if container.flags.is_some() && !matches!(variant.fields, Fields::Unit) {
                     errors.spanned(
                         variant.span(),
@@ -517,10 +724,218 @@ fn expand_inner(input: DeriveInput) -> syn::Result<TokenStream> {
                         quote! { ::haphe::VariantKind::Struct(&[#(#fields),*]) }
                     }
                 };
+                let disc_expr = if let Some(v) = discriminant {
+                    quote! { ::core::option::Option::Some(#v) }
+                } else {
+                    quote! { ::core::option::Option::None }
+                };
                 variant_exprs.push(quote! {
-                    ::haphe::EnumVariant { name: #vname, doc: #vdoc, kind: #kind }
+                    ::haphe::EnumVariant {
+                        name: #vname,
+                        doc: #vdoc,
+                        kind: #kind,
+                        discriminant: #disc_expr,
+                    }
                 });
             }
+            // Non-flags, non-generic enums with no skipped variants get value
+            // conversions when every payload field crosses the bridge: cases
+            // cross as `ScriptValue::Enum` carrying the declared name
+            // (matched exactly — backends translate native spellings at
+            // their own boundary) plus the case's values (tuple positional;
+            // struct fields in declaration order).
+            let payload_bridgeable = payload_cases.iter().all(|(_, _, fields)| {
+                fields.iter().all(|f| {
+                    !crate::bind::is_reference(&f.ty) && crate::bind::is_bridge_value_type(&f.ty)
+                })
+            });
+            let has_cases = !unit_cases.is_empty() || !payload_cases.is_empty();
+            let case_conversions =
+                if !any_skipped && !is_flags && !is_generic && payload_bridgeable && has_cases {
+                    let vidents: Vec<&syn::Ident> = unit_cases.iter().map(|(i, _, _)| i).collect();
+                    let vdiscs: Vec<TokenStream> = unit_cases
+                        .iter()
+                        .map(|(_, _, d)| {
+                            if let Some(v) = d {
+                                quote! { ::core::option::Option::Some(#v) }
+                            } else {
+                                quote! { ::core::option::Option::None }
+                            }
+                        })
+                        .collect();
+                    let expected = ident_str.clone();
+                    // Unit-case From arms plus one arm per payload case
+                    // deconstructing its fields into the payload vector.
+                    let mut from_arms: Vec<TokenStream> = unit_cases
+                        .iter()
+                        .zip(&vdiscs)
+                        .map(|((vi, name, _), disc)| {
+                            quote! {
+                                #ident::#vi => (#name, #disc, ::std::vec::Vec::new()),
+                            }
+                        })
+                        .collect();
+                    // Case-matching FromScript arms.
+                    let mut into_arms: Vec<TokenStream> = unit_cases
+                        .iter()
+                        .map(|(vi, name, _)| {
+                            quote! {
+                                if __case == #name {
+                                    return if __payload.is_empty() {
+                                        ::core::result::Result::Ok(#ident::#vi)
+                                    } else {
+                                        ::core::result::Result::Err(::haphe::ScriptConvertError {
+                                            expected: #expected,
+                                            got: "payload on a unit case",
+                                        })
+                                    };
+                                }
+                            }
+                        })
+                        .collect();
+                    for (vi, name, fields) in &payload_cases {
+                        match fields {
+                            Fields::Unnamed(unnamed) => {
+                                let binds: Vec<syn::Ident> = (0..unnamed.unnamed.len())
+                                    .map(|i| quote::format_ident!("__f{i}"))
+                                    .collect();
+                                let len = binds.len();
+                                let tys: Vec<&Type> =
+                                    unnamed.unnamed.iter().map(|f| &f.ty).collect();
+                                from_arms.push(quote! {
+                                    #ident::#vi(#(#binds),*) => (
+                                        #name,
+                                        ::core::option::Option::None,
+                                        <[_]>::into_vec(::std::boxed::Box::new([
+                                            #(::haphe::IntoScript::into_script(#binds)),*
+                                        ])),
+                                    ),
+                                });
+                                into_arms.push(quote! {
+                                    if __case == #name {
+                                        if __payload.len() != #len {
+                                            return ::core::result::Result::Err(
+                                                ::haphe::ScriptConvertError {
+                                                    expected: #expected,
+                                                    got: "payload of mismatched length",
+                                                },
+                                            );
+                                        }
+                                        let mut __it = __payload.into_iter();
+                                        return ::core::result::Result::Ok(#ident::#vi(
+                                            #( <#tys as ::haphe::FromScript>::from_script(
+                                                __it.next().expect("length checked")
+                                            )? ),*
+                                        ));
+                                    }
+                                });
+                            }
+                            Fields::Named(named) => {
+                                let fids: Vec<&syn::Ident> = named
+                                    .named
+                                    .iter()
+                                    .map(|f| f.ident.as_ref().expect("named field"))
+                                    .collect();
+                                let len = fids.len();
+                                let tys: Vec<&Type> = named.named.iter().map(|f| &f.ty).collect();
+                                from_arms.push(quote! {
+                                    #ident::#vi { #(#fids),* } => (
+                                        #name,
+                                        ::core::option::Option::None,
+                                        <[_]>::into_vec(::std::boxed::Box::new([
+                                            #(::haphe::IntoScript::into_script(#fids)),*
+                                        ])),
+                                    ),
+                                });
+                                into_arms.push(quote! {
+                                    if __case == #name {
+                                        if __payload.len() != #len {
+                                            return ::core::result::Result::Err(
+                                                ::haphe::ScriptConvertError {
+                                                    expected: #expected,
+                                                    got: "payload of mismatched length",
+                                                },
+                                            );
+                                        }
+                                        let mut __it = __payload.into_iter();
+                                        return ::core::result::Result::Ok(#ident::#vi {
+                                            #( #fids: <#tys as ::haphe::FromScript>::from_script(
+                                                __it.next().expect("length checked")
+                                            )? ),*
+                                        });
+                                    }
+                                });
+                            }
+                            Fields::Unit => unreachable!("unit variants collect separately"),
+                        }
+                    }
+                    // Numeric enums additionally accept their discriminant as
+                    // a plain integer (unit cases only — payload cases have no
+                    // discriminant).
+                    let numeric_arm = if numeric {
+                        let discs: Vec<i64> =
+                            unit_cases.iter().map(|(_, _, d)| d.unwrap_or(0)).collect();
+                        quote! {
+                            if let ::haphe::ScriptValue::I64(__n) = &value {
+                                #(
+                                    if *__n == #discs {
+                                        return ::core::result::Result::Ok(#ident::#vidents);
+                                    }
+                                )*
+                                return ::core::result::Result::Err(::haphe::ScriptConvertError {
+                                    expected: #expected,
+                                    got: "unknown enum discriminant",
+                                });
+                            }
+                        }
+                    } else {
+                        TokenStream::new()
+                    };
+                    quote! {
+                        #[automatically_derived]
+                        impl ::core::convert::From<#ident> for ::haphe::ScriptValue {
+                            fn from(value: #ident) -> Self {
+                                let (case, discriminant, payload) = match value {
+                                    #(#from_arms)*
+                                };
+                                ::haphe::ScriptValue::Enum {
+                                    case: ::std::string::String::from(case),
+                                    discriminant,
+                                    payload,
+                                }
+                            }
+                        }
+                        #[automatically_derived]
+                        impl ::haphe::FromScript for #ident {
+                            fn from_script(
+                                value: ::haphe::ScriptValue,
+                            ) -> ::core::result::Result<Self, ::haphe::ScriptConvertError> {
+                                #numeric_arm
+                                let (__case, __payload) = match value {
+                                    ::haphe::ScriptValue::Enum { case, payload, .. } => {
+                                        (case, payload)
+                                    }
+                                    ::haphe::ScriptValue::String(s) => (s, ::std::vec::Vec::new()),
+                                    other => {
+                                        return ::core::result::Result::Err(
+                                            ::haphe::ScriptConvertError {
+                                                expected: #expected,
+                                                got: other.variant_name(),
+                                            },
+                                        );
+                                    }
+                                };
+                                #(#into_arms)*
+                                ::core::result::Result::Err(::haphe::ScriptConvertError {
+                                    expected: #expected,
+                                    got: "unknown enum case",
+                                })
+                            }
+                        }
+                    }
+                } else {
+                    TokenStream::new()
+                };
             let enum_asserts = container.methods.map(|span| {
                 quote_spanned! {span=>
                     const _: () = ::core::assert!(
@@ -535,6 +950,7 @@ fn expand_inner(input: DeriveInput) -> syn::Result<TokenStream> {
             });
             quote! {
                 #enum_asserts
+                #case_conversions
                 #[automatically_derived]
                 impl #desc_impl_g ::haphe::ScriptEnum for #ident #desc_ty_g #desc_where_c {
                     const DESCRIPTOR: ::haphe::EnumDescriptor<'static> = ::haphe::EnumDescriptor {
@@ -546,6 +962,7 @@ fn expand_inner(input: DeriveInput) -> syn::Result<TokenStream> {
                         trait_impls: &[#(#trait_exprs),*],
                         thread_safety: #thread_safety,
                         generic_params: &[#(#generic_params),*],
+                        repr: #repr_expr,
                         is_flags: #is_flags,
                     };
                 }
@@ -575,8 +992,7 @@ fn expand_inner(input: DeriveInput) -> syn::Result<TokenStream> {
                     let name = args
                         .rename
                         .as_ref()
-                        .map(|r| r.value())
-                        .unwrap_or_else(|| field_ident.unraw().to_string());
+                        .map_or_else(|| field_ident.unraw().to_string(), syn::LitStr::value);
                     Some(crate::bind::BindField {
                         ident: field_ident,
                         name,
@@ -593,6 +1009,9 @@ fn expand_inner(input: DeriveInput) -> syn::Result<TokenStream> {
             &bind_fields,
             &container.traits,
             container.methods.is_some(),
+            container.methods.is_some()
+                && container.thread_safety.is_none()
+                && !input.generics.params.is_empty(),
             &input.generics,
         )
     } else {
@@ -602,6 +1021,9 @@ fn expand_inner(input: DeriveInput) -> syn::Result<TokenStream> {
             &[],
             &container.traits,
             container.methods.is_some(),
+            container.methods.is_some()
+                && container.thread_safety.is_none()
+                && !input.generics.params.is_empty(),
             &input.generics,
         )
     };
@@ -661,9 +1083,13 @@ fn expand_inner(input: DeriveInput) -> syn::Result<TokenStream> {
 /// Expansion for single-field tuple structs: a newtype exposed as a
 /// [`TypeAliasDescriptor`](haphe_core::TypeAliasDescriptor) — transparent
 /// (equivalent to the inner type) or a distinct named type.
+#[allow(
+    clippy::too_many_lines,
+    reason = "expansion drivers assemble one `quote!` output from many interdependent pieces; splitting them hurts locality more than length hurts readability"
+)]
 fn expand_newtype(
     input: &DeriveInput,
-    container: ContainerArgs,
+    container: &ContainerArgs,
     field: &syn::Field,
     mut errors: Errors,
 ) -> syn::Result<TokenStream> {
@@ -672,9 +1098,8 @@ fn expand_newtype(
     let display_name = container
         .rename
         .as_ref()
-        .map(|r| r.value())
-        .unwrap_or_else(|| ident_str.clone());
-    let doc = doc_tokens(&extract_doc(&input.attrs));
+        .map_or_else(|| ident_str.clone(), syn::LitStr::value);
+    let doc = doc_tokens(extract_doc(&input.attrs).as_deref());
     let transparent = container.transparent.is_some();
 
     if let Some(span) = container.flags {
@@ -701,7 +1126,7 @@ fn expand_newtype(
 
     let field_args = parse_field_args(&field.attrs, &mut errors);
     for (key, span) in [
-        ("rename", field_args.rename.as_ref().map(|r| r.span())),
+        ("rename", field_args.rename.as_ref().map(syn::LitStr::span)),
         ("skip", field_args.skip),
         ("readonly", field_args.readonly),
     ] {
@@ -740,7 +1165,53 @@ fn expand_newtype(
         quote! { ::haphe::TypeDescriptor::Ref(<Self as ::haphe::ScriptType>::ID) }
     };
 
+    // Transparent newtypes over value-convertible types cross the bridge as
+    // the inner value itself, so runtimes see their native primitive — e.g.
+    // a `bool` newtype participates in Lua truthiness. The conversions
+    // delegate through the inner type's own `From`/`FromScript`, so chains
+    // of transparent newtypes recurse down to the primitive, and containers
+    // of value types (`Vec<i64>`, maps, tuples) convert through their
+    // blanket impls; a transparent newtype over a non-convertible bare-ident
+    // inner is a compile error. Opaque newtypes stay distinct named types
+    // with no generated conversions.
+    let is_value_convertible = crate::bind::is_bridge_value_type(&field.ty)
+        || match &field.ty {
+            syn::Type::Path(p) => p
+                .path
+                .segments
+                .last()
+                .is_some_and(|seg| seg.arguments.is_none()),
+            _ => false,
+        };
+    let conversions = if transparent && is_value_convertible && field_args.bytes.is_none() {
+        let inner_ty = &field.ty;
+        let (access, construct) = match &field.ident {
+            Some(fid) => (quote! { __value.#fid }, quote! { Self { #fid: __inner } }),
+            None => (quote! { __value.0 }, quote! { Self(__inner) }),
+        };
+        quote! {
+            #[automatically_derived]
+            impl ::core::convert::From<#ident> for ::haphe::ScriptValue {
+                fn from(__value: #ident) -> Self {
+                    ::haphe::ScriptValue::from(#access)
+                }
+            }
+            #[automatically_derived]
+            impl ::haphe::FromScript for #ident {
+                fn from_script(
+                    __v: ::haphe::ScriptValue,
+                ) -> ::core::result::Result<Self, ::haphe::ScriptConvertError> {
+                    let __inner = <#inner_ty as ::haphe::FromScript>::from_script(__v)?;
+                    ::core::result::Result::Ok(#construct)
+                }
+            }
+        }
+    } else {
+        TokenStream::new()
+    };
+
     Ok(quote! {
+        #conversions
         #[automatically_derived]
         impl ::haphe::HapheType for #ident {
             const DESCRIPTOR: ::haphe::TypeDescriptor<'static> = #haphe_type_desc;

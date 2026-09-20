@@ -26,11 +26,15 @@ static POINT_METHODS: [FunctionDescriptor<'static>; 1] = [FunctionDescriptor {
     name: "distance_to",
     doc: None,
     receiver: Some(Receiver::Ref),
+    generic_params: &[],
+    instantiations: &[],
+    dispatch: haphe_core::Dispatch::Static,
     params: &POINT_PARAMS,
     return_type: &F64_TYPE,
     return_ownership: Ownership::Owned,
     is_async: false,
     error_kind: None,
+    fallible: false,
 }];
 
 static POINT_FIELDS: [FieldDescriptor<'static>; 2] = [
@@ -79,16 +83,19 @@ static COLOR_VARIANTS: [EnumVariant<'static>; 3] = [
         name: "Red",
         doc: None,
         kind: VariantKind::Unit,
+        discriminant: None,
     },
     EnumVariant {
         name: "Rgb",
         doc: None,
         kind: VariantKind::Tuple(&RGB_FIELDS),
+        discriminant: None,
     },
     EnumVariant {
         name: "Named",
         doc: None,
         kind: VariantKind::Struct(&NAMED_FIELDS),
+        discriminant: None,
     },
 ];
 
@@ -101,6 +108,7 @@ static COLOR_DESC: EnumDescriptor<'static> = EnumDescriptor {
     trait_impls: &[],
     thread_safety: ThreadSafety::SEND_SYNC,
     generic_params: &[],
+    repr: None,
     is_flags: false,
 };
 
@@ -129,7 +137,7 @@ fn const_constructed_registry() {
     static STRUCTS: [StructDescriptor<'static>; 1] = [POINT_DESC];
     static ENUMS: [EnumDescriptor<'static>; 1] = [COLOR_DESC];
 
-    let registry = TypeRegistry::new(&STRUCTS, &ENUMS, &[], &[], &[]);
+    let registry = TypeRegistry::new(&STRUCTS, &ENUMS, &[], &[], &[], &[]);
 
     let point = registry.get_struct(&TypeId::new("Point")).unwrap();
     assert_eq!(point.name, "Point");
@@ -170,7 +178,7 @@ fn describe_registers_enum() {
 
 #[test]
 fn registry_lookup_missing_returns_none() {
-    let registry = TypeRegistry::new(&[], &[], &[], &[], &[]);
+    let registry = TypeRegistry::new(&[], &[], &[], &[], &[], &[]);
     assert!(registry.get_struct(&TypeId::new("Missing")).is_none());
     assert!(registry.get_enum(&TypeId::new("Missing")).is_none());
 }
@@ -210,11 +218,15 @@ fn module_tree() {
         name: "origin",
         doc: None,
         receiver: None,
+        generic_params: &[],
+        instantiations: &[],
+        dispatch: haphe_core::Dispatch::Static,
         params: &[],
         return_type: &ORIGIN_RET,
         return_ownership: Ownership::Owned,
         is_async: false,
         error_kind: None,
+        fallible: false,
     }];
     static PI_TYPE: TypeDescriptor<'static> = TypeDescriptor::Primitive(PrimitiveType::F64);
     static CONSTS: [ConstantDescriptor<'static>; 1] = [ConstantDescriptor {
@@ -230,6 +242,7 @@ fn module_tree() {
         type_ids: &[],
         submodules: &[],
         constants: &[],
+        function_instantiations: &[],
     }];
     static TYPE_IDS: [TypeId<'static>; 2] = [TypeId::new("Point"), TypeId::new("Color")];
     static MODULES: [ModuleDescriptor<'static>; 1] = [ModuleDescriptor {
@@ -239,9 +252,10 @@ fn module_tree() {
         type_ids: &TYPE_IDS,
         submodules: &SHAPES,
         constants: &CONSTS,
+        function_instantiations: &[],
     }];
 
-    let registry = TypeRegistry::new(&[], &[], &[], &MODULES, &[]);
+    let registry = TypeRegistry::new(&[], &[], &[], &MODULES, &[], &[]);
     assert_eq!(registry.modules().len(), 1);
     let m = &registry.modules()[0];
     assert_eq!(m.name, "geometry");
@@ -286,6 +300,7 @@ fn duplicate_enum_registration_errors() {
         trait_impls: &[],
         thread_safety: ThreadSafety::SEND_SYNC,
         generic_params: &[],
+        repr: None,
         is_flags: false,
     });
     assert!(matches!(result, Err(RegistryError::DuplicateType { .. })));
@@ -305,6 +320,7 @@ fn cross_kind_duplicate_errors() {
         trait_impls: &[],
         thread_safety: ThreadSafety::SEND_SYNC,
         generic_params: &[],
+        repr: None,
         is_flags: false,
     });
     assert!(matches!(result, Err(RegistryError::DuplicateType { .. })));
@@ -360,7 +376,7 @@ fn validate_catches_dangling_ref_in_field() {
         generic_params: &[],
     }];
 
-    let registry = TypeRegistry::new(&BAD_STRUCT, &[], &[], &[], &[]);
+    let registry = TypeRegistry::new(&BAD_STRUCT, &[], &[], &[], &[], &[]);
     let errors = registry.validate().unwrap_err();
     assert_eq!(errors.len(), 1);
     assert!(matches!(
@@ -383,11 +399,15 @@ fn validate_catches_dangling_ref_in_method_param() {
         name: "bad_method",
         doc: None,
         receiver: Some(Receiver::Ref),
+        generic_params: &[],
+        instantiations: &[],
+        dispatch: haphe_core::Dispatch::Static,
         params: &PARAMS,
         return_type: &UNIT,
         return_ownership: Ownership::Owned,
         is_async: false,
         error_kind: None,
+        fallible: false,
     }];
     static STRUCTS: [StructDescriptor<'static>; 1] = [StructDescriptor {
         id: TypeId::new("HasBadMethod"),
@@ -402,7 +422,7 @@ fn validate_catches_dangling_ref_in_method_param() {
         generic_params: &[],
     }];
 
-    let registry = TypeRegistry::new(&STRUCTS, &[], &[], &[], &[]);
+    let registry = TypeRegistry::new(&STRUCTS, &[], &[], &[], &[], &[]);
     let errors = registry.validate().unwrap_err();
     assert_eq!(errors.len(), 1);
     assert!(matches!(
@@ -435,7 +455,7 @@ fn validate_catches_nested_dangling_ref() {
         generic_params: &[],
     }];
 
-    let registry = TypeRegistry::new(&STRUCTS, &[], &[], &[], &[]);
+    let registry = TypeRegistry::new(&STRUCTS, &[], &[], &[], &[], &[]);
     let errors = registry.validate().unwrap_err();
     assert_eq!(errors.len(), 1);
     assert!(matches!(
@@ -472,7 +492,7 @@ fn validate_catches_dangling_ref_in_callback() {
         generic_params: &[],
     }];
 
-    let registry = TypeRegistry::new(&STRUCTS, &[], &[], &[], &[]);
+    let registry = TypeRegistry::new(&STRUCTS, &[], &[], &[], &[], &[]);
     let errors = registry.validate().unwrap_err();
     assert_eq!(errors.len(), 1);
     assert!(matches!(
@@ -551,11 +571,15 @@ fn async_function_descriptor() {
         name: "fetch_data",
         doc: None,
         receiver: None,
+        generic_params: &[],
+        instantiations: &[],
+        dispatch: haphe_core::Dispatch::Static,
         params: &[],
         return_type: &RET,
         return_ownership: Ownership::Owned,
         is_async: true,
         error_kind: None,
+        fallible: false,
     };
 
     assert!(FN_DESC.is_async);
@@ -594,11 +618,15 @@ fn constructors_on_struct() {
         name: "new",
         doc: Some("Creates a new point"),
         receiver: None,
+        generic_params: &[],
+        instantiations: &[],
+        dispatch: haphe_core::Dispatch::Static,
         params: &NEW_PARAMS,
         return_type: &POINT_REF,
         return_ownership: Ownership::Owned,
         is_async: false,
         error_kind: None,
+        fallible: false,
     }];
     static STRUCTS: [StructDescriptor<'static>; 1] = [StructDescriptor {
         id: TypeId::new("Point"),
@@ -613,7 +641,7 @@ fn constructors_on_struct() {
         generic_params: &[],
     }];
 
-    let registry = TypeRegistry::new(&STRUCTS, &[], &[], &[], &[]);
+    let registry = TypeRegistry::new(&STRUCTS, &[], &[], &[], &[], &[]);
     let point = registry.get_struct(&TypeId::new("Point")).unwrap();
     assert_eq!(point.constructors.len(), 1);
     assert_eq!(point.constructors[0].name, "new");
@@ -634,11 +662,15 @@ fn validate_catches_dangling_ref_in_constructor() {
         name: "from_val",
         doc: None,
         receiver: None,
+        generic_params: &[],
+        instantiations: &[],
+        dispatch: haphe_core::Dispatch::Static,
         params: &CTOR_PARAMS,
         return_type: &F64_TYPE,
         return_ownership: Ownership::Owned,
         is_async: false,
         error_kind: None,
+        fallible: false,
     }];
     static STRUCTS: [StructDescriptor<'static>; 1] = [StructDescriptor {
         id: TypeId::new("Bad"),
@@ -653,7 +685,7 @@ fn validate_catches_dangling_ref_in_constructor() {
         generic_params: &[],
     }];
 
-    let registry = TypeRegistry::new(&STRUCTS, &[], &[], &[], &[]);
+    let registry = TypeRegistry::new(&STRUCTS, &[], &[], &[], &[], &[]);
     let errors = registry.validate().unwrap_err();
     assert_eq!(errors.len(), 1);
     assert!(matches!(
@@ -683,7 +715,7 @@ fn trait_impls_marker_traits() {
         generic_params: &[],
     }];
 
-    let registry = TypeRegistry::new(&STRUCTS, &[], &[], &[], &[]);
+    let registry = TypeRegistry::new(&STRUCTS, &[], &[], &[], &[], &[]);
     let foo = registry.get_struct(&TypeId::new("Foo")).unwrap();
     assert_eq!(foo.trait_impls.len(), 4);
     assert_eq!(foo.trait_impls[0], TraitImpl::Display);
@@ -713,7 +745,7 @@ fn trait_impls_with_associated_types() {
         generic_params: &[],
     }];
 
-    let registry = TypeRegistry::new(&STRUCTS, &[], &[], &[], &[]);
+    let registry = TypeRegistry::new(&STRUCTS, &[], &[], &[], &[], &[]);
     assert!(registry.validate().is_ok());
 
     let vec2 = registry.get_struct(&TypeId::new("Vec2")).unwrap();
@@ -745,7 +777,7 @@ fn validate_catches_dangling_ref_in_trait_impl() {
         generic_params: &[],
     }];
 
-    let registry = TypeRegistry::new(&STRUCTS, &[], &[], &[], &[]);
+    let registry = TypeRegistry::new(&STRUCTS, &[], &[], &[], &[], &[]);
     let errors = registry.validate().unwrap_err();
     assert_eq!(errors.len(), 1);
     assert!(matches!(
@@ -783,7 +815,7 @@ fn property_descriptors() {
         generic_params: &[],
     }];
 
-    let registry = TypeRegistry::new(&STRUCTS, &[], &[], &[], &[]);
+    let registry = TypeRegistry::new(&STRUCTS, &[], &[], &[], &[], &[]);
     let v = registry.get_struct(&TypeId::new("Vec2")).unwrap();
     assert_eq!(v.properties.len(), 2);
     assert!(v.properties[0].readonly);
@@ -813,7 +845,7 @@ fn validate_catches_dangling_ref_in_property() {
         generic_params: &[],
     }];
 
-    let registry = TypeRegistry::new(&STRUCTS, &[], &[], &[], &[]);
+    let registry = TypeRegistry::new(&STRUCTS, &[], &[], &[], &[], &[]);
     let errors = registry.validate().unwrap_err();
     assert_eq!(errors.len(), 1);
     assert!(matches!(
@@ -830,11 +862,15 @@ fn error_kind_on_function() {
         name: "parse_int",
         doc: None,
         receiver: None,
+        generic_params: &[],
+        instantiations: &[],
+        dispatch: haphe_core::Dispatch::Static,
         params: &[],
         return_type: &RES_TYPE,
         return_ownership: Ownership::Owned,
         is_async: false,
         error_kind: Some("ValueError"),
+        fallible: false,
     };
 
     assert_eq!(FN_DESC.error_kind, Some("ValueError"));
@@ -856,7 +892,7 @@ fn thread_safety_markers() {
         generic_params: &[],
     }];
 
-    let registry = TypeRegistry::new(&STRUCTS, &[], &[], &[], &[]);
+    let registry = TypeRegistry::new(&STRUCTS, &[], &[], &[], &[], &[]);
     let w = registry.get_struct(&TypeId::new("RcWrapper")).unwrap();
     assert!(!w.thread_safety.is_send);
     assert!(!w.thread_safety.is_sync);
@@ -898,7 +934,7 @@ fn generic_type_params_on_struct() {
         generic_params: &GENERICS,
     }];
 
-    let registry = TypeRegistry::new(&STRUCTS, &[], &[], &[], &[]);
+    let registry = TypeRegistry::new(&STRUCTS, &[], &[], &[], &[], &[]);
     let c = registry.get_struct(&TypeId::new("Container")).unwrap();
     assert_eq!(c.generic_params.len(), 1);
     assert_eq!(c.generic_params[0].name, "T");
@@ -935,7 +971,7 @@ fn generic_param_with_default() {
         generic_params: &GENERICS,
     }];
 
-    let registry = TypeRegistry::new(&STRUCTS, &[], &[], &[], &[]);
+    let registry = TypeRegistry::new(&STRUCTS, &[], &[], &[], &[], &[]);
     let wd = registry.get_struct(&TypeId::new("WithDefault")).unwrap();
     assert!(wd.generic_params[0].default.is_some());
     assert!(registry.validate().is_ok());
@@ -964,7 +1000,7 @@ fn validate_catches_undeclared_generic_param() {
         generic_params: &[], // No generics declared
     }];
 
-    let registry = TypeRegistry::new(&STRUCTS, &[], &[], &[], &[]);
+    let registry = TypeRegistry::new(&STRUCTS, &[], &[], &[], &[], &[]);
     let errors = registry.validate().unwrap_err();
     assert_eq!(errors.len(), 1);
     assert!(matches!(
@@ -996,7 +1032,7 @@ fn validate_catches_dangling_ref_in_generic_default() {
         generic_params: &GENERICS,
     }];
 
-    let registry = TypeRegistry::new(&STRUCTS, &[], &[], &[], &[]);
+    let registry = TypeRegistry::new(&STRUCTS, &[], &[], &[], &[], &[]);
     let errors = registry.validate().unwrap_err();
     assert_eq!(errors.len(), 1);
     assert!(matches!(
@@ -1043,7 +1079,7 @@ fn type_alias_transparent() {
     };
     static ALIASES: [TypeAliasDescriptor<'static>; 1] = [ALIAS];
 
-    let registry = TypeRegistry::new(&[], &[], &ALIASES, &[], &[]);
+    let registry = TypeRegistry::new(&[], &[], &ALIASES, &[], &[], &[]);
     let s = registry.get_type_alias(&TypeId::new("Seconds")).unwrap();
     assert!(s.transparent);
     assert!(registry.validate().is_ok());
@@ -1082,7 +1118,7 @@ fn type_alias_joins_known_types() {
         generic_params: &[],
     }];
 
-    let registry = TypeRegistry::new(&STRUCTS, &[], &ALIASES, &[], &[]);
+    let registry = TypeRegistry::new(&STRUCTS, &[], &ALIASES, &[], &[], &[]);
     assert!(registry.validate().is_ok());
 }
 
@@ -1098,7 +1134,7 @@ fn validate_catches_dangling_ref_in_alias_inner() {
     };
     static ALIASES: [TypeAliasDescriptor<'static>; 1] = [ALIAS];
 
-    let registry = TypeRegistry::new(&[], &[], &ALIASES, &[], &[]);
+    let registry = TypeRegistry::new(&[], &[], &ALIASES, &[], &[], &[]);
     let errors = registry.validate().unwrap_err();
     assert_eq!(errors.len(), 1);
     assert!(matches!(
@@ -1159,11 +1195,15 @@ fn ownership_on_params_and_return() {
         name: "process",
         doc: None,
         receiver: None,
+        generic_params: &[],
+        instantiations: &[],
+        dispatch: haphe_core::Dispatch::Static,
         params: &PARAMS,
         return_type: &STRING_TYPE,
         return_ownership: Ownership::Owned,
         is_async: false,
         error_kind: None,
+        fallible: false,
     };
 
     assert_eq!(FN_DESC.params[0].ownership, Ownership::Clone);
@@ -1212,6 +1252,7 @@ fn enum_with_all_new_fields() {
         name: "Some",
         doc: None,
         kind: VariantKind::Tuple(&[]),
+        discriminant: None,
     }];
     static ENUMS: [EnumDescriptor<'static>; 1] = [EnumDescriptor {
         id: TypeId::new("MyOption"),
@@ -1222,10 +1263,11 @@ fn enum_with_all_new_fields() {
         trait_impls: &TRAITS,
         thread_safety: ThreadSafety::SEND,
         generic_params: &GENERICS,
+        repr: None,
         is_flags: false,
     }];
 
-    let registry = TypeRegistry::new(&[], &ENUMS, &[], &[], &[]);
+    let registry = TypeRegistry::new(&[], &ENUMS, &[], &[], &[], &[]);
     let opt = registry.get_enum(&TypeId::new("MyOption")).unwrap();
     assert_eq!(opt.trait_impls.len(), 2);
     assert_eq!(opt.thread_safety, ThreadSafety::SEND);
@@ -1266,11 +1308,15 @@ fn capability_check_catches_unsupported_async() {
         name: "fetch",
         doc: None,
         receiver: Some(Receiver::Ref),
+        generic_params: &[],
+        instantiations: &[],
+        dispatch: haphe_core::Dispatch::Static,
         params: &[],
         return_type: &UNIT,
         return_ownership: Ownership::Owned,
         is_async: true,
         error_kind: None,
+        fallible: false,
     }];
     static STRUCTS: [StructDescriptor<'static>; 1] = [StructDescriptor {
         id: TypeId::new("Fetcher"),
@@ -1285,7 +1331,7 @@ fn capability_check_catches_unsupported_async() {
         generic_params: &[],
     }];
 
-    let registry = TypeRegistry::new(&STRUCTS, &[], &[], &[], &[]);
+    let registry = TypeRegistry::new(&STRUCTS, &[], &[], &[], &[], &[]);
     let validated = registry.validate().unwrap();
 
     let no_async = BackendCapabilities::ALL.with_async_fns(false);
@@ -1325,7 +1371,7 @@ fn capability_check_catches_unsupported_callbacks() {
         generic_params: &[],
     }];
 
-    let registry = TypeRegistry::new(&STRUCTS, &[], &[], &[], &[]);
+    let registry = TypeRegistry::new(&STRUCTS, &[], &[], &[], &[], &[]);
     let validated = registry.validate().unwrap();
 
     let no_cb = BackendCapabilities::ALL.with_callbacks(false);
@@ -1365,7 +1411,7 @@ fn capability_check_catches_unsupported_generics() {
         generic_params: &GENERICS,
     }];
 
-    let registry = TypeRegistry::new(&STRUCTS, &[], &[], &[], &[]);
+    let registry = TypeRegistry::new(&STRUCTS, &[], &[], &[], &[], &[]);
     let validated = registry.validate().unwrap();
 
     let no_generics = BackendCapabilities::ALL.with_generics(false);
@@ -1398,7 +1444,7 @@ fn capability_check_catches_unsupported_properties() {
         generic_params: &[],
     }];
 
-    let registry = TypeRegistry::new(&STRUCTS, &[], &[], &[], &[]);
+    let registry = TypeRegistry::new(&STRUCTS, &[], &[], &[], &[], &[]);
     let validated = registry.validate().unwrap();
 
     let no_props = BackendCapabilities::ALL.with_properties(false);
@@ -1421,7 +1467,7 @@ fn capability_check_catches_unsupported_type_alias() {
         transparent: false,
     }];
 
-    let registry = TypeRegistry::new(&[], &[], &ALIASES, &[], &[]);
+    let registry = TypeRegistry::new(&[], &[], &ALIASES, &[], &[], &[]);
     let validated = registry.validate().unwrap();
 
     let no_aliases = BackendCapabilities::ALL.with_type_aliases(false);
@@ -1448,7 +1494,7 @@ fn capability_check_catches_insufficient_thread_safety() {
         generic_params: &[],
     }];
 
-    let registry = TypeRegistry::new(&STRUCTS, &[], &[], &[], &[]);
+    let registry = TypeRegistry::new(&STRUCTS, &[], &[], &[], &[], &[]);
     let validated = registry.validate().unwrap();
 
     let needs_send_sync =
@@ -1477,7 +1523,7 @@ fn capability_check_thread_safety_passes_when_met() {
         generic_params: &[],
     }];
 
-    let registry = TypeRegistry::new(&STRUCTS, &[], &[], &[], &[]);
+    let registry = TypeRegistry::new(&STRUCTS, &[], &[], &[], &[], &[]);
     let validated = registry.validate().unwrap();
 
     let needs_send = BackendCapabilities::ALL.with_required_thread_safety(Some(ThreadSafety::SEND));
@@ -1492,11 +1538,13 @@ fn flags_enum_with_payload_variant_fails_validation() {
             name: "Read",
             doc: None,
             kind: VariantKind::Unit,
+            discriminant: None,
         },
         EnumVariant {
             name: "Custom",
             doc: None,
             kind: VariantKind::Tuple(&PAYLOAD),
+            discriminant: None,
         },
     ];
     static ENUMS: [EnumDescriptor<'static>; 1] = [EnumDescriptor {
@@ -1508,9 +1556,10 @@ fn flags_enum_with_payload_variant_fails_validation() {
         trait_impls: &[],
         thread_safety: ThreadSafety::SEND_SYNC,
         generic_params: &[],
+        repr: None,
         is_flags: true,
     }];
-    static REGISTRY: TypeRegistry<'static> = TypeRegistry::new(&[], &ENUMS, &[], &[], &[]);
+    static REGISTRY: TypeRegistry<'static> = TypeRegistry::new(&[], &ENUMS, &[], &[], &[], &[]);
 
     let errors = REGISTRY
         .validate()
@@ -1524,5 +1573,48 @@ fn flags_enum_with_payload_variant_fails_validation() {
             }
         )),
         "got: {errors:?}"
+    );
+}
+
+/// A module type entry shares the module namespace with functions,
+/// constants, and submodules: a constant named like an exposed type is a
+/// validation error, never a silent backend-side overwrite.
+#[test]
+fn module_type_names_share_the_namespace() {
+    static POINT_CONST_TY: TypeDescriptor<'static> = TypeDescriptor::Primitive(PrimitiveType::F64);
+    static CONSTS: [ConstantDescriptor<'static>; 1] = [ConstantDescriptor {
+        name: "Point",
+        doc: None,
+        ty: &POINT_CONST_TY,
+        value: "4.5",
+    }];
+    static TYPE_IDS: [TypeId<'static>; 1] = [TypeId::new("Point")];
+    static MODULES: [ModuleDescriptor<'static>; 1] = [ModuleDescriptor {
+        name: "geo",
+        doc: None,
+        functions: &[],
+        type_ids: &TYPE_IDS,
+        submodules: &[],
+        constants: &CONSTS,
+        function_instantiations: &[],
+    }];
+    let registry = TypeRegistry::new(
+        std::slice::from_ref(&POINT_DESC),
+        &[],
+        &[],
+        &MODULES,
+        &[],
+        &[],
+    );
+    let errors = registry.validate().unwrap_err();
+    assert!(
+        errors.iter().any(|e| matches!(
+            e,
+            haphe_core::RegistryError::DuplicateModuleEntry {
+                module: "geo",
+                name: "Point"
+            }
+        )),
+        "{errors:?}"
     );
 }

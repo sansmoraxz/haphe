@@ -2,6 +2,12 @@
 //! renames, ownership — matched against hand-written descriptors.
 
 #![cfg(feature = "macros")]
+#![allow(
+    clippy::needless_pass_by_value,
+    clippy::unused_self,
+    clippy::doc_markdown,
+    reason = "fixture shapes are dictated by the bridge surface under test: `#[script]` functions receive OWNED values (the boundary contract), methods keep unused receivers, and docs name fixture idents verbatim"
+)]
 
 use haphe::{
     FunctionDescriptor, Ownership, ParamDescriptor, PrimitiveType, PropertyDescriptor, Receiver,
@@ -36,8 +42,11 @@ impl Point {
     }
 
     #[script(rename = "fetch", error_kind = "IOError")]
-    #[allow(dead_code)]
-    pub async fn fetch_data(&self) -> Result<String, String> {
+    #[allow(
+        dead_code,
+        reason = "fixtures are exercised through their generated descriptors and bridge wrappers, not direct calls"
+    )]
+    pub async fn fetch_data(&self) -> Result<String, TextError> {
         Ok(format!("{},{}", self.x, self.y))
     }
 
@@ -68,6 +77,9 @@ static EXPECTED_METHODS: &[FunctionDescriptor<'static>] = &[
         name: "distance_to",
         doc: None,
         receiver: Some(Receiver::Ref),
+        generic_params: &[],
+        instantiations: &[],
+        dispatch: haphe::Dispatch::Static,
         params: &[ParamDescriptor {
             name: "other",
             ty: &POINT_REF,
@@ -77,11 +89,15 @@ static EXPECTED_METHODS: &[FunctionDescriptor<'static>] = &[
         return_ownership: Ownership::Owned,
         is_async: false,
         error_kind: None,
+        fallible: false,
     },
     FunctionDescriptor {
         name: "scaled",
         doc: None,
         receiver: Some(Receiver::Owned),
+        generic_params: &[],
+        instantiations: &[],
+        dispatch: haphe::Dispatch::Static,
         params: &[ParamDescriptor {
             name: "factor",
             ty: &F64,
@@ -91,16 +107,21 @@ static EXPECTED_METHODS: &[FunctionDescriptor<'static>] = &[
         return_ownership: Ownership::Owned,
         is_async: false,
         error_kind: None,
+        fallible: false,
     },
     FunctionDescriptor {
         name: "fetch",
         doc: None,
         receiver: Some(Receiver::Ref),
+        generic_params: &[],
+        instantiations: &[],
+        dispatch: haphe::Dispatch::Static,
         params: &[],
-        return_type: &TypeDescriptor::Result(&TypeDescriptor::String, &TypeDescriptor::String),
+        return_type: &TypeDescriptor::String,
         return_ownership: Ownership::Owned,
         is_async: true,
         error_kind: Some("IOError"),
+        fallible: true,
     },
 ];
 
@@ -108,6 +129,9 @@ static EXPECTED_CONSTRUCTORS: &[FunctionDescriptor<'static>] = &[FunctionDescrip
     name: "new",
     doc: Some("Creates a point."),
     receiver: None,
+    generic_params: &[],
+    instantiations: &[],
+    dispatch: haphe::Dispatch::Static,
     params: &[
         ParamDescriptor {
             name: "x",
@@ -124,6 +148,7 @@ static EXPECTED_CONSTRUCTORS: &[FunctionDescriptor<'static>] = &[FunctionDescrip
     return_ownership: Ownership::Owned,
     is_async: false,
     error_kind: None,
+    fallible: false,
 }];
 
 static EXPECTED_PROPERTIES: &[PropertyDescriptor<'static>] = &[PropertyDescriptor {
@@ -190,13 +215,19 @@ fn getter_only_property_is_readonly() {
 /// functions may keep parameter attributes.
 #[derive(Script)]
 #[script(methods)]
-#[allow(dead_code)]
+#[allow(
+    dead_code,
+    reason = "fixtures are exercised through their generated descriptors and bridge wrappers, not direct calls"
+)]
 struct Gated {
     n: i64,
 }
 
 #[script]
-#[allow(dead_code)]
+#[allow(
+    dead_code,
+    reason = "fixtures are exercised through their generated descriptors and bridge wrappers, not direct calls"
+)]
 impl Gated {
     fn always(&self) -> i64 {
         self.n
@@ -214,7 +245,10 @@ impl Gated {
     }
 
     #[script(skip)]
-    #[allow(dead_code)]
+    #[allow(
+        dead_code,
+        reason = "fixtures are exercised through their generated descriptors and bridge wrappers, not direct calls"
+    )]
     fn hidden(&self, #[script(clone)] factor: f64) -> f64 {
         factor
     }
@@ -294,10 +328,10 @@ struct Port {
 #[script]
 impl Port {
     #[script(constructor, error_kind = "ValueError")]
-    fn new(number: i64) -> Result<Self, String> {
+    fn new(number: i64) -> Result<Self, TextError> {
         u16::try_from(number)
             .map(|number| Port { number })
-            .map_err(|e| e.to_string())
+            .map_err(|e| TextError(e.to_string()))
     }
 }
 
@@ -305,7 +339,8 @@ impl Port {
 fn fallible_constructor() {
     let ctor = &<Port as ScriptImpl>::CONSTRUCTORS[0];
     assert_eq!(ctor.error_kind, Some("ValueError"));
-    assert!(matches!(*ctor.return_type, TypeDescriptor::Result(..)));
+    // The descriptor sees the ok type; `E` crosses as a Host error.
+    assert!(!matches!(*ctor.return_type, TypeDescriptor::Result(..)));
     assert!(Port::new(70000).is_err());
     assert_eq!(Port::new(80).unwrap().number, 80);
 }
@@ -313,13 +348,19 @@ fn fallible_constructor() {
 /// `Self` in accessor signatures is substituted before verification.
 #[derive(Script)]
 #[script(methods)]
-#[allow(dead_code)]
+#[allow(
+    dead_code,
+    reason = "fixtures are exercised through their generated descriptors and bridge wrappers, not direct calls"
+)]
 struct Node {
     twin: Option<Box<Node>>,
 }
 
 #[script]
-#[allow(dead_code)]
+#[allow(
+    dead_code,
+    reason = "fixtures are exercised through their generated descriptors and bridge wrappers, not direct calls"
+)]
 impl Node {
     #[script(getter)]
     fn twin(&self) -> Option<Node> {
@@ -338,3 +379,16 @@ fn self_in_accessor_signatures() {
     assert_eq!(props.len(), 1);
     assert!(!props[0].readonly);
 }
+
+/// A message-only fixture error: `String` itself no longer crosses (host
+/// errors must implement `std::error::Error`).
+#[derive(Debug)]
+struct TextError(String);
+
+impl std::fmt::Display for TextError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for TextError {}

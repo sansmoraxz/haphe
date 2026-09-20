@@ -5,7 +5,7 @@
 //! descriptor through any path that names the function.
 
 use proc_macro2::TokenStream;
-use quote::quote;
+use quote::{quote, quote_spanned};
 use syn::spanned::Spanned;
 use syn::{FnArg, ItemFn, Pat, Type};
 
@@ -13,10 +13,16 @@ use crate::attrs::{Errors, parse_fn_args, strip_script_attrs};
 use crate::fn_desc::{ReceiverShape, build_fn_info};
 use crate::ty_map::TyCtx;
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "expansion drivers assemble one `quote!` output from many interdependent pieces; splitting them hurts locality more than length hurts readability"
+)]
 pub fn expand(mut item: ItemFn) -> TokenStream {
     let mut errors = Errors::default();
-    let fn_args = parse_fn_args(&item.attrs, &mut errors, "a free function");
+    let mut fn_args = parse_fn_args(&item.attrs, &mut errors, "a free function");
     strip_script_attrs(&mut item.attrs);
+
+    fn_args.inject_bare_dyn_defaults(item.sig.generics.type_params().count());
 
     for (flag, span) in [
         ("skip", fn_args.skip),
@@ -46,8 +52,48 @@ pub fn expand(mut item: ItemFn) -> TokenStream {
         generic_params: &fn_generic_names,
         self_ty: None,
     };
+    // A `Result<T, E>` return is fallible: the descriptor and the bridge see
+    // `T`; the wrapper carries `Err` intact in a Callee error (tagged with
+    // `error_kind`), so `E` needs no bridge representation — only
+    // `std::error::Error + Send + Sync`.
+    let fallible = matches!(
+        &item.sig.output,
+        syn::ReturnType::Type(_, ret) if crate::fn_desc::result_types(ret).is_some()
+    );
     // Strips parameter attrs even on error paths.
-    let info = build_fn_info(&mut item.sig, &fn_args, &item.attrs, &ctx, &mut errors);
+    let info = if fallible {
+        let mut desc_sig = item.sig.clone();
+        if let syn::ReturnType::Type(_, ret) = &item.sig.output
+            && let Some((ok, _)) = crate::fn_desc::result_types(ret)
+        {
+            let ok = ok.clone();
+            // `Result<(), E>` is a unit return on the ok path.
+            desc_sig.output = if matches!(&ok, syn::Type::Tuple(t) if t.elems.is_empty()) {
+                syn::ReturnType::Default
+            } else {
+                syn::parse_quote! { -> #ok }
+            };
+        }
+        let info = build_fn_info(
+            &mut desc_sig,
+            &fn_args,
+            &item.attrs,
+            &ctx,
+            true,
+            &mut errors,
+        );
+        crate::fn_desc::strip_param_script_attrs(&mut item.sig);
+        info
+    } else {
+        build_fn_info(
+            &mut item.sig,
+            &fn_args,
+            &item.attrs,
+            &ctx,
+            false,
+            &mut errors,
+        )
+    };
     if let Some(info) = &info
         && info.receiver != ReceiverShape::None
     {
@@ -85,21 +131,9 @@ pub fn expand(mut item: ItemFn) -> TokenStream {
             let Pat::Ident(pi) = pat_ty.pat.as_ref() else {
                 return None;
             };
-            // Strip outer references for the tuple type (bridge receives owned values).
-            // &str → String (str is unsized).
-            let ty = match pat_ty.ty.as_ref() {
-                Type::Reference(r) => {
-                    if let Type::Path(p) = r.elem.as_ref()
-                        && p.path.is_ident("str")
-                    {
-                        syn::parse_quote!(String)
-                    } else {
-                        (*r.elem).clone()
-                    }
-                }
-                other => other.clone(),
-            };
-            Some((pi.ident.clone(), ty))
+            // Strip outer references (bridge receives owned values, &str →
+            // String) and anonymize signature lifetimes for embedding.
+            Some((pi.ident.clone(), crate::bind::strip_ref(&pat_ty.ty)))
         })
         .collect();
 
@@ -126,81 +160,293 @@ pub fn expand(mut item: ItemFn) -> TokenStream {
 
     // Generate a wrapper that converts ScriptValue args to concrete types
     // and the result back to ScriptValue. Each param uses FromScript, the
-    // return uses IntoScript — both with concrete types, no unsafe.
-    let param_conversions: Vec<TokenStream> = param_info
-        .iter()
-        .enumerate()
-        .map(|(i, (name, ty))| {
-            quote! {
-                let #name = <#ty as ::haphe::FromScript>::from_script(
-                    __args.get(#i).cloned().unwrap_or(::haphe::ScriptValue::Unit)
-                ).map_err(|__e| ::haphe::ScriptConvertError {
-                    expected: stringify!(#ty),
-                    got: __e.got,
-                })?;
-            }
-        })
-        .collect();
-
-    let return_conversion = if info.return_ty.is_some() {
-        quote! { ::haphe::IntoScript::into_script(#fn_ident(#(#call_args),*)) }
-    } else {
-        quote! { { #fn_ident(#(#call_args),*); ::haphe::ScriptValue::Unit } }
-    };
-
-    let has_type_params = !fn_generic_names.is_empty();
-    let type_params: Vec<_> = item
+    // return uses IntoScript — both with concrete types, no unsafe. For a
+    // generic function, one wrapper is generated per `instantiate(...)`
+    // declaration with the type parameters substituted.
+    let type_params: Vec<syn::Ident> = item
         .sig
         .generics
         .params
         .iter()
         .filter_map(|p| match p {
-            syn::GenericParam::Type(tp) => Some(&tp.ident),
+            syn::GenericParam::Type(tp) => Some(tp.ident.clone()),
             _ => None,
         })
         .collect();
+    let has_type_params = !type_params.is_empty();
 
-    // Build a generics set with only type params (no lifetimes) for the
-    // hidden struct + trait impls. The function itself keeps its lifetimes.
-    let struct_generics = {
-        let mut g = item.sig.generics.clone();
-        g.params = g
-            .params
-            .into_iter()
-            .filter(|p| matches!(p, syn::GenericParam::Type(_)))
-            .collect();
-        g
+    let error_kind_tokens = if let Some(kind) = &fn_args.error_kind {
+        quote! { ::core::option::Option::Some(#kind) }
+    } else {
+        quote! { ::core::option::Option::None }
     };
-    let (impl_g, ty_g, where_c) = struct_generics.split_for_impl();
-
-    let all_params_compatible = !has_type_params
-        && item.sig.inputs.iter().all(|input| {
-            let FnArg::Typed(pat_ty) = input else {
-                return true;
+    // `E: Error + Send + Sync` is the requirement on a fallible error type;
+    // checked
+    // here so the failure points at the declared error type, not at
+    // generated conversion code.
+    let display_probe = if fallible
+        && !has_type_params
+        && let syn::ReturnType::Type(_, ret) = &item.sig.output
+        && let Some((_, err)) = crate::fn_desc::result_types(ret)
+    {
+        quote_spanned! {err.span()=>
+            const _: () = {
+                fn __haphe_fallible_error_bound<__E: ::std::error::Error + ::core::marker::Send + ::core::marker::Sync + 'static>() {}
+                let _ = __haphe_fallible_error_bound::<#err>;
             };
-            crate::bind::is_bridge_compatible_type(&pat_ty.ty)
-        });
-    let return_compatible = !has_type_params
-        && info.return_ty.as_ref().is_none_or(|t| {
-            !matches!(t, Type::Reference(_)) && crate::bind::is_bridge_compatible_type(t)
-        });
+        }
+    } else {
+        TokenStream::new()
+    };
+    // The wrapper expression producing the call's ScriptValue result; a
+    // fallible call's `Err` maps into a Callee error.
+    let wrap_return = |call: TokenStream| -> TokenStream {
+        if fallible {
+            quote! {
+                match #call {
+                    ::core::result::Result::Ok(__v) => ::haphe::IntoScript::into_script(__v),
+                    ::core::result::Result::Err(__e) => {
+                        return ::core::result::Result::Err(::haphe::ScriptCallError::Callee {
+                            type_name: ::core::any::type_name_of_val(&__e),
+                            error: ::std::sync::Arc::new(__e),
+                            kind: #error_kind_tokens,
+                        });
+                    }
+                }
+            }
+        } else if info.return_ty.is_some() {
+            quote! { ::haphe::IntoScript::into_script(#call) }
+        } else {
+            quote! { { #call; ::haphe::ScriptValue::Unit } }
+        }
+    };
 
-    let can_bind = !info.is_async
-        && cfgs.is_empty()
-        && (has_type_params || (all_params_compatible && return_compatible));
+    let make_wrapper = |subst: &std::collections::HashMap<String, Type>| -> TokenStream {
+        let conversions: Vec<TokenStream> = param_info
+            .iter()
+            .enumerate()
+            .map(|(i, (name, ty))| {
+                let ty = substitute_type_params(ty, subst);
+                // Rendered at expansion time: `stringify!` on interpolated
+                // tokens would space every punct ("Vec < i64 >").
+                let expected = crate::derive::stringify_bound(&quote!(#ty));
+                quote! {
+                    let #name = <#ty as ::haphe::FromScript>::from_script(
+                        __args.get(#i).cloned().unwrap_or(::haphe::ScriptValue::Unit)
+                    ).map_err(|__e| ::haphe::ScriptConvertError {
+                        expected: #expected,
+                        got: __e.got,
+                    })?;
+                }
+            })
+            .collect();
+        let turbofish = if subst.is_empty() {
+            TokenStream::new()
+        } else {
+            let args: Vec<&Type> = type_params
+                .iter()
+                .map(|p| subst.get(&p.to_string()).expect("all params substituted"))
+                .collect();
+            quote! { ::<#(#args),*> }
+        };
+        let return_conversion = wrap_return(quote! { #fn_ident #turbofish (#(#call_args),*) });
+        quote! {
+            |__args: &[::haphe::ScriptValue]| -> ::core::result::Result<::haphe::ScriptValue, ::haphe::ScriptCallError> {
+                #(#conversions)*
+                ::core::result::Result::Ok(#return_conversion)
+            }
+        }
+    };
+
+    let make_async_wrapper = |subst: &std::collections::HashMap<String, Type>| -> TokenStream {
+        let conversions: Vec<TokenStream> = param_info
+            .iter()
+            .enumerate()
+            .map(|(i, (name, ty))| {
+                let ty = substitute_type_params(ty, subst);
+                quote! {
+                    let #name = <#ty as ::haphe::FromScript>::from_script(
+                        __args.get(#i).cloned().unwrap_or(::haphe::ScriptValue::Unit)
+                    )?;
+                }
+            })
+            .collect();
+        let turbofish = if subst.is_empty() {
+            TokenStream::new()
+        } else {
+            let args: Vec<&Type> = type_params
+                .iter()
+                .map(|p| subst.get(&p.to_string()).expect("all params substituted"))
+                .collect();
+            quote! { ::<#(#args),*> }
+        };
+        let return_conversion =
+            wrap_return(quote! { #fn_ident #turbofish (#(#call_args),*).await });
+        quote! {
+            (|__args: &[::haphe::ScriptValue]| -> ::haphe::ScriptCallFuture<'_> {
+                ::std::boxed::Box::pin(async move {
+                    #(#conversions)*
+                    ::core::result::Result::Ok(#return_conversion)
+                })
+            }) as for<'a> fn(&'a [::haphe::ScriptValue]) -> ::haphe::ScriptCallFuture<'a>
+        }
+    };
+
+    let compatible = |subst: &std::collections::HashMap<String, Type>| -> bool {
+        param_info
+            .iter()
+            .all(|(_, ty)| crate::bind::is_bridge_value_type(&substitute_type_params(ty, subst)))
+            && info.return_ty.as_ref().is_none_or(|t| {
+                let t = substitute_type_params(t, subst);
+                // Returns convert immediately at the boundary, so
+                // outbound-only composites (`Vec<&str>`) are fine there.
+                !matches!(t, Type::Reference(_)) && crate::bind::is_bridge_outbound_type(&t)
+            })
+    };
+
+    let empty_subst = std::collections::HashMap::new();
+    let (can_bind, bind_body) = if has_type_params {
+        let substs: Vec<std::collections::HashMap<String, Type>> = fn_args
+            .instantiate
+            .iter()
+            .map(|(types, _)| {
+                type_params
+                    .iter()
+                    .map(std::string::ToString::to_string)
+                    .zip(types.iter().cloned())
+                    .collect()
+            })
+            .collect();
+        let is_dyn = fn_args.dyn_dispatch.is_some();
+        let can = cfgs.is_empty() && !substs.is_empty() && substs.iter().all(&compatible);
+        let registrations: Vec<TokenStream> = fn_args
+            .instantiate
+            .iter()
+            .zip(&substs)
+            .map(|((types, span), subst)| {
+                let type_args = quote! { &[#( <#types as ::haphe::HapheType>::DESCRIPTOR ),*] };
+                if is_dyn && info.is_async {
+                    let wrapper = make_async_wrapper(subst);
+                    quote_spanned! {*span=>
+                        __binder.function_dyn_async(
+                            &<#ident as ::haphe::ScriptFunction>::DESCRIPTOR,
+                            #type_args,
+                            #wrapper,
+                        )?;
+                    }
+                } else if is_dyn {
+                    let wrapper = make_wrapper(subst);
+                    quote_spanned! {*span=>
+                        __binder.function_dyn(
+                            &<#ident as ::haphe::ScriptFunction>::DESCRIPTOR,
+                            #type_args,
+                            #wrapper,
+                        )?;
+                    }
+                } else if info.is_async {
+                    let wrapper = make_async_wrapper(subst);
+                    quote_spanned! {*span=>
+                        __binder.function_async(
+                            #exposed_name,
+                            #type_args,
+                            #wrapper,
+                        )?;
+                    }
+                } else {
+                    let wrapper = make_wrapper(subst);
+                    quote_spanned! {*span=>
+                        __binder.function(
+                            #exposed_name,
+                            #type_args,
+                            #wrapper,
+                        )?;
+                    }
+                }
+            })
+            .collect();
+        (
+            can,
+            quote! { #(#registrations)* ::core::result::Result::Ok(()) },
+        )
+    } else {
+        let whitelisted = compatible(&empty_subst);
+        let dispatch_eligible = !whitelisted
+            && param_info.iter().all(|(_, ty)| {
+                crate::bind::is_bridge_compatible_type(ty) || crate::bind::is_dispatchable_path(ty)
+            })
+            && info.return_ty.as_ref().is_none_or(|t| {
+                !matches!(t, Type::Reference(_))
+                    && (crate::bind::is_bridge_compatible_type(t)
+                        || crate::bind::is_dispatchable_path(t))
+            });
+        let can = cfgs.is_empty() && (whitelisted || dispatch_eligible);
+        let body = if info.is_async && whitelisted {
+            // Async free functions register through the async channel; the
+            // boxed future borrows the argument slice.
+            let conversions: Vec<TokenStream> = param_info
+                .iter()
+                .enumerate()
+                .map(|(i, (name, ty))| {
+                    quote! {
+                        let #name = <#ty as ::haphe::FromScript>::from_script(
+                            __args.get(#i).cloned().unwrap_or(::haphe::ScriptValue::Unit)
+                        )?;
+                    }
+                })
+                .collect();
+            let return_conversion = wrap_return(quote! { #fn_ident(#(#call_args),*).await });
+            quote! {
+                __binder.function_async(
+                    #exposed_name,
+                    &[],
+                    (|__args: &[::haphe::ScriptValue]| -> ::haphe::ScriptCallFuture<'_> {
+                        ::std::boxed::Box::pin(async move {
+                            #(#conversions)*
+                            ::core::result::Result::Ok(#return_conversion)
+                        })
+                    }) as for<'a> fn(&'a [::haphe::ScriptValue]) -> ::haphe::ScriptCallFuture<'a>,
+                )
+            }
+        } else if whitelisted {
+            let wrapper = make_wrapper(&empty_subst);
+            quote! { __binder.function(#exposed_name, &[], #wrapper) }
+        } else {
+            // Types the whitelist can't judge (e.g. transparent primitive
+            // newtypes): registration is decided by compile-time
+            // trait-presence dispatch — real registration when the bridge
+            // bounds hold, no-op otherwise.
+            {
+                let param_is_ref: Vec<bool> = item
+                    .sig
+                    .inputs
+                    .iter()
+                    .filter_map(|input| match input {
+                        syn::FnArg::Typed(pat_ty) => {
+                            Some(matches!(pat_ty.ty.as_ref(), Type::Reference(_)))
+                        }
+                        syn::FnArg::Receiver(_) => None,
+                    })
+                    .collect();
+                gen_dispatched_fn_registration(
+                    ident,
+                    fn_ident,
+                    exposed_name,
+                    &param_info,
+                    &param_is_ref,
+                    &info,
+                    fallible.then_some(&error_kind_tokens),
+                )
+            }
+        };
+        (can, body)
+    };
 
     let bind_fn = if can_bind {
         quote! {
             #[automatically_derived]
-            impl #impl_g ::haphe::ScriptBindFn for #ident #ty_g #where_c {
+            impl ::haphe::ScriptBindFn for #ident {
                 fn bind<__B: ::haphe::FnBinder>(__binder: &mut __B) -> ::core::result::Result<(), __B::Error> {
-                    __binder.function(
-                        #exposed_name,
-                        |__args: &[::haphe::ScriptValue]| -> ::core::result::Result<::haphe::ScriptValue, ::haphe::ScriptConvertError> {
-                            #(#param_conversions)*
-                            ::core::result::Result::Ok(#return_conversion)
-                        },
-                    )
+                    #bind_body
                 }
             }
         }
@@ -208,36 +454,190 @@ pub fn expand(mut item: ItemFn) -> TokenStream {
         TokenStream::new()
     };
 
-    let struct_def = if has_type_params {
-        quote! {
-            #(#cfgs)*
-            #[doc(hidden)]
-            #[allow(non_camel_case_types)]
-            #vis struct #ident #impl_g #where_c {
-                _marker: ::core::marker::PhantomData<(#(#type_params,)*)>,
-            }
-        }
-    } else {
-        quote! {
-            #(#cfgs)*
-            #[doc(hidden)]
-            #[allow(non_camel_case_types)]
-            #vis struct #ident {}
-        }
-    };
-
     quote! {
         #item
 
-        #struct_def
+        #(#cfgs)*
+        #[doc(hidden)]
+        #[allow(non_camel_case_types)]
+        #vis struct #ident {}
+
+        #(#cfgs)*
+        #display_probe
 
         #(#cfgs)*
         #[automatically_derived]
-        impl #impl_g ::haphe::ScriptFunction for #ident #ty_g #where_c {
+        impl ::haphe::ScriptFunction for #ident {
             const DESCRIPTOR: ::haphe::FunctionDescriptor<'static> = #descriptor;
         }
 
         #(#cfgs)*
         #bind_fn
+    }
+}
+
+use crate::bind::substitute_type_params;
+
+/// A free-fn registration decided by compile-time trait-presence dispatch
+/// (autoref specialization): registers when every stripped param implements
+/// `FromScript` and the return converts to `ScriptValue`, no-ops otherwise.
+/// Mirrors `bind::gen_dispatched_method_registration`; the hidden descriptor
+/// struct doubles as the dispatch carrier. Non-generic functions only.
+#[allow(
+    clippy::too_many_lines,
+    reason = "expansion drivers assemble one `quote!` output from many interdependent pieces; splitting them hurts locality more than length hurts readability"
+)]
+fn gen_dispatched_fn_registration(
+    carrier: &syn::Ident,
+    fn_ident: &syn::Ident,
+    exposed_name: &str,
+    param_info: &[(syn::Ident, Type)],
+    param_is_ref: &[bool],
+    info: &crate::fn_desc::FnInfo,
+    fallible_error_kind: Option<&TokenStream>,
+) -> TokenStream {
+    // param_info types are already stripped of outer references.
+    let stripped: Vec<Type> = param_info.iter().map(|(_, t)| t.clone()).collect();
+    let p_assoc: Vec<syn::Ident> = (0..stripped.len())
+        .map(|i| quote::format_ident!("__P{i}"))
+        .collect();
+    let p_vars: Vec<syn::Ident> = (0..stripped.len())
+        .map(|i| quote::format_ident!("__p{i}"))
+        .collect();
+    let call_args: Vec<TokenStream> = param_is_ref
+        .iter()
+        .zip(&p_vars)
+        .map(|(is_ref, v)| {
+            if *is_ref {
+                quote! { &#v }
+            } else {
+                quote! { #v }
+            }
+        })
+        .collect();
+    let ret_ty: TokenStream = if let Some(t) = &info.return_ty {
+        quote! { #t }
+    } else {
+        quote! { () }
+    };
+    let idx: Vec<usize> = (0..stripped.len()).collect();
+
+    // Async twin: async `__invoke` on the probe trait, boxed-future wrapper,
+    // `function_async` registration — bounds unchanged.
+    let asyncness = info.is_async.then(|| quote! { async });
+    let trait_allow = info
+        .is_async
+        .then(|| quote! { #[allow(async_fn_in_trait)] });
+    let invoke_body = if info.is_async {
+        quote! { #fn_ident(#(#call_args),*).await }
+    } else {
+        quote! { #fn_ident(#(#call_args),*) }
+    };
+    // Fallible twin: `__invoke` maps `Err` into a Callee error at the concrete
+    // impl, where `E` is inferable — it never appears in the probe's types.
+    let (invoke_ret_trait, invoke_ret_impl, invoke_body, try_op) =
+        if let Some(kind) = fallible_error_kind {
+            (
+                quote! { ::core::result::Result<Self::__R, ::haphe::ScriptCallError> },
+                quote! { ::core::result::Result<#ret_ty, ::haphe::ScriptCallError> },
+                quote! {
+                    #invoke_body.map_err(|__e| ::haphe::ScriptCallError::Callee {
+                        type_name: ::core::any::type_name_of_val(&__e),
+                        error: ::std::sync::Arc::new(__e),
+                        kind: #kind,
+                    })
+                },
+                quote! { ? },
+            )
+        } else {
+            (
+                quote! { Self::__R },
+                ret_ty.clone(),
+                invoke_body,
+                TokenStream::new(),
+            )
+        };
+    let registration = if info.is_async {
+        quote! {
+            __b.function_async(
+                #exposed_name,
+                &[],
+                (|__args: &[::haphe::ScriptValue]| -> ::haphe::ScriptCallFuture<'_> {
+                    ::std::boxed::Box::pin(async move {
+                        #(
+                            let #p_vars = <__T::#p_assoc as ::haphe::FromScript>::from_script(
+                                __args.get(#idx).cloned().unwrap_or(::haphe::ScriptValue::Unit)
+                            )?;
+                        )*
+                        ::core::result::Result::Ok(::haphe::ScriptValue::from(
+                            __T::__invoke(#( #p_vars ),*).await #try_op
+                        ))
+                    })
+                }) as for<'a> fn(&'a [::haphe::ScriptValue]) -> ::haphe::ScriptCallFuture<'a>,
+            )
+        }
+    } else {
+        quote! {
+            __b.function(
+                #exposed_name,
+                &[],
+                (|__args: &[::haphe::ScriptValue]|
+                    -> ::core::result::Result<::haphe::ScriptValue, ::haphe::ScriptCallError> {
+                    #(
+                        let #p_vars = <__T::#p_assoc as ::haphe::FromScript>::from_script(
+                            __args.get(#idx).cloned().unwrap_or(::haphe::ScriptValue::Unit)
+                        )?;
+                    )*
+                    ::core::result::Result::Ok(::haphe::ScriptValue::from(
+                        __T::__invoke(#( #p_vars ),*) #try_op
+                    ))
+                }) as fn(&[::haphe::ScriptValue])
+                    -> ::core::result::Result<::haphe::ScriptValue, ::haphe::ScriptCallError>,
+            )
+        }
+    };
+
+    quote! {
+        {
+            #[allow(non_camel_case_types)]
+            #trait_allow
+            trait __Call {
+                #( type #p_assoc; )*
+                type __R;
+                #asyncness fn __invoke(#( #p_vars: Self::#p_assoc ),*) -> #invoke_ret_trait;
+            }
+            impl __Call for #carrier {
+                #( type #p_assoc = #stripped; )*
+                type __R = #ret_ty;
+                #[allow(unused_variables)]
+                #asyncness fn __invoke(#( #p_vars: #stripped ),*) -> #invoke_ret_impl {
+                    #invoke_body
+                }
+            }
+            #[allow(non_camel_case_types)]
+            trait __Go {
+                fn __haphe_bind_fn<__B: ::haphe::FnBinder>(
+                    &self,
+                    __b: &mut __B,
+                ) -> ::core::result::Result<(), __B::Error>;
+            }
+            impl<__T> __Go for &::haphe::BridgeProbe<__T>
+            where
+                __T: __Call,
+                #( __T::#p_assoc: ::haphe::FromScript, )*
+                ::haphe::ScriptValue: ::core::convert::From<__T::__R>,
+            {
+                fn __haphe_bind_fn<__B: ::haphe::FnBinder>(
+                    &self,
+                    __b: &mut __B,
+                ) -> ::core::result::Result<(), __B::Error> {
+                    #registration
+                }
+            }
+            #[allow(unused_imports)]
+            use ::haphe::SkipBindFn as _;
+            (&&::haphe::BridgeProbe::<#carrier>(::core::marker::PhantomData))
+                .__haphe_bind_fn(__binder)
+        }
     }
 }

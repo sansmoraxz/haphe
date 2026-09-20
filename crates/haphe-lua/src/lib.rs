@@ -2,7 +2,7 @@
 //!
 //! Implements [`RuntimeBinder`] to register haphe-described modules and
 //! constants into a live [`mlua::Lua`] runtime, and [`bind_type`] to
-//! register haphe-described types as Lua UserData — with fields, methods,
+//! register haphe-described types as Lua `UserData` — with fields, methods,
 //! constructors, and metamethods generated from `#[derive(Script)]` +
 //! `#[script] impl`.
 //!
@@ -11,8 +11,16 @@
 //! - **Module tables**: nested Lua tables mirroring the module hierarchy.
 //! - **Constants**: module constants converted to Lua values.
 //! - **Type binding**: [`bind_type`] registers a type's fields, methods,
-//!   constructors, and trait metamethods (Display, PartialEq, Add, etc.)
-//!   as Lua UserData — no hand-written mlua code required.
+//!   constructors, and trait metamethods (Display → `tostring`, `ToString` →
+//!   `..` concatenation with string-like operands, PartialEq/Eq → `==`,
+//!   PartialOrd/Ord → `<`/`<=`, arithmetic operators, ...) as Lua `UserData` —
+//!   no hand-written mlua code required.
+//! - **Declaration stubs**: [`LuaDeclGenerator`] emits a `LuaLS` `---@meta`
+//!   definition file so editors see the bound surface with full types.
+//! - **Foreign interfaces**: [`foreign_handle`] builds the handle for a
+//!   `#[script(foreign)]` trait from a table of Lua callbacks, so Rust calls
+//!   out to script-supplied functions — no binder or registration machinery
+//!   involved, just the Lua state and the table.
 //!
 //! # Capabilities
 //!
@@ -20,6 +28,16 @@
 //! (unless the `async` feature is enabled). With the `send` feature, thread
 //! safety requires `Send` (mlua wraps userdata in `Arc<Mutex<T>>`);
 //! without it, no thread-safety constraint is imposed.
+//!
+//! # Operator overloads
+//!
+//! Repeated operator-trait declarations (`traits(Add, Add(rhs = f64))`) are
+//! merged into ONE Lua metamethod per operator. Resolution order:
+//! `Self op Self` first, then scalar overloads whose declared rhs type
+//! exactly matches the Lua value's shape (an integer prefers an integer
+//! overload, a float a float one), then the remaining overloads in
+//! declaration order — where a Lua integer still converts into a float
+//! overload, so declaration order decides among lossy candidates.
 //!
 //! # Example
 //!
@@ -58,11 +76,17 @@
 //! ```
 
 mod binder;
+mod decl;
 mod error;
+mod foreign;
 mod module;
 
+pub use decl::{LuaDeclError, LuaDeclGenerator};
+pub use foreign::{foreign_caller, foreign_handle};
+
 use haphe::{
-    BackendCapabilities, RuntimeBinder, ScriptBind, ScriptBindFn, ThreadSafety, ValidatedRegistry,
+    BackendCapabilities, RuntimeBinder, ScriptBind, ScriptBindFn, ScriptStruct, ThreadSafety,
+    ValidatedRegistry,
 };
 
 pub use error::LuaBindError;
@@ -92,7 +116,7 @@ impl LuaBinder {
         Self { capabilities }
     }
 
-    fn default_capabilities() -> BackendCapabilities {
+    pub(crate) fn default_capabilities() -> BackendCapabilities {
         let thread_safety = if cfg!(feature = "send") {
             Some(ThreadSafety::SEND)
         } else {
@@ -101,6 +125,10 @@ impl LuaBinder {
 
         BackendCapabilities::ALL
             .with_async_fns(cfg!(feature = "async"))
+            // Dyn generic dispatch rides the same opt-in as the rest of the
+            // generics extension: the runtime is natively dynamic, but the
+            // scan machinery is only compiled in with the feature.
+            .with_dyn_generics(cfg!(feature = "generics"))
             .with_required_thread_safety(thread_safety)
     }
 }
@@ -115,7 +143,7 @@ impl RuntimeBinder for LuaBinder {
     type Runtime = mlua::Lua;
     type Error = LuaBindError;
 
-    fn language_name(&self) -> &str {
+    fn language_name(&self) -> &'static str {
         "lua"
     }
 
@@ -135,27 +163,174 @@ impl RuntimeBinder for LuaBinder {
             globals.set(module.name, table).map_err(LuaBindError::Lua)?;
         }
 
+        install_error_info(runtime)?;
+
         Ok(())
     }
+}
+
+/// Installs the `haphe_error` global: callee errors cross as external error
+/// values rendering as "Kind: message" through `tostring(e)`, and
+/// `haphe_error(e)` decodes one caught by `pcall` into `{ message, kind?,
+/// type, chain }` — `kind` the declared `error_kind`, `type` the concrete
+/// Rust error type's name, `chain` the rendered `source()` cause chain.
+/// Returns `nil` for anything that is not a callee error.
+///
+/// [`RuntimeBinder::bind`] installs this automatically; call it directly
+/// when composing a state through [`bind_type`]/[`bind_fn`] alone.
+pub fn install_error_info(lua: &mlua::Lua) -> Result<(), LuaBindError> {
+    let error_info = lua
+        .create_function(error::error_info)
+        .map_err(LuaBindError::Lua)?;
+    lua.globals()
+        .set("haphe_error", error_info)
+        .map_err(LuaBindError::Lua)
 }
 
 /// Registers a type's fields, methods, constructors, and metamethods into
 /// the Lua state. The type's `#[derive(Script)]` + `#[script] impl`
 /// provides the `ScriptBind` implementation automatically.
 ///
-/// Call this for each type that should be usable as UserData in Lua.
+/// Call this for each type that should be usable as `UserData` in Lua.
 /// After registration, Lua code can construct, access fields, and call
 /// methods on the type.
 ///
 /// `type_table` is the Lua table where the type's constructors will be
 /// placed (typically the type's entry in a module table).
-pub fn bind_type<T: ScriptBind + Clone + mlua::MaybeSend + mlua::MaybeSync + 'static>(
+///
+/// # Iteration
+///
+/// A type declaring `traits(IntoIterator(item = ...))` (or `Iterator`)
+/// iterates with the built-in `pairs(obj)` on Lua 5.2+ and `LuaJIT` with 5.2
+/// compatibility, with Luau's native `for ... in obj do`, and with a
+/// portable implicit `obj:iter()` method on every version (the only option
+/// on 5.1 and plain `LuaJIT`, which have no `__pairs`). A declared 2-tuple
+/// item iterates as `(k, v)`; any other item as 1-based `(i, item)` — this
+/// pairing is decided here, statically, from the declared item type. `#obj`
+/// reports the iterator's size hint. Note that built-in containers
+/// (`Vec`, arrays, maps) already cross as native Lua tables and iterate
+/// with plain `pairs`/`ipairs`; this covers opaque userdata types.
+///
+/// `ipairs(obj)` works only on Lua 5.2 and `LuaJIT` with 5.2 compatibility,
+/// where the `__ipairs` metamethod exists: always 1-based sequential
+/// `(i, item)` (the array protocol), regardless of a kv item's pairing. Lua
+/// 5.3 deprecated and 5.4+ removed `__ipairs` — there `ipairs(obj)` performs
+/// raw `obj[1], obj[2], ...` lookups through `__index`, which only terminates
+/// on nil while this backend's `traits(Index)` bridge surfaces out-of-range
+/// access as an error; the supported spellings on 5.3+ are `pairs(obj)` and
+/// `obj:iter()`.
+pub fn bind_type<
+    T: ScriptBind + ScriptStruct + Clone + mlua::MaybeSend + mlua::MaybeSync + 'static,
+>(
     lua: &mlua::Lua,
     type_table: &mlua::Table,
 ) -> Result<(), LuaBindError> {
     let mut binder = binder::LuaTypeBinder::<T>::new();
+    binder.set_pairing(declared_iter_pairing(
+        <T as ScriptStruct>::DESCRIPTOR.trait_impls,
+    ));
+    binder.set_idiv_fallback(declared_idiv_fallback(
+        <T as ScriptStruct>::DESCRIPTOR.trait_impls,
+    ));
     T::bind(&mut binder)?;
     binder.register(lua, type_table)
+}
+
+/// Binds a methods-bearing enum as full userdata: methods and trait
+/// metamethods become callable on enum VALUES delivered as userdata (a
+/// plain unit enum without methods needs no binding — its cases cross as
+/// native string/integer values and the module case table names them).
+///
+/// The value boundary is unchanged: unit-enum arguments and returns still
+/// convert by case name / discriminant. Userdata produced here is the
+/// receiver surface for methods; a bound function returning the enum still
+/// yields the lightweight value. Constructing userdata from a case is done
+/// through the enum's own methods or bound functions.
+pub fn bind_enum_type<
+    E: ScriptBind + haphe::ScriptEnum + Clone + mlua::MaybeSend + mlua::MaybeSync + 'static,
+>(
+    lua: &mlua::Lua,
+    type_table: &mlua::Table,
+) -> Result<(), LuaBindError> {
+    let mut binder = binder::LuaTypeBinder::<E>::new();
+    binder.set_pairing(declared_iter_pairing(
+        <E as haphe::ScriptEnum>::DESCRIPTOR.trait_impls,
+    ));
+    binder.set_idiv_fallback(declared_idiv_fallback(
+        <E as haphe::ScriptEnum>::DESCRIPTOR.trait_impls,
+    ));
+    E::bind(&mut binder)?;
+    binder.register(lua, type_table)
+}
+
+/// Strips lifetime-carrying descriptors: Lua has no borrow semantics, so a
+/// [`TypeDescriptor::Borrowed`] value is its inner type, cloned at the
+/// boundary — the carried lifetime is ignored.
+pub(crate) fn peel_borrowed<'a>(
+    ty: &'a haphe::TypeDescriptor<'a>,
+) -> &'a haphe::TypeDescriptor<'a> {
+    match ty {
+        haphe::TypeDescriptor::Borrowed { inner, .. } => peel_borrowed(inner),
+        other => other,
+    }
+}
+
+/// Whether `//` should fall back to the type's `Div` registration: only for
+/// integer-typed `Div` declarations (integer-primitive rhs, and an output
+/// that is not some other primitive shape), and never when an explicit
+/// `IDiv` is declared. The fallback carries Rust's truncating semantics
+/// (`-7 // 2` gives `-3`, not Lua's floor `-4`) — declare `traits(IDiv)`
+/// for floor behavior on negative operands.
+pub(crate) fn declared_idiv_fallback(trait_impls: &[haphe::TraitImpl<'_>]) -> bool {
+    use haphe::{PrimitiveType, TraitImpl, TypeDescriptor};
+    let is_int = |td: &TypeDescriptor<'_>| {
+        matches!(
+            peel_borrowed(td),
+            TypeDescriptor::Primitive(
+                PrimitiveType::I8
+                    | PrimitiveType::I16
+                    | PrimitiveType::I32
+                    | PrimitiveType::I64
+                    | PrimitiveType::U8
+                    | PrimitiveType::U16
+                    | PrimitiveType::U32
+                    | PrimitiveType::U64
+            )
+        )
+    };
+    if trait_impls
+        .iter()
+        .any(|ti| matches!(ti, TraitImpl::IDiv { .. }))
+    {
+        return false;
+    }
+    trait_impls.iter().any(|ti| {
+        matches!(
+            ti,
+            TraitImpl::Div { rhs, output }
+                if is_int(rhs)
+                    && (is_int(output)
+                        || !matches!(peel_borrowed(output), TypeDescriptor::Primitive(_)))
+        )
+    })
+}
+
+/// The pairing for a type's iteration, from its declared iterator item type:
+/// a 2-tuple item iterates as `(k, v)`, anything else as 1-based `(i, item)`.
+fn declared_iter_pairing(trait_impls: &[haphe::TraitImpl<'_>]) -> binder::IterPairing {
+    use haphe::{TraitImpl, TypeDescriptor};
+    for ti in trait_impls {
+        let item = match ti {
+            TraitImpl::IntoIterator { item } | TraitImpl::Iterator { item } => peel_borrowed(item),
+            _ => continue,
+        };
+        return if matches!(item, TypeDescriptor::Tuple(elems) if elems.len() == 2) {
+            binder::IterPairing::KeyValue
+        } else {
+            binder::IterPairing::Enumerate
+        };
+    }
+    binder::IterPairing::Enumerate
 }
 
 /// Registers a free function into a Lua table.

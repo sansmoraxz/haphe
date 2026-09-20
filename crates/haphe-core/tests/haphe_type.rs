@@ -133,13 +133,21 @@ fn smart_pointers_forward() {
     use std::sync::Arc;
     assert_eq!(<Rc<i32> as HapheType>::DESCRIPTOR, I32);
     assert_eq!(<Arc<str> as HapheType>::DESCRIPTOR, TypeDescriptor::String);
+    // `Cow` carries its (anonymous here) lifetime; backends decide what to
+    // do with `Borrowed`.
     assert_eq!(
         <Cow<'_, str> as HapheType>::DESCRIPTOR,
-        TypeDescriptor::String
+        TypeDescriptor::Borrowed {
+            lifetime: None,
+            inner: &TypeDescriptor::String,
+        }
     );
     assert_eq!(
         <Cow<'_, [u8]> as HapheType>::DESCRIPTOR,
-        TypeDescriptor::List(&U8),
+        TypeDescriptor::Borrowed {
+            lifetime: None,
+            inner: &TypeDescriptor::List(&U8),
+        }
     );
 }
 

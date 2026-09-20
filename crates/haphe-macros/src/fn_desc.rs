@@ -5,13 +5,45 @@ use proc_macro2::TokenStream;
 use quote::{quote, quote_spanned};
 use syn::ext::IdentExt;
 use syn::spanned::Spanned;
-use syn::{FnArg, Pat, ReceiverKind, ReturnType, Safety, Signature};
+use syn::{FnArg, Pat, ReceiverKind, ReturnType, Safety, Signature, Type};
 
 use crate::attrs::{
     Errors, FnArgs, extract_doc, option_str_tokens, parse_param_args, strip_script_attrs,
 };
 use crate::ty_map::{TyCtx, descriptor_expr, ownership_expr, substitute_self};
 use crate::verify;
+
+/// `Result<T, E>` split syntactically, mirroring the built-in-container rules
+/// of `ty_map` (bare name, or a `std`/`core` path).
+pub(crate) fn result_types(ty: &Type) -> Option<(&Type, &Type)> {
+    let Type::Path(p) = ty else { return None };
+    if p.qself.is_some() {
+        return None;
+    }
+    let is_builtin_path = p.path.segments.len() == 1
+        || matches!(
+            p.path.segments.first().map(|seg| seg.ident.to_string()),
+            Some(ref first) if matches!(first.as_str(), "std" | "core")
+        );
+    if !is_builtin_path {
+        return None;
+    }
+    let last = p.path.segments.last()?;
+    if last.ident != "Result" {
+        return None;
+    }
+    let syn::PathArguments::AngleBracketed(args) = &last.arguments else {
+        return None;
+    };
+    let mut types = args.args.iter().filter_map(|a| match a {
+        syn::GenericArgument::Type(t) => Some(t),
+        _ => None,
+    });
+    match (types.next(), types.next(), types.next()) {
+        (Some(ok), Some(err), None) => Some((ok, err)),
+        _ => None,
+    }
+}
 
 /// The receiver shape of an exposed function.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -67,11 +99,16 @@ pub fn strip_param_script_attrs(sig: &mut Signature) {
 /// Builds a descriptor from a signature, stripping parameter-level
 /// `#[script(...)]` attrs as it goes. Returns `None` (with errors recorded)
 /// for unsupported shapes — parameter attrs are stripped even then.
+#[allow(
+    clippy::too_many_lines,
+    reason = "expansion drivers assemble one `quote!` output from many interdependent pieces; splitting them hurts locality more than length hurts readability"
+)]
 pub fn build_fn_info(
     sig: &mut Signature,
     fn_args: &FnArgs,
     attrs: &[syn::Attribute],
     ctx: &TyCtx,
+    fallible: bool,
     errors: &mut Errors,
 ) -> Option<FnInfo> {
     // Parse and strip parameter attrs first: every early return below must
@@ -204,30 +241,113 @@ pub fn build_fn_info(
         }
     };
 
+    // The function's own generic parameters and their declared instantiations.
+    let mut gp_exprs = Vec::new();
+    let mut fn_type_param_count = 0usize;
+    for param in &sig.generics.params {
+        let syn::GenericParam::Type(tp) = param else {
+            continue;
+        };
+        fn_type_param_count += 1;
+        let name = tp.ident.to_string();
+        let bounds: Vec<String> = tp
+            .bounds
+            .iter()
+            .filter_map(|b| match b {
+                syn::TypeParamBound::Trait(t) => Some(crate::derive::stringify_bound(&quote!(#t))),
+                _ => None,
+            })
+            .collect();
+        gp_exprs.push(quote! {
+            ::haphe::GenericParam {
+                name: #name,
+                bounds: &[#(#bounds),*],
+                default: ::core::option::Option::None,
+            }
+        });
+    }
+    let mut inst_exprs = Vec::new();
+    let mut seen_instantiations: Vec<String> = Vec::new();
+    for (types, span) in &fn_args.instantiate {
+        if fn_type_param_count == 0 {
+            errors.spanned(
+                *span,
+                "`instantiate(...)` applies to functions with generic parameters",
+            );
+            continue;
+        }
+        let key = types
+            .iter()
+            .map(|ty| quote!(#ty).to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        if seen_instantiations.contains(&key) {
+            errors.spanned(
+                *span,
+                format!("duplicate `instantiate({key})`: this instantiation is already declared"),
+            );
+            continue;
+        }
+        seen_instantiations.push(key);
+        if types.len() != fn_type_param_count {
+            errors.spanned(
+                *span,
+                format!(
+                    "`instantiate(...)` lists {} type argument(s), but the function declares {} generic parameter(s)",
+                    types.len(),
+                    fn_type_param_count
+                ),
+            );
+            continue;
+        }
+        inst_exprs.push(quote_spanned! {*span=>
+            &[#( <#types as ::haphe::HapheType>::DESCRIPTOR ),*] as &[::haphe::TypeDescriptor<'static>]
+        });
+    }
+
     let name = fn_args
         .rename
         .as_ref()
-        .map(|r| r.value())
-        .unwrap_or_else(|| sig.ident.unraw().to_string());
+        .map_or_else(|| sig.ident.unraw().to_string(), syn::LitStr::value);
     let doc = extract_doc(attrs);
-    let doc_tokens = option_str_tokens(&doc);
-    let error_kind = match &fn_args.error_kind {
-        Some(kind) => quote! { ::core::option::Option::Some(#kind) },
-        None => quote! { ::core::option::Option::None },
+    let doc_tokens = option_str_tokens(doc.as_deref());
+    let error_kind = if let Some(kind) = &fn_args.error_kind {
+        quote! { ::core::option::Option::Some(#kind) }
+    } else {
+        quote! { ::core::option::Option::None }
     };
     let is_async = sig.asyncness.is_some();
     let receiver_tokens = receiver.tokens();
+    let dispatch_expr = if let Some(span) = fn_args.dyn_dispatch {
+        if gp_exprs.is_empty() {
+            errors.spanned(span, "`dyn` requires generic parameters");
+        }
+        if fn_args.instantiate.is_empty() {
+            errors.spanned(
+                span,
+                "`dyn` here needs explicit `instantiate(...)` declarations: the default \
+                 candidate set applies only to single-parameter generics",
+            );
+        }
+        quote! { ::haphe::Dispatch::Dyn }
+    } else {
+        quote! { ::haphe::Dispatch::Static }
+    };
 
     let descriptor = quote! {
         ::haphe::FunctionDescriptor {
             name: #name,
             doc: #doc_tokens,
             receiver: #receiver_tokens,
+            generic_params: &[#(#gp_exprs),*],
+            instantiations: &[#(#inst_exprs),*],
+            dispatch: #dispatch_expr,
             params: &[#(#param_exprs),*],
             return_type: #return_expr,
             return_ownership: #return_ownership,
             is_async: #is_async,
             error_kind: #error_kind,
+            fallible: #fallible,
         }
     };
 

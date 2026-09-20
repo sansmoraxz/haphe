@@ -109,7 +109,7 @@ impl<T: HapheType, const N: usize> HapheType for [T; N] {
     const DESCRIPTOR: TypeDescriptor<'static> = TypeDescriptor::Array(&T::DESCRIPTOR, N);
 }
 
-impl<K: HapheType, V: HapheType> HapheType for HashMap<K, V> {
+impl<K: HapheType, V: HapheType, S> HapheType for HashMap<K, V, S> {
     const DESCRIPTOR: TypeDescriptor<'static> = TypeDescriptor::Map(&K::DESCRIPTOR, &V::DESCRIPTOR);
 }
 
@@ -142,8 +142,15 @@ impl<T: HapheType + ?Sized> HapheType for Arc<T> {
     const DESCRIPTOR: TypeDescriptor<'static> = T::DESCRIPTOR;
 }
 
+/// Described as [`TypeDescriptor::Borrowed`] over the carried type. The
+/// lifetime is anonymous here — a trait impl cannot name a signature
+/// lifetime; the `#[script]` macro describes written `Cow<'a, T>` types
+/// syntactically, carrying the declared name.
 impl<T: HapheType + ToOwned + ?Sized> HapheType for Cow<'_, T> {
-    const DESCRIPTOR: TypeDescriptor<'static> = T::DESCRIPTOR;
+    const DESCRIPTOR: TypeDescriptor<'static> = TypeDescriptor::Borrowed {
+        lifetime: None,
+        inner: &T::DESCRIPTOR,
+    };
 }
 
 macro_rules! impl_tuple {

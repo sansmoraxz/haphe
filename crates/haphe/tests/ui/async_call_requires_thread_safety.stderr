@@ -1,0 +1,5 @@
+error: types declaring `AsyncCall` must declare #[script(thread_safety = ...)] explicitly
+ --> tests/ui/async_call_requires_thread_safety.rs:4:17
+  |
+4 | #[script(traits(AsyncCall(args = (i64,), output = i64)))]
+  |                 ^^^^^^^^^

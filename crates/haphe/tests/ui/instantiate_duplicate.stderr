@@ -1,0 +1,5 @@
+error: duplicate `instantiate(i64)`: this instantiation is already declared
+ --> tests/ui/instantiate_duplicate.rs:3:49
+  |
+3 | #[script(instantiate(i64), instantiate(String), instantiate(i64))]
+  |                                                 ^^^^^^^^^^^

@@ -1,7 +1,10 @@
 //! Derive-side folding of first-class stream/future types.
 
 #![cfg(all(feature = "macros", feature = "streams", feature = "futures"))]
-#![allow(dead_code)]
+#![allow(
+    dead_code,
+    reason = "fixtures are exercised through their generated descriptors and bridge wrappers, not direct calls"
+)]
 
 use haphe::{Script, ScriptStruct, TypeDescriptor};
 

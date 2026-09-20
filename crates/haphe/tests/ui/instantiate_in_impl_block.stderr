@@ -1,0 +1,5 @@
+error: `instantiate(...)` applies to functions with generic parameters
+  --> tests/ui/instantiate_in_impl_block.rs:11:14
+   |
+11 |     #[script(instantiate(i64))]
+   |              ^^^^^^^^^^^

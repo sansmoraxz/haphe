@@ -1,4 +1,20 @@
-use crate::types::TypeDescriptor;
+use crate::types::{GenericParam, TypeDescriptor};
+
+/// How a generic function's registrations are dispatched at runtime.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Dispatch {
+    /// Callers name a declared instantiation; backends key dispatch on
+    /// `(name, type_args)`. The default.
+    #[default]
+    Static,
+    /// Declared `dyn`: one callable per name; the backend scans the
+    /// registered instantiation candidates at call time and picks the one
+    /// whose type arguments match the incoming values (see
+    /// [`resolve_dyn_candidate`](crate::dispatch::resolve_dyn_candidate)).
+    /// Compilation is unchanged — the same monomorph wrappers back both
+    /// modes.
+    Dyn,
+}
 
 /// A Rust function or method exposed to scripting languages.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -9,6 +25,17 @@ pub struct FunctionDescriptor<'a> {
     pub doc: Option<&'a str>,
     /// If `Some`, this is a method with the given receiver type.
     pub receiver: Option<Receiver>,
+    /// Generic parameters declared on the function itself; the signature may
+    /// reference them via [`TypeDescriptor::GenericParam`], and each concrete
+    /// use is listed in [`instantiations`](Self::instantiations).
+    pub generic_params: &'a [GenericParam<'a>],
+    /// Concrete instantiations of [`generic_params`](Self::generic_params):
+    /// one entry per declared use, each carrying the type arguments in
+    /// declaration order. Backends monomorphize the function once per entry.
+    /// Empty for non-generic functions.
+    pub instantiations: &'a [&'a [TypeDescriptor<'a>]],
+    /// Runtime dispatch mode for the generic registrations.
+    pub dispatch: Dispatch,
     /// Positional parameters (excluding `self`).
     pub params: &'a [ParamDescriptor<'a>],
     /// The return type of the function.
@@ -23,6 +50,11 @@ pub struct FunctionDescriptor<'a> {
     /// their target language. `None` means use the backend's default error
     /// type.
     pub error_kind: Option<&'a str>,
+    /// Whether the declared return was `Result<T, E>` — the descriptor's
+    /// [`return_type`](Self::return_type) is `T` and calls may yield a
+    /// [`Callee`](crate::ScriptCallError::Callee) error. Fallibility is explicit
+    /// here; [`error_kind`](Self::error_kind) presence is NOT its proxy.
+    pub fallible: bool,
 }
 
 /// Whether any function in the slice is `async`. Usable in `const` contexts.

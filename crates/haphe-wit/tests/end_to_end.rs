@@ -1,7 +1,13 @@
-//! Full integration test: derive macros → registry! → haphe::generate →
+//! Full integration test: derive macros → registry! → `haphe::generate` →
 //! WIT text assertions.
 
-#![allow(dead_code, clippy::approx_constant)]
+#![allow(
+    dead_code,
+    clippy::approx_constant,
+    clippy::needless_pass_by_value,
+    clippy::unused_self,
+    reason = "fixture shapes are dictated by the bridge surface under test: receivers and owned parameters mirror the declared script signatures, not local call ergonomics"
+)]
 
 use haphe::{BindingGenerator, Script, script};
 use haphe_wit::{ConstantMode, WitGenerator};
@@ -50,10 +56,73 @@ impl Point {
 }
 
 /// A plain data record with no behavior.
-#[derive(Script)]
+#[derive(Script, PartialEq)]
+#[script(traits(PartialEq))]
 struct Size {
     width: u32,
     height: u32,
+}
+
+/// A buffer resource exercising the full trait-projection table.
+#[derive(Script, Clone, Default, PartialEq, Debug, Hash)]
+#[script(
+    thread_safety = send_sync,
+    traits(
+        PartialEq,
+        Default,
+        Debug,
+        Hash,
+        Add,
+        Index(index = i64, output = i64),
+        IndexMut(index = i64, output = i64),
+        IntoIterator(item = i64)
+    ),
+    methods
+)]
+struct Buffer {
+    #[script(skip)]
+    data: Vec<i64>,
+}
+
+impl std::ops::Add for Buffer {
+    type Output = Buffer;
+    fn add(mut self, rhs: Buffer) -> Buffer {
+        self.data.extend(rhs.data);
+        self
+    }
+}
+
+impl std::ops::Index<i64> for Buffer {
+    type Output = i64;
+    fn index(&self, i: i64) -> &i64 {
+        &self.data[i as usize]
+    }
+}
+
+impl std::ops::IndexMut<i64> for Buffer {
+    fn index_mut(&mut self, i: i64) -> &mut i64 {
+        &mut self.data[i as usize]
+    }
+}
+
+impl IntoIterator for Buffer {
+    type Item = i64;
+    type IntoIter = std::vec::IntoIter<i64>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.data.into_iter()
+    }
+}
+
+#[script]
+impl Buffer {
+    #[script(constructor)]
+    fn new() -> Self {
+        Buffer { data: Vec::new() }
+    }
+
+    fn push(&mut self, v: i64) {
+        self.data.push(v);
+    }
 }
 
 /// A named color.
@@ -63,6 +132,14 @@ enum Color {
     Green,
     Blue,
     Rgb(u8, u8, u8),
+}
+
+/// A pointer event: a mixed payload enum (unit + single + struct cases).
+#[derive(Script)]
+enum Event {
+    Idle,
+    Scroll(f64),
+    Move { x: f64, y: f64 },
 }
 
 /// Cardinal directions.
@@ -92,12 +169,19 @@ fn greet(name: String) -> String {
     format!("hello, {name}!")
 }
 
+/// Uppercases text, borrowing when it can. The `Borrowed` descriptor lowers
+/// as its inner type: WIT values cross by copy, so the lifetime vanishes.
+#[script]
+fn shout(text: std::borrow::Cow<'_, str>) -> std::borrow::Cow<'_, str> {
+    std::borrow::Cow::Owned(text.to_uppercase())
+}
+
 /// Midpoint of two points.
 #[script]
 fn midpoint(a: &Point, b: &Point) -> Point {
     Point {
-        x: (a.x + b.x) / 2.0,
-        y: (a.y + b.y) / 2.0,
+        x: f64::midpoint(a.x, b.x),
+        y: f64::midpoint(a.y, b.y),
     }
 }
 
@@ -110,17 +194,48 @@ async fn fetch_data(url: String) -> String {
 /// Sums a fixed block of four samples.
 #[script]
 fn sum_block(samples: [u8; 4]) -> u32 {
-    samples.iter().map(|&s| s as u32).sum()
+    samples.iter().map(|&s| u32::from(s)).sum()
 }
 
 /// Parses a point from text.
+///
+/// Fallible with a described-record ok type: the descriptor (and the WIT
+/// text) see `point`; the error crosses as a Host failure with no wire
+/// representation.
 #[script]
-fn parse_point(text: String) -> Result<Point, String> {
-    let (x, y) = text.split_once(',').ok_or("bad format")?;
+fn parse_point(text: String) -> Result<Point, TextError> {
+    let (x, y) = text.split_once(',').ok_or(TextError("bad format".into()))?;
     Ok(Point {
-        x: x.trim().parse().map_err(|e| format!("{e}"))?,
-        y: y.trim().parse().map_err(|e| format!("{e}"))?,
+        x: x.trim().parse().map_err(|e| TextError(format!("{e}")))?,
+        y: y.trim().parse().map_err(|e| TextError(format!("{e}")))?,
     })
+}
+
+/// Host-side notifications.
+#[script(foreign, thread_safety = none)]
+trait Notifier {
+    /// Sends a message to the embedder.
+    fn notify(&self, message: String);
+
+    #[script(error_kind = "IoError")]
+    fn moved(&self, to: Point) -> Result<u32, NotifyError>;
+
+    async fn flush(&self);
+}
+
+struct NotifyError;
+
+impl From<haphe::ForeignError> for NotifyError {
+    fn from(_: haphe::ForeignError) -> Self {
+        NotifyError
+    }
+}
+
+// Dispatch shuttles user-defined values as opaque userdata.
+impl From<Point> for haphe::ScriptValue {
+    fn from(p: Point) -> Self {
+        haphe::ScriptValue::UserData(haphe::OpaqueUserData::new(p))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -129,8 +244,9 @@ fn parse_point(text: String) -> Result<Point, String> {
 
 haphe::registry! {
     pub static REGISTRY = {
-        structs: [Point, Size],
-        enums: [Color, Direction],
+        structs: [Point, Size, Buffer],
+        enums: [Color, Direction, Event],
+        foreign: [NotifierHandle],
         modules: [
             mod geometry {
                 doc: "Geometry types and utilities",
@@ -138,14 +254,14 @@ haphe::registry! {
                 types: [Point, Color],
                 constants: [
                     /// The ratio of a circle's circumference to its diameter.
-                    PI: f64 = 3.141592653589793,
+                    PI: f64 = 3.141_592_653_589_793,
                     /// Maximum number of vertices.
                     MAX_VERTICES: i32 = 1024,
                 ],
                 modules: [
                     mod utils {
                         doc: "Utility helpers",
-                        functions: [greet],
+                        functions: [greet, shout],
                     },
                 ],
             },
@@ -233,6 +349,18 @@ fn unit_enum_and_variant() {
 }
 
 #[test]
+fn payload_enum_emits_variant_with_record_case() {
+    let wit = generate();
+    // Struct cases synthesize a record, emitted before the variant.
+    assert!(wit.contains("record event-move {"), "got:\n{wit}");
+    assert!(wit.contains("x: f64,"), "got:\n{wit}");
+    assert!(wit.contains("variant event {"), "got:\n{wit}");
+    assert!(wit.contains("idle,"), "got:\n{wit}");
+    assert!(wit.contains("scroll(f64),"), "got:\n{wit}");
+    assert!(wit.contains("move(event-move),"), "got:\n{wit}");
+}
+
+#[test]
 fn free_functions() {
     let wit = generate();
     assert!(
@@ -243,12 +371,29 @@ fn free_functions() {
         wit.contains("greet: func(name: string) -> string;"),
         "got:\n{wit}"
     );
+    // `Cow<'a, str>` lowers as `string`: the lifetime is text-neutral.
+    assert!(
+        wit.contains("shout: func(text: string) -> string;"),
+        "got:\n{wit}"
+    );
     assert!(
         wit.contains("midpoint: func(a: borrow<point>, b: borrow<point>) -> point;"),
         "got:\n{wit}"
     );
+    // Fallible WITHOUT a declared kind: fallibility is explicit in the
+    // descriptor (`error_kind` presence used to be a wrong proxy that
+    // rendered this signature infallible) — guests see a real `result`.
     assert!(
-        wit.contains("parse-point: func(text: string) -> result<point, string>;"),
+        wit.contains("parse-point: func(text: string) -> result<point, script-error>;"),
+        "got:\n{wit}"
+    );
+    // The shared error record is defined once in the interface.
+    assert!(wit.contains("record script-error {"), "got:\n{wit}");
+    assert!(
+        wit.contains("kind: option<string>,")
+            && wit.contains("message: string,")
+            && wit.contains("type-name: string,")
+            && wit.contains("chain: list<string>,"),
         "got:\n{wit}"
     );
     assert!(
@@ -520,3 +665,366 @@ fn stream_and_future_types_emit() {
     );
     assert!(wit.contains("value: stream<s32>,"), "got:\n{wit}");
 }
+
+// ---------------------------------------------------------------------------
+// Foreign interfaces
+// ---------------------------------------------------------------------------
+
+#[test]
+fn foreign_interface_is_emitted() {
+    let wit = generate();
+    assert!(
+        wit.contains("/// Host-side notifications.\ninterface notifier {"),
+        "got:\n{wit}"
+    );
+    // The `&self` receiver is dropped; params render normally.
+    assert!(
+        wit.contains("notify: func(message: string);"),
+        "got:\n{wit}"
+    );
+    // Owned `Point` param pulls a `use` from its defining interface. A
+    // fallible FOREIGN method carries the same `script-error` err arm as a
+    // provided one — the guest's implementation authors the record, lifted
+    // host-side into `ForeignFailure`.
+    assert!(wit.contains("use geometry.{point};"), "got:\n{wit}");
+    assert!(wit.contains("/// Errors: IoError"), "got:\n{wit}");
+    assert!(
+        wit.contains("moved: func(to: point) -> result<u32, script-error>;"),
+        "got:\n{wit}"
+    );
+    // The record is therefore defined in the foreign interface too.
+    let notifier = wit.split("interface notifier {").nth(1).expect("notifier");
+    assert!(
+        notifier.contains("record script-error {"),
+        "got:\n{notifier}"
+    );
+    assert!(wit.contains("flush: async func();"), "got:\n{wit}");
+}
+
+#[test]
+fn world_lists_foreign_interfaces_per_perspective() {
+    let wit = generate();
+    assert!(wit.contains("import geometry;"), "got:\n{wit}");
+    assert!(wit.contains("export notifier;"), "got:\n{wit}");
+    assert!(!wit.contains("import notifier;"), "got:\n{wit}");
+
+    // With the world targeted by the haphe program itself, the polarity flips.
+    let generator =
+        WitGenerator::new("haphe:demo").with_world_perspective(haphe_wit::WorldPerspective::Own);
+    let output = haphe::generate(&generator, &REGISTRY).unwrap();
+    let wit = String::from_utf8(output.files[0].content.clone()).unwrap();
+    assert!(wit.contains("export geometry;"), "got:\n{wit}");
+    assert!(wit.contains("import notifier;"), "got:\n{wit}");
+}
+
+// ---------------------------------------------------------------------------
+// Trait projections (interusability)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn resource_trait_projections_emit() {
+    let wit = generate();
+    // Point: PartialEq + Display project as members.
+    assert!(
+        wit.contains("eq: func(other: borrow<point>) -> bool;"),
+        "got:\n{wit}"
+    );
+    assert!(wit.contains("to-string: func() -> string;"), "got:\n{wit}");
+    // Buffer: the full table.
+    assert!(
+        wit.contains("add: func(rhs: borrow<buffer>) -> buffer;"),
+        "got:\n{wit}"
+    );
+    assert!(
+        wit.contains("eq: func(other: borrow<buffer>) -> bool;"),
+        "got:\n{wit}"
+    );
+    assert!(
+        wit.contains("to-debug-string: func() -> string;"),
+        "got:\n{wit}"
+    );
+    assert!(wit.contains("hash: func() -> u64;"), "got:\n{wit}");
+    assert!(wit.contains("at: func(index: s64) -> s64;"), "got:\n{wit}");
+    assert!(
+        wit.contains("set-at: func(index: s64, value: s64);"),
+        "got:\n{wit}"
+    );
+    assert!(wit.contains("items: func() -> list<s64>;"), "got:\n{wit}");
+    assert!(wit.contains("length: func() -> u64;"), "got:\n{wit}");
+    assert!(
+        wit.contains("default: static func() -> buffer;"),
+        "got:\n{wit}"
+    );
+    // The snapshot semantics are documented in the output.
+    assert!(wit.contains("Eager snapshot"), "got:\n{wit}");
+}
+
+#[test]
+fn record_trait_projections_emit_as_interface_functions() {
+    let wit = generate();
+    assert!(
+        wit.contains("size-eq: func(this: size, other: size) -> bool;"),
+        "got:\n{wit}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Record properties: a struct whose only callable surface is computed
+// properties keeps value semantics — it lowers as a record, its accessors
+// projected as interface functions.
+// ---------------------------------------------------------------------------
+
+/// A measurement with computed accessors only.
+#[derive(Script, Clone)]
+#[script(methods)]
+struct Meter {
+    raw: f64,
+}
+
+#[script]
+impl Meter {
+    #[script(getter)]
+    fn level(&self) -> f64 {
+        self.raw
+    }
+
+    #[script(setter)]
+    fn set_level(&mut self, value: f64) {
+        self.raw = value;
+    }
+
+    #[script(getter)]
+    fn doubled(&self) -> f64 {
+        self.raw * 2.0
+    }
+}
+
+haphe::registry! {
+    static METER_REGISTRY = {
+        structs: [Meter],
+        modules: [
+            mod meters { types: [Meter] },
+        ],
+    };
+}
+
+#[test]
+fn property_only_structs_lower_as_records_with_projected_accessors() {
+    let generator = WitGenerator::new("haphe:demo");
+    let output = haphe::generate(&generator, &METER_REGISTRY).expect("generation succeeds");
+    let wit = String::from_utf8_lossy(&output.files[0].content).to_string();
+    assert!(wit.contains("record meter"), "got:\n{wit}");
+    assert!(!wit.contains("resource meter"), "got:\n{wit}");
+    assert!(
+        wit.contains("meter-level: func(this: meter) -> f64;"),
+        "got:\n{wit}"
+    );
+    assert!(
+        wit.contains("meter-set-level: func(this: meter, value: f64) -> meter;"),
+        "got:\n{wit}"
+    );
+    // Readonly property: getter only.
+    assert!(
+        wit.contains("meter-doubled: func(this: meter) -> f64;"),
+        "got:\n{wit}"
+    );
+    assert!(!wit.contains("meter-set-doubled"), "got:\n{wit}");
+}
+
+// ---------------------------------------------------------------------------
+// Generic self types: a static generic method on a generic resource composes
+// the resource instantiation's environment with the method's own.
+// ---------------------------------------------------------------------------
+
+/// A generic gauge resource.
+#[cfg(feature = "generics")]
+#[derive(Script, Clone)]
+#[script(thread_safety = send_sync, methods)]
+struct Gauge2<T: haphe::FromScript + haphe::IntoScript + haphe::HapheType + Clone + Send + Sync> {
+    #[script(skip)]
+    v: T,
+}
+
+#[cfg(feature = "generics")]
+#[script]
+impl<T: haphe::FromScript + haphe::IntoScript + haphe::HapheType + Clone + Send + Sync> Gauge2<T> {
+    #[script(constructor)]
+    fn new(v: T) -> Self {
+        Gauge2 { v }
+    }
+
+    /// `base` is typed by the SELF parameter, `k` by the method's own.
+    #[script(instantiate(f64))]
+    fn mix<U>(&self, base: T, k: U) -> U {
+        let _ = base;
+        k
+    }
+}
+
+#[cfg(feature = "generics")]
+haphe::registry! {
+    static GAUGE2_REGISTRY = {
+        structs: [Gauge2<i64>],
+        modules: [
+            mod gauges { types: [Gauge2<i64>] },
+        ],
+    };
+}
+
+#[cfg(feature = "generics")]
+#[test]
+fn generic_resource_composes_method_instantiation_envs() {
+    let generator = WitGenerator::new("haphe:demo");
+    let output = haphe::generate(&generator, &GAUGE2_REGISTRY).expect("generation succeeds");
+    let wit = String::from_utf8_lossy(&output.files[0].content).to_string();
+    assert!(wit.contains("resource gauge2-s64"), "got:\n{wit}");
+    // T substitutes from the resource instance, U from the method's own
+    // instantiation.
+    assert!(
+        wit.contains("mix-f64: func(base: s64, k: f64) -> f64;"),
+        "got:\n{wit}"
+    );
+}
+
+// A dyn method on a generic self type: self-parameter positions render
+// concretely (pass-through); only the method's own parameter becomes a
+// dispatcher variant.
+#[cfg(all(feature = "generics", feature = "dyn-generics"))]
+#[derive(Script, Clone)]
+#[script(thread_safety = send_sync, methods)]
+struct Gauge3<T: haphe::FromScript + haphe::IntoScript + haphe::HapheType + Clone + Send + Sync> {
+    #[script(skip)]
+    v: T,
+}
+
+#[cfg(all(feature = "generics", feature = "dyn-generics"))]
+#[script]
+impl<T: haphe::FromScript + haphe::IntoScript + haphe::HapheType + Clone + Send + Sync> Gauge3<T> {
+    #[script(constructor)]
+    fn new(v: T) -> Self {
+        Gauge3 { v }
+    }
+
+    #[script(dyn, instantiate(bool), instantiate(String))]
+    fn pick<U>(&self, base: T, flag: U) -> U {
+        let _ = base;
+        flag
+    }
+}
+
+#[cfg(all(feature = "generics", feature = "dyn-generics"))]
+haphe::registry! {
+    static GAUGE3_REGISTRY = {
+        structs: [Gauge3<i64>],
+        modules: [
+            mod gauges3 { types: [Gauge3<i64>] },
+        ],
+    };
+}
+
+#[cfg(all(feature = "generics", feature = "dyn-generics"))]
+#[test]
+fn generic_self_dyn_dispatcher_passes_self_typed_positions_through() {
+    let generator = WitGenerator::new("haphe:demo");
+    let output = haphe::generate(&generator, &GAUGE3_REGISTRY).expect("generation succeeds");
+    let wit = String::from_utf8_lossy(&output.files[0].content).to_string();
+    // The self-typed position is concrete; the method's own is a variant.
+    // The identically-shaped result variant dedups onto the flag's.
+    assert!(
+        wit.contains(
+            "pick-dyn: func(base: s64, flag: gauge3-s64-pick-dyn-flag) -> gauge3-s64-pick-dyn-flag;"
+        ),
+        "got:\n{wit}"
+    );
+    assert!(
+        wit.contains("variant gauge3-s64-pick-dyn-flag"),
+        "got:\n{wit}"
+    );
+    assert!(wit.contains("%bool(bool)"), "got:\n{wit}");
+    // The static monomorphs remain, self positions concrete.
+    assert!(
+        wit.contains("pick-bool: func(base: s64, flag: bool) -> bool;"),
+        "got:\n{wit}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Receiver-less associated functions: emitted as `static func` members;
+// their live dispatch is pinned in tests/runtime.rs. Newtype-typed ones
+// register through trait-presence dispatch and render over the carried type.
+// ---------------------------------------------------------------------------
+
+/// A transparent bool newtype: crosses as a native boolean.
+#[derive(Script, Clone, Copy)]
+#[script(transparent)]
+struct Woven(bool);
+
+#[derive(Script, Clone)]
+#[script(methods)]
+struct Fabric {
+    n: i64,
+}
+
+#[script]
+impl Fabric {
+    fn origin() -> i64 {
+        0
+    }
+
+    fn read(&self) -> i64 {
+        self.n
+    }
+
+    fn flipped(flag: Woven) -> Woven {
+        Woven(!flag.0)
+    }
+
+    #[script(error_kind = "MakeError")]
+    fn checked_flip(flag: Woven) -> Result<Woven, TextError> {
+        if flag.0 {
+            Ok(Woven(false))
+        } else {
+            Err(TextError("already off".into()))
+        }
+    }
+}
+
+haphe::registry! {
+    static FABRIC_REGISTRY = {
+        structs: [Fabric],
+        modules: [
+            mod fabrics { types: [Fabric] },
+        ],
+    };
+}
+
+#[test]
+fn receiverless_associated_fns_emit_as_static_members() {
+    let generator = WitGenerator::new("haphe:demo");
+    let output = haphe::generate(&generator, &FABRIC_REGISTRY).expect("generation succeeds");
+    let wit = String::from_utf8_lossy(&output.files[0].content).to_string();
+    assert!(wit.contains("origin: static func() -> s64;"), "got:\n{wit}");
+    // Newtype-typed receiver-less fns render over the carried bool; the
+    // fallible one is guest-visible.
+    assert!(
+        wit.contains("flipped: static func(flag: bool) -> bool;"),
+        "got:\n{wit}"
+    );
+    assert!(
+        wit.contains("checked-flip: static func(flag: bool) -> result<bool, script-error>;"),
+        "got:\n{wit}"
+    );
+}
+
+/// A message-only fixture error: `String` itself no longer crosses (host
+/// errors must implement `std::error::Error`).
+#[derive(Debug)]
+struct TextError(String);
+
+impl std::fmt::Display for TextError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for TextError {}

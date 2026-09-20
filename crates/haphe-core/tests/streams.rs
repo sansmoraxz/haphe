@@ -26,7 +26,7 @@ static STRUCTS: [StructDescriptor; 1] = [StructDescriptor {
     thread_safety: ThreadSafety::SEND_SYNC,
     generic_params: &[],
 }];
-static REGISTRY: TypeRegistry = TypeRegistry::new(&STRUCTS, &[], &[], &[], &[]);
+static REGISTRY: TypeRegistry = TypeRegistry::new(&STRUCTS, &[], &[], &[], &[], &[]);
 
 #[test]
 fn streams_capability_accepts_and_rejects() {
@@ -58,6 +58,9 @@ fn module_stream_fn_rejected_without_capability() {
         name: "subscribe",
         doc: None,
         receiver: None,
+        generic_params: &[],
+        instantiations: &[],
+        dispatch: haphe_core::Dispatch::Static,
         params: &[ParamDescriptor {
             name: "topic",
             ty: &TypeDescriptor::String,
@@ -67,6 +70,7 @@ fn module_stream_fn_rejected_without_capability() {
         return_ownership: Ownership::Owned,
         is_async: false,
         error_kind: None,
+        fallible: false,
     }];
     static MODULES: [ModuleDescriptor; 1] = [ModuleDescriptor {
         name: "events",
@@ -75,8 +79,9 @@ fn module_stream_fn_rejected_without_capability() {
         type_ids: &[],
         submodules: &[],
         constants: &[],
+        function_instantiations: &[],
     }];
-    static REGISTRY: TypeRegistry = TypeRegistry::new(&[], &[], &[], &MODULES, &[]);
+    static REGISTRY: TypeRegistry = TypeRegistry::new(&[], &[], &[], &MODULES, &[], &[]);
 
     let validated = REGISTRY.validate().unwrap();
     let errors = BackendCapabilities::ALL
@@ -114,7 +119,7 @@ static FUT_STRUCTS: [StructDescriptor; 1] = [StructDescriptor {
     thread_safety: ThreadSafety::SEND_SYNC,
     generic_params: &[],
 }];
-static FUT_REGISTRY: TypeRegistry = TypeRegistry::new(&FUT_STRUCTS, &[], &[], &[], &[]);
+static FUT_REGISTRY: TypeRegistry = TypeRegistry::new(&FUT_STRUCTS, &[], &[], &[], &[], &[]);
 
 /// Streams and futures are independent capabilities: disabling one leaves
 /// the other accepted.
@@ -142,4 +147,73 @@ fn stream_and_future_capabilities_are_independent() {
         )),
         "got: {errors:?}"
     );
+}
+
+/// `check` reports EVERY offending function, not just the first: two
+/// stream-parameter methods each get their own error.
+#[test]
+fn capability_check_reports_every_offending_function() {
+    use haphe_core::{FunctionDescriptor, Ownership, ParamDescriptor};
+    static UNIT: TypeDescriptor = TypeDescriptor::Unit;
+    static PARAMS: [ParamDescriptor; 1] = [ParamDescriptor {
+        name: "events",
+        ty: &STREAM_I32,
+        ownership: Ownership::Owned,
+    }];
+    static METHODS: [FunctionDescriptor; 2] = [
+        FunctionDescriptor {
+            name: "watch_a",
+            doc: None,
+            receiver: Some(haphe_core::Receiver::Ref),
+            generic_params: &[],
+            instantiations: &[],
+            dispatch: haphe_core::Dispatch::Static,
+            params: &PARAMS,
+            return_type: &UNIT,
+            return_ownership: Ownership::Owned,
+            is_async: false,
+            error_kind: None,
+            fallible: false,
+        },
+        FunctionDescriptor {
+            name: "watch_b",
+            doc: None,
+            receiver: Some(haphe_core::Receiver::Ref),
+            generic_params: &[],
+            instantiations: &[],
+            dispatch: haphe_core::Dispatch::Static,
+            params: &PARAMS,
+            return_type: &UNIT,
+            return_ownership: Ownership::Owned,
+            is_async: false,
+            error_kind: None,
+            fallible: false,
+        },
+    ];
+    static STRUCTS: [StructDescriptor; 1] = [StructDescriptor {
+        id: TypeId::new("test::Watcher"),
+        name: "Watcher",
+        doc: None,
+        fields: &[],
+        methods: &METHODS,
+        constructors: &[],
+        properties: &[],
+        trait_impls: &[],
+        thread_safety: ThreadSafety::SEND_SYNC,
+        generic_params: &[],
+    }];
+    static REG: TypeRegistry = TypeRegistry::new(&STRUCTS, &[], &[], &[], &[], &[]);
+    let validated = REG.validate().unwrap();
+    let errors = BackendCapabilities::ALL
+        .with_streams(false)
+        .check(&validated)
+        .unwrap_err();
+    let offenders: Vec<&str> = errors
+        .iter()
+        .filter_map(|e| match e {
+            CompatibilityError::UnsupportedStream { context, .. } => Some(*context),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(offenders, ["watch_a", "watch_b"], "got: {errors:?}");
 }

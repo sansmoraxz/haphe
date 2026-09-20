@@ -1,4 +1,4 @@
-//! Integration test: registry → validate → LuaBinder → Lua runtime.
+//! Integration test: registry → validate → `LuaBinder` → Lua runtime.
 
 use haphe::{
     ConstantDescriptor, FieldDescriptor, FunctionDescriptor, ModuleDescriptor, Ownership,
@@ -45,6 +45,9 @@ static ADD_FN: FunctionDescriptor<'static> = FunctionDescriptor {
     name: "add",
     doc: Some("Adds two integers."),
     receiver: None,
+    generic_params: &[],
+    instantiations: &[],
+    dispatch: haphe::Dispatch::Static,
     params: &[
         ParamDescriptor {
             name: "a",
@@ -61,6 +64,7 @@ static ADD_FN: FunctionDescriptor<'static> = FunctionDescriptor {
     return_ownership: Ownership::Owned,
     is_async: false,
     error_kind: None,
+    fallible: false,
 };
 
 static PI_CONST: ConstantDescriptor<'static> = ConstantDescriptor {
@@ -98,6 +102,7 @@ static INNER_MODULE: ModuleDescriptor<'static> = ModuleDescriptor {
     type_ids: &[],
     submodules: &[],
     constants: &[],
+    function_instantiations: &[],
 };
 
 static MATH_MODULE: ModuleDescriptor<'static> = ModuleDescriptor {
@@ -107,9 +112,11 @@ static MATH_MODULE: ModuleDescriptor<'static> = ModuleDescriptor {
     type_ids: &[TypeId::new("test::Point")],
     submodules: &[INNER_MODULE],
     constants: &[PI_CONST, MAX_CONST, ENABLED_CONST, NAME_CONST],
+    function_instantiations: &[],
 };
 
-static REGISTRY: TypeRegistry<'static> = TypeRegistry::new(&[POINT], &[], &[], &[MATH_MODULE], &[]);
+static REGISTRY: TypeRegistry<'static> =
+    TypeRegistry::new(&[POINT], &[], &[], &[MATH_MODULE], &[], &[]);
 
 #[test]
 fn module_table_is_registered_as_global() {
@@ -178,10 +185,7 @@ fn function_stubs_error_with_message() {
     let result: mlua::Result<()> = lua.load("math.add(1, 2)").exec();
     let err = result.unwrap_err();
     let msg = err.to_string();
-    assert!(
-        msg.contains("not yet implemented"),
-        "unexpected error: {msg}"
-    );
+    assert!(msg.contains("not bound"), "unexpected error: {msg}");
 }
 
 #[test]

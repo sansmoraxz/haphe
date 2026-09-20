@@ -1,0 +1,5 @@
+error: `dyn` here needs explicit `instantiate(...)` declarations: the default candidate set applies only to single-parameter generics
+ --> tests/ui/dyn_zero_instantiations.rs:5:10
+  |
+5 | #[script(dyn)]
+  |          ^^^

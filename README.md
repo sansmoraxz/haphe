@@ -4,9 +4,15 @@ Describe Rust types once, bind them into any embedded scripting runtime.
 
 haphe provides a language-agnostic IR for Rust types, functions, and modules.
 Backend crates implement `RuntimeBinder` to register types into a live
-scripting runtime (mlua, rhai, boa, steel, etc.). The binding code matches
-what you'd write by hand — haphe adds nothing to your runtime binary beyond
-the registration calls themselves.
+scripting runtime. The binding code matches what you'd write by hand — haphe
+adds nothing to your runtime binary beyond the registration calls themselves.
+
+Two backends live in this workspace:
+
+- [`haphe-lua`](crates/haphe-lua) — mlua: live Lua registration plus LuaLS
+  `---@meta` declaration stubs;
+- [`haphe-wit`](crates/haphe-wit) — WebAssembly Component Model: `.wit`
+  document generation plus live wasmtime host binding.
 
 ## Quickstart: derive the descriptors
 
@@ -58,13 +64,62 @@ runtimes may or may not be multithreaded).
 Descriptors can also be written by hand — the derive is a convenience layer
 over the same const-constructible IR.
 
+## Surfaces
+
+The full declaration matrix binds — every declared surface either registers,
+fails with a descriptive compile/bind error, or is descriptor-only by a
+documented rule; nothing is silently dropped:
+
+- **methods** in every receiver shape (`&self`, `&mut self`, consuming
+  `self`, receiver-less associated fns), sync and `async`, plus
+  constructors, computed properties (`getter`/`setter`), and free functions —
+  named, or declared inline in `registry!` as annotated non-capturing
+  closures (`double: |x: i64| -> i64 { x * 2 }`), which expand into
+  equivalent free fns inside generated Rust modules mirroring the registry
+  tree (`geometry::double`);
+- **fallible surfaces** — a `Result<T, E>` return describes `T`; `Err`
+  crosses as a structured error (below). `E` must implement
+  `std::error::Error + Send + Sync`;
+- **trait declarations** (`traits(Display, PartialEq, Add, IntoIterator, …)`)
+  are verified at compile time and mapped to each runtime's native construct;
+- **enums** — unit enums (string- or `#[repr]`-integer-represented), payload
+  variants, `script_bitflags!` flag sets, and enum methods;
+- **generics** — declared `instantiate(...)` monomorphs dispatch statically;
+  `#[script(dyn, ...)]` asks the backend to pick the matching instantiation
+  from the incoming values at call time (a capability backends opt into);
+- **std types** — primitives, containers (`Vec`, maps, sets, tuples,
+  `Option`), paths, network/time types, transparent carriers
+  (`Box`/`Rc`/`Arc`/`Cow`), and transparent primitive newtypes, spelled bare
+  or through explicit `std::` paths. Composites with `&str`/`&Path` elements
+  cross OUTBOUND only (return types, `readonly` fields with `'static`
+  references, getter-only properties) — inbound positions need owned
+  element types and say so at compile time;
+- **the foreign direction** — `#[script(foreign)]` traits are implemented by
+  the script/guest side and called from Rust through a generated handle.
+
+Signatures the syntactic whitelist can't judge (e.g. methods over
+transparent primitive newtypes) register through compile-time
+trait-presence dispatch: a real registration when the bridge traits hold, a
+no-op otherwise — never a broken binding.
+
+## Errors
+
+A fallible implementation's error crosses the boundary **intact**:
+`ScriptCallError::Callee` carries the original error as
+`Arc<dyn std::error::Error + Send + Sync>` plus the declared `error_kind`
+hint and the concrete type's name. Rust-side embedders `downcast_ref` to the
+concrete type and walk `source()`; each backend renders data (message, kind,
+type name, cause chain) into its native error construct at its own boundary.
+The same applies in reverse: a structured failure from a script-side
+implementation reaches the Rust caller as a `haphe::ForeignFailure` inside
+`ForeignErrorKind::Call`.
+
 ## Architecture
 
 ### Embedded Runtime Model
 
-The
-host contains the function bodies; the scripting engine needs types,
-methods, and constructors registered into its API.
+The embedding program contains the function bodies; the scripting engine
+needs types, methods, and constructors registered into its API.
 
 ```rust
 // 1. Describe types (const-constructed, compile-time)
@@ -78,7 +133,7 @@ let validated = REGISTRY.validate()?;
 binder.bind(&validated, &mut lua_runtime)?;
 ```
 
-Binding artifact files (`.pyi` type stubs, `.d.ts` declarations) are a
+Binding artifact files (LuaLS `---@meta` stubs, `.wit` documents) are a
 secondary concern handled by `BindingGenerator`.
 
 ### Zero-Cost Design

@@ -4,9 +4,11 @@ use proc_macro::TokenStream;
 
 mod bind;
 mod derive;
+mod foreign;
 mod freefn;
 mod imp;
 mod registry;
+mod std_types;
 mod verify;
 
 /// Derive macro generating scripting descriptors for a struct or enum.
@@ -48,13 +50,25 @@ mod verify;
 ///
 /// assert_eq!(<Meters as HapheType>::DESCRIPTOR, <f64 as HapheType>::DESCRIPTOR);
 /// ```
-/// - `traits(...)` — standard traits to expose, verified at compile time:
-///   `Display`, `Debug`, `Hash`, `PartialEq`, `Eq`, `PartialOrd`, `Ord`,
-///   `Clone`, `Default`, `Add`, `Sub`, `Mul`, `Div`, `Rem`, `Neg`, `Index`,
-///   `IndexMut`, `Iterator`, `IntoIterator`. Operator traits accept named
-///   type arguments (e.g. `Add(rhs = f64, output = Self)`), defaulting to
-///   `Self`; `Index`/`IndexMut` require `index` and `output`;
+/// - `traits(...)` — traits to expose, verified at compile time: `Display`,
+///   `ToString` (string concatenation), `Debug`, `Hash`, `PartialEq`, `Eq`,
+///   `PartialOrd`, `Ord`, `Clone`, `Default`, `Add`, `Sub`, `Mul`, `Div`,
+///   `Rem`, `IDiv`, `Mod`, `Neg`, `BitAnd`, `BitOr`, `BitXor`, `Shl`, `Shr`,
+///   `Not`, `Pow`, `Call`, `AsyncCall`, `Index`, `IndexMut`, `Iterator`,
+///   `IntoIterator`. `Call(args = (A, B), output = O)` exposes invocation
+///   via the haphe-provided `ops::Call` trait (`args` is always a tuple);
+///   `AsyncCall` is its awaiting sibling, requires an explicit
+///   `thread_safety`, and is gated by the backend's async capability. Operator traits accept
+///   named type arguments (e.g. `Add(rhs = f64, output = Self)`), defaulting
+///   to `Self`; `Index`/`IndexMut` require `index` and `output`;
 ///   `Iterator`/`IntoIterator` require `item`.
+///
+///   Operator declarations bind against haphe's `ops` traits, each a blanket
+///   extension of its `core::ops` counterpart — implementing the std trait
+///   is all a type needs. `Pow`, `IDiv` (floor division), and `Mod` (floor
+///   modulo) have no std counterpart: implement the `haphe::ops` trait
+///   directly (all provided for the standard numeric types), forwarding to
+///   a third-party impl if that is where the behavior lives.
 /// - `methods` — include the type's `#[script] impl` block.
 ///
 /// # Field attributes
@@ -86,7 +100,7 @@ mod verify;
 #[proc_macro_derive(Script, attributes(script))]
 pub fn derive_script(input: TokenStream) -> TokenStream {
     let input = syn::parse_macro_input!(input as syn::DeriveInput);
-    derive::expand(input).into()
+    derive::expand(&input).into()
 }
 
 /// Attribute macro exposing an `impl` block or a free function to scripting
@@ -112,6 +126,119 @@ pub fn derive_script(input: TokenStream) -> TokenStream {
 ///
 /// On a free function, the same options are given on the attribute itself
 /// (e.g. `#[script(rename = "name")]`).
+///
+/// # Generic functions
+///
+/// A generic free function declares each concrete use with a repeatable
+/// `instantiate(...)` option; the descriptor records the parameters and
+/// instantiations, and binding registers one monomorphized wrapper per
+/// instantiation (each identified by its type arguments):
+///
+/// ```
+/// use haphe::script;
+///
+/// #[script(instantiate(i64), instantiate(String))]
+/// fn echo<T>(value: T) -> T { value }
+/// ```
+///
+/// Whether a backend accepts generic functions is governed by its generics
+/// capability.
+///
+/// ## Dynamic dispatch
+///
+/// Adding `dyn` switches the generic to dynamic dispatch: the backend scans
+/// the declared instantiations at call time and picks the candidate whose
+/// type arguments match the incoming values (exact matches first, then
+/// coercible, declaration order breaking ties; a rejected conversion falls
+/// through to the remaining candidates). On a single-parameter generic,
+/// bare `dyn` auto-instantiates the default bridgeable candidate set — in
+/// dispatch-priority order: `i64`, `f64`, `bool`, `String`, `char` — and
+/// the function's bounds must hold for all of them; declare explicit
+/// `instantiate(...)` to narrow or extend (it fully replaces the default).
+/// Multi-parameter generics always declare explicitly. Availability is
+/// governed by the backend's `dyn_generics` capability.
+///
+/// ```
+/// use haphe::script;
+///
+/// #[script(dyn)]
+/// fn mirror<T: haphe::FromScript + haphe::IntoScript>(value: T) -> T { value }
+/// ```
+///
+/// The same applies to generic methods in `#[script] impl` blocks, in both
+/// modes: with `instantiate(...)` alone
+/// they dispatch statically — one monomorph per declaration, registered
+/// through the `method_generic*` channels and keyed on `(name, type_args)`
+/// (backends typically mangle a per-monomorph method name) — and with `dyn`
+/// they register one candidate per instantiation through the
+/// receiver-shaped `method_dyn*` channels for the runtime scan. Async
+/// generic functions and methods bind in both modes, through the async
+/// siblings of those channels. Both modes also work on GENERIC self types:
+/// static monomorphs stay keyed on `(name, type_args)` (the registration
+/// surface is per-monomorph, so the self identity is implicit), and `dyn`
+/// candidates carry the self type's instantiation (`SelfInstantiation`) so
+/// the resolver can substitute the type's parameters alongside the method's
+/// own.
+///
+/// ```
+/// use haphe::{Script, script};
+///
+/// #[derive(Script, Clone)]
+/// #[script(methods)]
+/// struct Holder {
+///     total: i64,
+/// }
+///
+/// #[script]
+/// impl Holder {
+///     #[script(dyn)]
+///     fn mirror<T>(&self, value: T) -> T { value }
+/// }
+/// ```
+///
+/// # Foreign traits
+///
+/// `#[script(foreign)]` on a trait declares functions Rust calls *out* to,
+/// with bodies supplied by the embedding host. The macro re-emits the trait
+/// and generates a `{Trait}Handle` struct implementing it: each method
+/// converts its arguments, dispatches through a boxed `ForeignCaller`
+/// (constructed via `ForeignHandle::from_caller`), and converts the result
+/// back. The handle carries the interface descriptor via `ScriptForeign` and
+/// is what `foreign:` entries in [`registry!`] name.
+///
+/// Attribute options: `rename = "Name"` and `thread_safety = none` (the only
+/// supported value — handles are not thread-safe). Traits with `async`
+/// methods must declare `thread_safety` explicitly. Method attributes accept
+/// `rename` and `error_kind`.
+///
+/// Methods take `&self` and owned parameters. A `Result<T, E>` return
+/// surfaces host failures through `E: From<ForeignError>` and is described
+/// to the host as returning `T`; a non-`Result` method panics if the host
+/// call fails.
+///
+/// Traits may declare type parameters (`trait Store<T>`); signatures
+/// reference them and the descriptor stays erased. Each concrete use is
+/// listed in [`registry!`] (`foreign: [StoreHandle<i32>]`), recorded as an
+/// instantiation for backends that monomorphize, and gated by the backend's
+/// generics capability.
+///
+/// Methods may also declare their own type parameters, with concrete uses
+/// listed via `instantiate(...)` on the method. Dispatch passes the type
+/// arguments' descriptors alongside the call, and the emitted trait method
+/// gains the bounds the handle needs (`HapheType + FromScript`, plus
+/// `ScriptValue: From<T>`). Lifetimes, const generics, and parameter
+/// defaults are not supported.
+///
+/// ```
+/// use haphe::{ForeignHandle, ScriptForeign, script};
+///
+/// #[script(foreign)]
+/// pub trait HostHooks {
+///     fn log(&self, message: String);
+/// }
+///
+/// assert_eq!(<HostHooksHandle as ScriptForeign>::DESCRIPTOR.name, "HostHooks");
+/// ```
 ///
 /// # Example
 ///
@@ -173,9 +300,17 @@ pub fn script(args: TokenStream, item: TokenStream) -> TokenStream {
             }
             freefn::expand(item).into()
         }
+        syn::Item::Trait(mut item) => {
+            // Same re-injection as free functions: the outer attribute is
+            // where `foreign`, `rename`, and `thread_safety` live.
+            if !args.is_empty() {
+                item.attrs.push(syn::parse_quote! { #[script(#args)] });
+            }
+            foreign::expand(item).into()
+        }
         other => syn::Error::new_spanned(
             &other,
-            "`#[script]` applies to `impl` blocks and free functions",
+            "`#[script]` applies to `impl` blocks, free functions, and traits",
         )
         .to_compile_error()
         .into(),
@@ -186,7 +321,8 @@ pub fn script(args: TokenStream, item: TokenStream) -> TokenStream {
 /// functions.
 ///
 /// All sections are optional: `structs`, `enums`, `type_aliases` (newtypes
-/// derived with `Script`), and `modules`. A module block accepts `doc`,
+/// derived with `Script`), `modules`, and `foreign` (handle types generated
+/// by `#[script(foreign)]` on traits). A module block accepts `doc`,
 /// `functions`, `types`, `constants` (`NAME: Type = literal`, with optional
 /// doc comments; literal values are checked against the declared type), and
 /// nested `modules`. Functions and types are resolved through their traits,
@@ -232,7 +368,7 @@ pub fn script(args: TokenStream, item: TokenStream) -> TokenStream {
 #[proc_macro]
 pub fn registry(input: TokenStream) -> TokenStream {
     let input = syn::parse_macro_input!(input as registry::RegistryInput);
-    registry::expand(input).into()
+    registry::expand(&input).into()
 }
 mod attrs;
 mod fn_desc;

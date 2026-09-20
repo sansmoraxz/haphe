@@ -7,6 +7,7 @@
 
 use proc_macro2::{Span, TokenStream};
 use quote::quote;
+use syn::ext::IdentExt;
 use syn::spanned::Spanned;
 use syn::{Attribute, Ident, LitStr, Type};
 
@@ -64,6 +65,36 @@ pub struct FnArgs {
     /// `setter` flag or `setter = "property_name"` override.
     pub setter: Option<(Option<LitStr>, Span)>,
     pub error_kind: Option<LitStr>,
+    /// Repeatable `instantiate(T, ...)` declarations for generic functions:
+    /// one entry per declared instantiation, listing its type arguments.
+    pub instantiate: Vec<(Vec<Type>, Span)>,
+    /// `dyn` — dynamic dispatch: the backend scans the declared
+    /// instantiations at call time instead of keying on named monomorphs.
+    pub dyn_dispatch: Option<Span>,
+}
+
+impl FnArgs {
+    /// Bare `dyn` on a single-parameter generic auto-instantiates the default
+    /// bridgeable candidate set (documented order — it is also the dispatch
+    /// tiebreak order). Explicit `instantiate(...)` overrides it entirely;
+    /// multi-parameter generics must declare explicitly (no Cartesian
+    /// default).
+    pub fn inject_bare_dyn_defaults(&mut self, type_param_count: usize) {
+        if let Some(span) = self.dyn_dispatch
+            && self.instantiate.is_empty()
+            && type_param_count == 1
+        {
+            for ty in [
+                syn::parse_quote!(i64),
+                syn::parse_quote!(f64),
+                syn::parse_quote!(bool),
+                syn::parse_quote!(String),
+                syn::parse_quote!(char),
+            ] {
+                self.instantiate.push((vec![ty], span));
+            }
+        }
+    }
 }
 
 /// Arguments accepted on function parameters.
@@ -71,6 +102,14 @@ pub struct FnArgs {
 pub struct ParamArgs {
     pub clone: Option<Span>,
     pub bytes: Option<Span>,
+}
+
+/// Arguments accepted on a foreign trait.
+#[derive(Default)]
+pub struct ForeignArgs {
+    pub foreign: Option<Span>,
+    pub rename: Option<LitStr>,
+    pub thread_safety: Option<(ThreadSafetyKind, Span)>,
 }
 
 /// Accumulates errors so every mistake on an item is reported at once.
@@ -117,7 +156,7 @@ pub fn extract_doc(attrs: &[Attribute]) -> Option<String> {
     if lines.is_empty() {
         None
     } else {
-        while lines.last().is_some_and(|l| l.is_empty()) {
+        while lines.last().is_some_and(std::string::String::is_empty) {
             lines.pop();
         }
         Some(lines.join("\n"))
@@ -125,10 +164,11 @@ pub fn extract_doc(attrs: &[Attribute]) -> Option<String> {
 }
 
 /// `Option<String>` → `Some("...")` / `None` tokens.
-pub fn option_str_tokens(value: &Option<String>) -> TokenStream {
-    match value {
-        Some(text) => quote! { ::core::option::Option::Some(#text) },
-        None => quote! { ::core::option::Option::None },
+pub fn option_str_tokens(value: Option<&str>) -> TokenStream {
+    if let Some(text) = value {
+        quote! { ::core::option::Option::Some(#text) }
+    } else {
+        quote! { ::core::option::Option::None }
     }
 }
 
@@ -187,6 +227,10 @@ fn parse_script_attrs(
         if !attr.path().is_ident("script") {
             continue;
         }
+        // `dyn` is a Rust keyword and would fail nested-meta path parsing;
+        // rewrite bare `dyn` idents to `r#dyn` up front so every site parses
+        // it uniformly (handlers compare unrawed).
+        let attr = keywordize_dyn(attr);
         let result = attr.parse_nested_meta(|meta| {
             let Some(key) = meta.path.get_ident().cloned() else {
                 return Err(syn::Error::new(
@@ -207,6 +251,30 @@ fn parse_script_attrs(
     parse_errors
 }
 
+/// Rewrites top-level bare `dyn` ident tokens inside `#[script(...)]` to
+/// `r#dyn` so path-based nested-meta parsing accepts them.
+fn keywordize_dyn(attr: &Attribute) -> Attribute {
+    let syn::Meta::List(list) = &attr.meta else {
+        return attr.clone();
+    };
+    let tokens: TokenStream = list
+        .tokens
+        .clone()
+        .into_iter()
+        .map(|tt| match &tt {
+            proc_macro2::TokenTree::Ident(ident) if ident == "dyn" => {
+                proc_macro2::TokenTree::Ident(proc_macro2::Ident::new_raw("dyn", ident.span()))
+            }
+            _ => tt,
+        })
+        .collect();
+    let mut list = list.clone();
+    list.tokens = tokens;
+    let mut attr = attr.clone();
+    attr.meta = syn::Meta::List(list);
+    attr
+}
+
 macro_rules! set_once {
     ($errors:expr, $slot:expr, $key:expr, $value:expr) => {
         if $slot.is_some() {
@@ -217,6 +285,10 @@ macro_rules! set_once {
     };
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "one dispatch arm per accepted key; length tracks the attribute surface"
+)]
 pub fn parse_container_args(attrs: &[Attribute], errors: &mut Errors) -> ContainerArgs {
     const ALLOWED: &[&str] = &[
         "rename",
@@ -276,7 +348,19 @@ pub fn parse_container_args(attrs: &[Attribute], errors: &mut Errors) -> Contain
                     // unique.
                     let is_operator = matches!(
                         name.to_string().as_str(),
-                        "Add" | "Sub" | "Mul" | "Div" | "Rem"
+                        "Add"
+                            | "Sub"
+                            | "Mul"
+                            | "Div"
+                            | "Rem"
+                            | "BitAnd"
+                            | "BitOr"
+                            | "BitXor"
+                            | "Shl"
+                            | "Shr"
+                            | "Pow"
+                            | "IDiv"
+                            | "Mod"
                     );
                     if !is_operator && args.traits.iter().any(|t| t.name == name) {
                         return Err(syn::Error::new(
@@ -344,7 +428,7 @@ pub fn parse_field_args(attrs: &[Attribute], errors: &mut Errors) -> FieldArgs {
     }
     if args.skip.is_some() {
         let others = [
-            (args.rename.as_ref().map(|r| r.span()), "rename"),
+            (args.rename.as_ref().map(syn::LitStr::span), "rename"),
             (args.readonly, "readonly"),
             (args.bytes, "bytes"),
         ];
@@ -391,6 +475,8 @@ pub fn parse_fn_args(attrs: &[Attribute], errors: &mut Errors, site: &str) -> Fn
         "getter",
         "setter",
         "error_kind",
+        "instantiate",
+        "dyn",
     ];
     let mut args = FnArgs::default();
     let parse_errors = parse_script_attrs(
@@ -416,6 +502,22 @@ pub fn parse_fn_args(attrs: &[Attribute], errors: &mut Errors, site: &str) -> Fn
             } else if key == "error_kind" {
                 let value: LitStr = meta.value()?.parse()?;
                 set_once!(errors, args.error_kind, &key, value);
+            } else if key.unraw() == "dyn" {
+                set_once!(errors, args.dyn_dispatch, &key, key.span());
+            } else if key == "instantiate" {
+                let content;
+                syn::parenthesized!(content in meta.input);
+                let types = syn::punctuated::Punctuated::<Type, syn::Token![,]>::parse_terminated(
+                    &content,
+                )?;
+                if types.is_empty() {
+                    return Err(syn::Error::new(
+                        key.span(),
+                        "`instantiate(...)` lists at least one type argument",
+                    ));
+                }
+                args.instantiate
+                    .push((types.into_iter().collect(), key.span()));
             } else {
                 return Ok(false);
             }
@@ -441,6 +543,48 @@ pub fn parse_fn_args(attrs: &[Attribute], errors: &mut Errors, site: &str) -> Fn
                 second.0, first.0
             ),
         );
+    }
+    args
+}
+
+pub fn parse_foreign_args(attrs: &[Attribute], errors: &mut Errors) -> ForeignArgs {
+    const ALLOWED: &[&str] = &["foreign", "rename", "thread_safety"];
+    let mut args = ForeignArgs::default();
+    let parse_errors = parse_script_attrs(
+        attrs,
+        |meta| {
+            let key = meta.path.get_ident().cloned().expect("checked by caller");
+            if key == "foreign" {
+                set_once!(errors, args.foreign, &key, key.span());
+            } else if key == "rename" {
+                let value: LitStr = meta.value()?.parse()?;
+                set_once!(errors, args.rename, &key, value);
+            } else if key == "thread_safety" {
+                let value: Ident = meta.value()?.parse()?;
+                let kind = match value.to_string().as_str() {
+                    "none" => ThreadSafetyKind::None,
+                    "send" => ThreadSafetyKind::Send,
+                    "send_sync" => ThreadSafetyKind::SendSync,
+                    other => {
+                        return Err(syn::Error::new(
+                            value.span(),
+                            format!(
+                                "invalid thread_safety `{other}` (expected `none`, `send`, or `send_sync`)"
+                            ),
+                        ));
+                    }
+                };
+                set_once!(errors, args.thread_safety, &key, (kind, value.span()));
+            } else {
+                return Ok(false);
+            }
+            Ok(true)
+        },
+        ALLOWED,
+        "a trait",
+    );
+    for err in parse_errors {
+        errors.push(err);
     }
     args
 }

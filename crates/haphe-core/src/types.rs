@@ -93,6 +93,17 @@ pub enum TypeDescriptor<'a> {
         /// Concrete type arguments, in declaration order.
         args: &'a [TypeDescriptor<'a>],
     },
+    /// A value carried behind a lifetime (`Cow<'a, T>`; plain references in
+    /// a future tranche). The lifetime is carried as declared — `Some` for a
+    /// named signature lifetime, `None` for an anonymous or elided one — and
+    /// each backend decides what to do with it (a runtime without borrow
+    /// semantics treats the value as `inner`, cloning at the boundary).
+    Borrowed {
+        /// The declared lifetime name (without the `'`), when named.
+        lifetime: Option<&'a str>,
+        /// The carried type.
+        inner: &'a TypeDescriptor<'a>,
+    },
     /// The unit type `()`.
     Unit,
     /// A stream of values; `Unit` payload means a bare signal stream.
@@ -108,6 +119,34 @@ pub enum TypeDescriptor<'a> {
     GenericParam(&'a str),
 }
 
+macro_rules! primitive_shorthands {
+    ($($name:ident => $variant:ident),* $(,)?) => {
+        /// Shorthand constants for the primitive descriptors, so descriptor
+        /// literals read `TypeDescriptor::I64` instead of
+        /// `TypeDescriptor::Primitive(PrimitiveType::I64)`.
+        impl TypeDescriptor<'static> {
+            $(pub const $name: Self = Self::Primitive(PrimitiveType::$variant);)*
+        }
+    };
+}
+
+primitive_shorthands! {
+    BOOL => Bool,
+    I8 => I8,
+    I16 => I16,
+    I32 => I32,
+    I64 => I64,
+    I128 => I128,
+    U8 => U8,
+    U16 => U16,
+    U32 => U32,
+    U64 => U64,
+    U128 => U128,
+    F32 => F32,
+    F64 => F64,
+    CHAR => Char,
+}
+
 impl TypeDescriptor<'_> {
     /// Structural equality usable in `const` contexts.
     ///
@@ -118,10 +157,13 @@ impl TypeDescriptor<'_> {
         match (self, other) {
             (T::Primitive(a), T::Primitive(b)) => *a as u8 == *b as u8,
             (T::String, T::String) | (T::Bytes, T::Bytes) | (T::Unit, T::Unit) => true,
+            // Borrowed compares by inner: lifetime names don't change the
+            // script-visible type.
             (T::Option(a), T::Option(b))
             | (T::List(a), T::List(b))
             | (T::Stream(a), T::Stream(b))
-            | (T::Future(a), T::Future(b)) => a.const_eq(b),
+            | (T::Future(a), T::Future(b))
+            | (T::Borrowed { inner: a, .. }, T::Borrowed { inner: b, .. }) => a.const_eq(b),
             (T::Array(a, n), T::Array(b, m)) => *n == *m && a.const_eq(b),
             (T::Map(ka, va), T::Map(kb, vb)) | (T::Result(ka, va), T::Result(kb, vb)) => {
                 ka.const_eq(kb) && va.const_eq(vb)
@@ -190,6 +232,9 @@ pub enum PrimitiveType {
 pub enum TraitImpl<'a> {
     // Formatting / comparison (no associated types)
     Display,
+    /// String conversion (`std::string::ToString`); backends map it to their
+    /// concatenation construct.
+    ToString,
     Debug,
     Hash,
     PartialEq,
@@ -220,7 +265,64 @@ pub enum TraitImpl<'a> {
         rhs: &'a TypeDescriptor<'a>,
         output: &'a TypeDescriptor<'a>,
     },
+    /// Floor modulo via the haphe-provided [`ops::Mod`](crate::ops::Mod)
+    /// trait (std defines none); the result takes the divisor's sign.
+    Mod {
+        rhs: &'a TypeDescriptor<'a>,
+        output: &'a TypeDescriptor<'a>,
+    },
+    /// Floor division via the haphe-provided [`ops::IDiv`](crate::ops::IDiv)
+    /// trait (std defines none); quotient rounds toward negative infinity.
+    IDiv {
+        rhs: &'a TypeDescriptor<'a>,
+        output: &'a TypeDescriptor<'a>,
+    },
+    /// Exponentiation via the haphe-provided [`ops::Pow`](crate::ops::Pow)
+    /// trait (std defines none).
+    Pow {
+        rhs: &'a TypeDescriptor<'a>,
+        output: &'a TypeDescriptor<'a>,
+    },
     Neg {
+        output: &'a TypeDescriptor<'a>,
+    },
+
+    // Bitwise operators (with associated types)
+    BitAnd {
+        rhs: &'a TypeDescriptor<'a>,
+        output: &'a TypeDescriptor<'a>,
+    },
+    BitOr {
+        rhs: &'a TypeDescriptor<'a>,
+        output: &'a TypeDescriptor<'a>,
+    },
+    BitXor {
+        rhs: &'a TypeDescriptor<'a>,
+        output: &'a TypeDescriptor<'a>,
+    },
+    Shl {
+        rhs: &'a TypeDescriptor<'a>,
+        output: &'a TypeDescriptor<'a>,
+    },
+    Shr {
+        rhs: &'a TypeDescriptor<'a>,
+        output: &'a TypeDescriptor<'a>,
+    },
+    Not {
+        output: &'a TypeDescriptor<'a>,
+    },
+
+    /// Callable values via the haphe-provided [`ops::Call`](crate::ops::Call)
+    /// trait (std's `Fn*` traits are not implementable).
+    Call {
+        args: &'a [TypeDescriptor<'a>],
+        output: &'a TypeDescriptor<'a>,
+    },
+    /// Asynchronously callable values via
+    /// [`ops::AsyncCall`](crate::ops::AsyncCall); gated by the backend's
+    /// async capability.
+    AsyncCall {
+        args: &'a [TypeDescriptor<'a>],
         output: &'a TypeDescriptor<'a>,
     },
 
@@ -363,6 +465,11 @@ pub struct EnumDescriptor<'a> {
     pub thread_safety: ThreadSafety,
     /// Generic type parameters declared on this enum.
     pub generic_params: &'a [GenericParam<'a>],
+    /// Numeric script representation, propagated from the Rust `#[repr]`
+    /// integer type (the exact type — backends that can express `u8`
+    /// should). `None` means the enum crosses as its declared case names
+    /// (the default).
+    pub repr: Option<PrimitiveType>,
     /// Whether this enum is a bitflags set: each (unit) variant names one
     /// independent bit, in declaration order. Backends map it to their native
     /// bitset construct.
@@ -372,6 +479,13 @@ pub struct EnumDescriptor<'a> {
 /// A single variant of an enum.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EnumVariant<'a> {
+    /// Numeric discriminant for enums with a numeric script representation
+    /// ([`EnumDescriptor::repr`]): the explicit Rust discriminant, the
+    /// Rust-rule implicit value (previous + 1, starting at 0), or the flag's
+    /// actual bit value for bitflags. `None` on string-represented enums and
+    /// payload variants. Stored as the `i64` bit pattern (`u64` values wrap;
+    /// discriminants must fit 64 bits).
+    pub discriminant: Option<i64>,
     /// Variant name.
     pub name: &'a str,
     /// Optional documentation string.
