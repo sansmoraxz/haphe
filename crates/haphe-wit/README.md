@@ -22,7 +22,8 @@ let output = haphe::generate(&generator, &REGISTRY)?;
 | enum with unit variants only | `enum` |
 | `#[script(flags)]` enum / `haphe::script_bitflags!` type | `flags` (bit positions follow declaration order; composite masks are compile errors) |
 | enum with payload variants | `variant` (single-field cases carry the field directly, multi-field tuple cases a `tuple<...>`, struct cases a synthesized companion `record`) — at runtime a `ScriptValue::Enum { case, payload }` lowers under the case's kebab spelling with its positional payload reassembled per that shape, and a guest variant whose case translates through the registry (and matches the declared shape) lifts back the same way; untranslated variants keep the single-pair map `{ case: payload }` convention |
-| enum methods | free functions `enum-name-method(this: enum-name, ...)` in the owning interface |
+| enum methods | free functions `enum-name-method(this: enum-name, ...)` in the owning interface (receiver-less companions take no `this`) |
+| receiver-less associated fns | `static func` members, dispatched live through the receiver-less `associated*` channels — no resource handle involved (sync, async, generic monomorphs, and the `dyn` dispatcher alike) |
 | type alias | `type x = y;` |
 | module constants | nullary getter functions (value preserved in a doc comment); configurable via `ConstantMode`. Primitive and string constants only: user-type constants (enum cases and payloads have no literal form — `registry!` cannot even declare them) are rejected descriptively at bind |
 | `&T`/`&mut T` params where `T` is a resource | `borrow<t>` |
@@ -324,10 +325,6 @@ every linker definition against the guest component at instantiation.
   (`haphe::GenerateError::Incompatible`).
 - WIT `constructor` cannot be `async`, so an async constructor is emitted as a
   `static async func` returning the resource instead.
-- Receiver-less associated functions emit as `static func` members and
-  dispatch live through the receiver-less `associated*` channels — no
-  resource handle involved (sync, async, generic monomorphs, and the `dyn`
-  dispatcher alike). Enum companions for them take no `this` parameter.
 - Declared `trait_impls` are PROJECTED into WIT-native named functions
   (interusability: every trait a type declares is reachable from guests).
   On resources they are members; on records they are interface-level

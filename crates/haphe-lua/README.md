@@ -9,7 +9,30 @@ a Lua script supplies.
 ## Quickstart
 
 ```rust
+use haphe::{Script, script};
 use haphe_lua::{LuaBinder, bind_fn, bind_type};
+
+/// A 2D point.
+#[derive(Script)]
+#[script(methods)]
+struct Point {
+    x: f64,
+    y: f64,
+}
+
+#[script]
+impl Point {
+    #[script(constructor)]
+    fn new(x: f64, y: f64) -> Self {
+        Point { x, y }
+    }
+}
+
+/// Adds two numbers.
+#[script]
+fn add(a: i64, b: i64) -> i64 {
+    a + b
+}
 
 haphe::registry! {
     pub static REGISTRY = {
@@ -115,6 +138,14 @@ no hand-written mlua code:
   type table like a sync constructor and is awaited when called
   (`Type.connect(...)`), under the same gating as async functions; sync and
   async constructors share one namespace (duplicates are rejected);
+- **associated functions** — a receiver-less fn in a `#[script] impl` lands
+  on the type table next to constructors and is called with no instance:
+  `Meter.flipped(false)`. Sync, async (same gating as async methods), and
+  fallible forms all work; static generic monomorphs live under mangled
+  names (`Tally.first__i64(...)`) and `dyn` generics under the bare name
+  with runtime candidate scanning. Constructors, associated functions, and
+  generic mangles share the type-table namespace — duplicates are rejected
+  loudly;
 - **indexing** — `traits(Index(index = ..., output = ...))` /
   `traits(IndexMut(...))` map to `obj[key]` reads and writes. Registered
   fields and methods win; the custom index is the fallback for misses. Keys
@@ -158,9 +189,12 @@ raises a descriptive error.
 
 ### Generic functions: static vs `dyn` dispatch
 
-Statically-dispatched generics (`#[script(instantiate(...))]` without `dyn`)
-are rejected by this backend — Lua dispatches by name only, so named
-monomorphs would shadow each other.
+Statically-dispatched generic FREE functions (`#[script(instantiate(...))]`
+without `dyn`) are rejected by this backend — module tables dispatch by name
+only, so named monomorphs would shadow each other. Generic METHODS and
+associated functions dispatch statically under mangled per-monomorph names
+instead (`p:first_of__i64(4, 9)`, `Tally.first__string('a', 'b')`) — each
+declared instantiation is its own entry, exact dispatch, no scan.
 
 Declaring `dyn` makes the generic callable by its bare name:
 
@@ -187,11 +221,39 @@ a second accepts coercible matches (e.g. an integer for a float parameter),
 and ties resolve in declaration order. The chosen candidate's conversions
 stay authoritative — if they reject the values the remaining candidates are
 try-called in declaration order, and when nothing accepts, the error lists
-every candidate signature. Async `dyn` functions dispatch the same way.
+every candidate signature. Async `dyn` functions dispatch the same way, and
+so do `dyn` METHODS and associated functions — one entry under the bare name
+(`obj:mirror(5)`, `obj:mirror("hi")`), scanning that member's candidates; on
+a generic self type the resource monomorph's own type arguments join the
+ranking.
 
 `dyn` dispatch rides the `generics` cargo feature (the backend reports the
 `dyn_generics` capability only when it is enabled); without it, `dyn`
 registrations are rejected descriptively.
+
+## Errors
+
+A fallible surface (`Result<T, E>` constructor, method, associated fn, or
+free function; `E: std::error::Error + Send + Sync`) raises a Lua error on
+`Err`. `tostring(e)` renders `"Kind: message"` when the declaration carries
+`#[script(error_kind = "Kind")]`, the bare message otherwise — but the error
+VALUE is the intact `ScriptCallError` crossing as an external error, and the
+`haphe_error` global (installed by `bind()`; `install_error_info(&lua)` for
+à-la-carte `bind_type`/`bind_fn` composition) decodes one caught by `pcall`
+into structured fields:
+
+```lua
+local ok, e = pcall(function() return m:checked_add(big) end)
+local info = haphe_error(e)
+-- info.message  the error's Display rendering
+-- info.kind     the declared error_kind, or nil
+-- info.type     the Rust error type's name
+-- info.chain    rendered source() causes, outermost first
+```
+
+`haphe_error` returns `nil` for anything that isn't a callee error (plain
+string errors, argument conversion failures). Conversion failures stay plain
+string errors — boundary misuse, not a structured outcome.
 
 ## Value conversion
 
@@ -287,8 +349,4 @@ let output = haphe::generate(&LuaDeclGenerator::new(), &REGISTRY)?;
 | `send` | requires `Send` thread safety for bound types; makes the Lua handles `Send` |
 | `error-send` | `Send + Sync` mlua errors |
 | `serialize` | mlua serde integration |
-| `generics` | foreign dispatch for generic interfaces/functions: Lua is dynamic, so one Lua function serves every instantiation (type arguments are ignored). Without it, generic foreign use is a descriptive error. Export-direction generic functions remain unsupported (monomorphs would collide by name). |
-
-## License
-
-Apache-2.0, like all haphe crates.
+| `generics` | generic dispatch, both directions: export-side static generic methods/associated fns (mangled monomorph names) and `dyn` candidate scanning (`dyn_generics` capability); foreign-side generic interfaces/functions (Lua is dynamic, so one Lua function serves every instantiation — type arguments are ignored). Without it, generic use is a descriptive error. Static generic FREE functions remain unsupported in the export direction (module-table monomorphs would collide by name — declare `dyn`). |
