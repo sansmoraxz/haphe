@@ -1,7 +1,8 @@
-//! Empty-table reshaping and container-typed member binding: Lua's `{}` is
-//! shape-ambiguous (one table type), so the binder re-shapes empty arguments
-//! by the DECLARED parameter type; container-typed methods and properties
-//! bind like free functions.
+//! Empty-table conversion and container-typed member binding: Lua's `{}` is
+//! shape-ambiguous (one table type). Core's empty-shape rule accepts either
+//! empty shape at the conversion itself, so `{}` converts wherever a
+//! container is expected — these tests pin that end to end. Container-typed
+//! methods and properties bind like free functions.
 
 #![allow(
     clippy::needless_pass_by_value,
@@ -93,7 +94,7 @@ fn empty_table_crosses_as_empty_map() {
 /// Container-typed METHODS bind (free-fn gate parity), including the
 /// empty-table argument, and a `Vec` return crosses as a sequence table.
 #[test]
-fn container_typed_methods_bind_and_reshape() {
+fn container_typed_methods_bind_and_accept_empty_tables() {
     let (lua, _) = env();
     let out: i64 = lua
         .load("local b = m.Basket.new() return b:add_all({3, 4})")
@@ -197,5 +198,153 @@ mod namespace_gaps {
             ),
             "expected DuplicateMethod, got {err}"
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Nested empties: empty tables inside containers convert recursively
+// ---------------------------------------------------------------------------
+
+/// Counts elements per group; empty groups count zero.
+#[script]
+fn nested_total(groups: Vec<Vec<i64>>) -> i64 {
+    groups.iter().map(|g| g.iter().sum::<i64>()).sum()
+}
+
+/// Sums every list in a map of lists.
+#[script]
+fn grouped_total(groups: std::collections::HashMap<String, Vec<i64>>) -> i64 {
+    groups.values().map(|g| g.iter().sum::<i64>()).sum()
+}
+
+#[test]
+fn nested_empty_tables_follow_the_declared_shape() {
+    let (lua, module) = env();
+    bind_fn::<nested_total>(&lua, &module).unwrap();
+    bind_fn::<grouped_total>(&lua, &module).unwrap();
+
+    // An empty table INSIDE a list-typed element converts too.
+    let out: i64 = lua
+        .load("return m.nested_total({ {}, {1, 2} })")
+        .eval()
+        .unwrap();
+    assert_eq!(out, 3);
+    let out: i64 = lua.load("return m.nested_total({})").eval().unwrap();
+    assert_eq!(out, 0);
+    // ... and inside map VALUES, following the declared value type.
+    let out: i64 = lua
+        .load("return m.grouped_total({ a = {}, b = {4, 5} })")
+        .eval()
+        .unwrap();
+    assert_eq!(out, 9);
+}
+
+// ---------------------------------------------------------------------------
+// A constructor and a method may legally share an exposed name (type-table
+// vs metatable namespaces); `{}` converts correctly for BOTH signatures —
+// core's empty-shape rule needs no per-namespace descriptor pairing
+// ---------------------------------------------------------------------------
+
+#[derive(Script, Clone)]
+#[script(methods)]
+struct Ledger {
+    #[script(skip)]
+    #[allow(dead_code, reason = "read only through the bound methods")]
+    entries: Vec<i64>,
+}
+
+#[script]
+impl Ledger {
+    /// Type-table namespace: `Ledger.reset(seed)` with a LIST parameter.
+    #[script(constructor)]
+    fn reset(seed: Vec<i64>) -> Self {
+        Ledger { entries: seed }
+    }
+
+    /// Metatable namespace: `l:reset(weights)` with a MAP parameter.
+    #[script(rename = "reset")]
+    fn reset_weights(&self, weights: std::collections::HashMap<String, i64>) -> i64 {
+        weights.values().sum::<i64>() + self.entries.iter().sum::<i64>()
+    }
+
+    fn len(&self) -> i64 {
+        self.entries.len() as i64
+    }
+}
+
+#[test]
+fn shared_name_converts_per_signature() {
+    let (lua, module) = env();
+    let ledger = lua.create_table().unwrap();
+    module.set("Ledger", &ledger).unwrap();
+    bind_type::<Ledger>(&lua, &ledger).unwrap();
+
+    // `{}` converts through the CONSTRUCTOR's list param, even though a
+    // method shares the exposed name with a map param.
+    let out: i64 = lua.load("return m.Ledger.reset({}):len()").eval().unwrap();
+    assert_eq!(out, 0);
+    let out: i64 = lua
+        .load("return m.Ledger.reset({7, 8}):len()")
+        .eval()
+        .unwrap();
+    assert_eq!(out, 2);
+    // And the method's `{}` stays a map.
+    let out: i64 = lua
+        .load("local l = m.Ledger.reset({1}) return l:reset({})")
+        .eval()
+        .unwrap();
+    assert_eq!(out, 1);
+    let out: i64 = lua
+        .load("local l = m.Ledger.reset({1}) return l:reset({ a = 4 })")
+        .eval()
+        .unwrap();
+    assert_eq!(out, 5);
+}
+
+// ---------------------------------------------------------------------------
+// Generic self types: the SELF instantiation resolves `T`-typed parameters
+// during reshaping on the static channels (dyn already merged it)
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "generics")]
+mod generic_self {
+    use super::*;
+
+    #[derive(Script, Clone)]
+    #[script(methods)]
+    pub struct Bag<T> {
+        #[script(skip)]
+        #[allow(dead_code, reason = "read only through the bound methods")]
+        pub items: Vec<T>,
+    }
+
+    #[script]
+    impl<T> Bag<T> {
+        #[script(constructor)]
+        fn new() -> Self {
+            Bag { items: Vec::new() }
+        }
+
+        /// Plain method whose parameter is the SELF type's `T`.
+        fn put(&mut self, value: T) -> i64 {
+            self.items.push(value);
+            self.items.len() as i64
+        }
+    }
+
+    /// `Bag<Vec<i64>>`: the monomorphized wrapper's conversion target is
+    /// `Vec<i64>`, so `b:put({})` converts via the empty-shape rule.
+    #[test]
+    fn self_instantiation_resolves_generic_params_on_static_channels() {
+        let lua = Lua::new();
+        let table = lua.create_table().unwrap();
+        lua.globals().set("BagOfLists", &table).unwrap();
+        bind_type::<Bag<Vec<i64>>>(&lua, &table).unwrap();
+
+        let out: i64 = lua
+            .load("local b = BagOfLists.new() b:put({1, 2}) return b:put({})")
+            .eval()
+            .unwrap();
+        assert_eq!(out, 2);
     }
 }

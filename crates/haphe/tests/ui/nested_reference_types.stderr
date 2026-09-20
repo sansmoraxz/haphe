@@ -1,0 +1,11 @@
+error: references inside composite types cannot cross the bridge; use owned element types (e.g. `Vec<String>` instead of `Vec<&str>`)
+ --> tests/ui/nested_reference_types.rs:6:17
+  |
+6 |     labels: Vec<&'static str>,
+  |                 ^
+
+error: references inside composite types cannot cross the bridge; use owned element types (e.g. `Vec<String>` instead of `Vec<&str>`)
+  --> tests/ui/nested_reference_types.rs:11:35
+   |
+11 |     fn label_all(&self, tags: Vec<&str>) -> i64 {
+   |                                   ^

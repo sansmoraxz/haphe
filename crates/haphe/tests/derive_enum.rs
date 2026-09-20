@@ -137,3 +137,20 @@ fn extreme_discriminants_record_exactly() {
         "explicit extreme discriminants must survive parsing"
     );
 }
+
+/// A `repr(u64)` discriminant above `i64::MAX` follows the bridge's u64
+/// policy: it records as the i64 BIT PATTERN.
+#[derive(Script)]
+#[repr(u64)]
+enum WideBits {
+    Top = 18_446_744_073_709_551_615,
+    Zero = 0,
+}
+
+#[test]
+fn u64_discriminants_record_as_bit_pattern() {
+    use haphe::ScriptEnum;
+    let desc = <WideBits as ScriptEnum>::DESCRIPTOR;
+    let discs: Vec<Option<i64>> = desc.variants.iter().map(|v| v.discriminant).collect();
+    assert_eq!(discs, [Some(-1), Some(0)]);
+}

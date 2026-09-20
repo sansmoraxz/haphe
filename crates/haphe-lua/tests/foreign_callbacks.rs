@@ -411,3 +411,75 @@ mod async_dispatch {
             .await;
     }
 }
+
+// ---------------------------------------------------------------------------
+// Empty containers round-trip across the foreign boundary
+// ---------------------------------------------------------------------------
+
+/// Container-shuttling hooks: Lua's `{}` is shape-ambiguous, and core's
+/// empty-shape rule converts it on the RETURN path like arguments.
+#[script(foreign, thread_safety = none)]
+pub trait Shuttle {
+    fn echo_list(&self, items: Vec<i64>) -> Vec<i64>;
+
+    fn echo_map(&self, entries: HashMap<String, i64>) -> HashMap<String, i64>;
+
+    fn empty_list(&self) -> Vec<i64>;
+
+    fn empty_map(&self) -> HashMap<String, i64>;
+
+    fn nested(&self) -> Vec<Vec<i64>>;
+
+    fn list_by_key(&self) -> HashMap<String, Vec<i64>>;
+
+    fn map_by_key(&self) -> HashMap<String, HashMap<String, i64>>;
+}
+
+const SHUTTLE_CALLBACKS: &str = r#"
+return {
+    echo_list = function(items)
+        assert(type(items) == "table", "list arrives as a table")
+        return items
+    end,
+    echo_map = function(entries)
+        assert(type(entries) == "table", "map arrives as a table")
+        return entries
+    end,
+    empty_list = function() return {} end,
+    empty_map = function() return {} end,
+    nested = function() return { {} } end,
+    list_by_key = function() return { a = {}, b = { 1, 2 } } end,
+    map_by_key = function() return { outer = {}, full = { x = 7 } } end,
+}
+"#;
+
+#[test]
+fn empty_containers_round_trip_across_the_foreign_boundary() {
+    let lua = Lua::new();
+    let table: mlua::Table = lua.load(SHUTTLE_CALLBACKS).eval().unwrap();
+    let shuttle: ShuttleHandle = foreign_handle(&lua, &table).unwrap();
+
+    // Outbound empties arrive as empty tables and echo back intact.
+    assert_eq!(shuttle.echo_list(Vec::new()), Vec::<i64>::new());
+    assert_eq!(shuttle.echo_map(HashMap::new()), HashMap::new());
+
+    // Inbound `{}` returns convert per the DECLARED type.
+    assert_eq!(shuttle.empty_list(), Vec::<i64>::new());
+    assert_eq!(shuttle.empty_map(), HashMap::new());
+    assert_eq!(shuttle.nested(), vec![Vec::<i64>::new()]);
+
+    // Map-VALUED nesting on the foreign return path: the empty inner table
+    // follows the declared value type, populated siblings undistorted.
+    let by_key = shuttle.list_by_key();
+    assert_eq!(by_key.get("a"), Some(&Vec::new()));
+    assert_eq!(by_key.get("b"), Some(&vec![1, 2]));
+    let deep = shuttle.map_by_key();
+    assert_eq!(deep.get("outer"), Some(&HashMap::new()));
+    assert_eq!(deep.get("full").and_then(|m| m.get("x")), Some(&7));
+
+    // Populated values are never touched by the empty-shape rule.
+    assert_eq!(shuttle.echo_list(vec![1, 2]), vec![1, 2]);
+    let mut entries = HashMap::new();
+    entries.insert("a".to_string(), 1);
+    assert_eq!(shuttle.echo_map(entries.clone()), entries);
+}

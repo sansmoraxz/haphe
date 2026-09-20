@@ -447,6 +447,12 @@ impl<T: FromScript> FromScript for Vec<T> {
     fn from_script(v: ScriptValue) -> Result<Self, ScriptConvertError> {
         match v {
             ScriptValue::List(list) => list.into_iter().map(T::from_script).collect(),
+            // The empty-shape rule: an empty sequence and an empty
+            // associative container carry identical information, and
+            // runtimes with one aggregate value type cannot tell them
+            // apart — either empty shape converts, losslessly. Conversions
+            // recurse, so nested positions inherit the rule.
+            ScriptValue::Map(entries) if entries.is_empty() => Ok(Vec::new()),
             other => Err(ScriptConvertError {
                 expected: "list",
                 got: other.variant_name(),
@@ -479,6 +485,8 @@ where
                 .into_iter()
                 .map(|(k, v)| V::from_script(v).map(|val| (k, val)))
                 .collect(),
+            // The empty-shape rule (see `Vec`): either empty shape converts.
+            ScriptValue::List(items) if items.is_empty() => Ok(Self::default()),
             other => Err(ScriptConvertError {
                 expected: "map",
                 got: other.variant_name(),

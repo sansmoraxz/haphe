@@ -923,6 +923,128 @@ fn foreign_err_record_lifts_into_foreign_failure() {
 }
 
 // ---------------------------------------------------------------------------
+// Foreign container roundtrips: empty and populated, both directions
+// ---------------------------------------------------------------------------
+
+/// Guest-implemented pantry exercising container roundtrips — the wire
+/// carries maps as `list<tuple<string, s64>>`, so returns must lift back
+/// under the DECLARED type, empty ones included.
+#[script(foreign, thread_safety = none)]
+trait Pantry {
+    /// `items.len() * 100 + weights.len()`: proves what the guest received.
+    fn count_all(&self, items: Vec<i64>, weights: std::collections::HashMap<String, i64>) -> i64;
+    fn empty_items(&self) -> Vec<i64>;
+    /// `stocked = false` returns `{}`; `true` returns `{a: 4, b: 5}`.
+    fn weights(&self, stocked: bool) -> std::collections::HashMap<String, i64>;
+    /// `[ {}, {k: 7} ]` — an empty map nested inside a list.
+    fn crates(&self) -> Vec<std::collections::HashMap<String, i64>>;
+    /// `{outer: {}, full: {k: 7}}` — an empty map nested as a MAP VALUE.
+    fn depot(&self) -> std::collections::HashMap<String, std::collections::HashMap<String, i64>>;
+}
+
+/// Canonical-ABI guest: list results return a pointer to a static
+/// `(ptr, len)` area; map-shaped data is element arrays of
+/// `{string ptr, string len, s64}` (16 bytes each, little-endian).
+const PANTRY_GUEST: &str = r#"
+(component
+  (core module $m
+    (memory (export "mem") 1)
+    (func (export "realloc") (param i32 i32 i32 i32) (result i32) (i32.const 8192))
+    ;; strings: "a"@300 "b"@301 "k"@304
+    (data (i32.const 300) "ab")
+    (data (i32.const 304) "k")
+    ;; stocked elements @448: ("a",4), ("b",5)
+    (data (i32.const 448) "\2c\01\00\00\01\00\00\00\04\00\00\00\00\00\00\00\2d\01\00\00\01\00\00\00\05\00\00\00\00\00\00\00")
+    ;; crates inner element ("k",7) @480
+    (data (i32.const 480) "\30\01\00\00\01\00\00\00\07\00\00\00\00\00\00\00")
+    ;; crates outer elements @520: (64,0) empty inner, (480,1)
+    (data (i32.const 520) "\40\00\00\00\00\00\00\00\e0\01\00\00\01\00\00\00")
+    ;; result areas: stocked weights @1056 (448,2); crates @1104 (520,2)
+    (data (i32.const 1056) "\c0\01\00\00\02\00\00\00")
+    (data (i32.const 1104) "\08\02\00\00\02\00\00\00")
+    ;; depot: strings "outer"@336 "full"@344; outer elements @560:
+    ;; ("outer",(64,0)), ("full",(480,1)); result area @1120 (560,2)
+    (data (i32.const 336) "outer")
+    (data (i32.const 344) "full")
+    (data (i32.const 560) "\50\01\00\00\05\00\00\00\40\00\00\00\00\00\00\00\58\01\00\00\04\00\00\00\e0\01\00\00\01\00\00\00")
+    (data (i32.const 1120) "\30\02\00\00\02\00\00\00")
+    (func (export "count-all") (param i32 i32 i32 i32) (result i64)
+      (i64.add
+        (i64.mul (i64.extend_i32_u (local.get 1)) (i64.const 100))
+        (i64.extend_i32_u (local.get 3))))
+    (func (export "empty-items") (result i32)
+      (i32.store (i32.const 1024) (i32.const 64))
+      (i32.store (i32.const 1028) (i32.const 0))
+      (i32.const 1024))
+    (func (export "weights") (param i32) (result i32)
+      (if (result i32) (i32.eqz (local.get 0))
+        (then
+          (i32.store (i32.const 1040) (i32.const 64))
+          (i32.store (i32.const 1044) (i32.const 0))
+          (i32.const 1040))
+        (else (i32.const 1056))))
+    (func (export "crates") (result i32) (i32.const 1104))
+    (func (export "depot") (result i32) (i32.const 1120)))
+  (core instance $mi (instantiate $m))
+  (func $count-all
+    (param "items" (list s64)) (param "weights" (list (tuple string s64)))
+    (result s64)
+    (canon lift (core func $mi "count-all")
+      (memory (core memory $mi "mem")) (realloc (core func $mi "realloc"))))
+  (func $empty-items (result (list s64))
+    (canon lift (core func $mi "empty-items") (memory (core memory $mi "mem"))))
+  (func $weights (param "stocked" bool) (result (list (tuple string s64)))
+    (canon lift (core func $mi "weights") (memory (core memory $mi "mem"))))
+  (func $crates (result (list (list (tuple string s64))))
+    (canon lift (core func $mi "crates") (memory (core memory $mi "mem"))))
+  (func $depot (result (list (tuple string (list (tuple string s64)))))
+    (canon lift (core func $mi "depot") (memory (core memory $mi "mem"))))
+  (instance $i
+    (export "count-all" (func $count-all))
+    (export "empty-items" (func $empty-items))
+    (export "weights" (func $weights))
+    (export "crates" (func $crates))
+    (export "depot" (func $depot)))
+  (export "haphe:demo/pantry" (instance $i))
+)
+"#;
+
+#[test]
+fn foreign_containers_roundtrip_empty_and_populated() {
+    use std::collections::HashMap;
+    let pantry: PantryHandle = foreign_handle_from_wat(PANTRY_GUEST).unwrap();
+
+    // Outbound: empty containers arrive as zero-length payloads.
+    assert_eq!(pantry.count_all(vec![], HashMap::new()), 0);
+    let mut w = HashMap::new();
+    w.insert("a".to_string(), 1);
+    assert_eq!(pantry.count_all(vec![9, 9, 9], w), 301);
+
+    // Inbound: an empty list lifts as `vec![]`.
+    assert_eq!(pantry.empty_items(), Vec::<i64>::new());
+
+    // Inbound maps: the declared type directs the lift — empty and
+    // populated pair-lists both arrive as the declared `HashMap`.
+    assert_eq!(pantry.weights(false), HashMap::new());
+    let stocked = pantry.weights(true);
+    assert_eq!(stocked.len(), 2);
+    assert_eq!(stocked.get("a"), Some(&4));
+    assert_eq!(stocked.get("b"), Some(&5));
+
+    // Nested: an empty map inside a list of maps.
+    let crates = pantry.crates();
+    assert_eq!(crates.len(), 2);
+    assert!(crates[0].is_empty());
+    assert_eq!(crates[1].get("k"), Some(&7));
+
+    // Nested as a MAP VALUE: the recursive reshape reaches map values too.
+    let depot = pantry.depot();
+    assert_eq!(depot.len(), 2);
+    assert!(depot.get("outer").is_some_and(HashMap::is_empty));
+    assert_eq!(depot.get("full").and_then(|inner| inner.get("k")), Some(&7));
+}
+
+// ---------------------------------------------------------------------------
 // Generic foreign interfaces (`generics` naming extension)
 // ---------------------------------------------------------------------------
 
@@ -1040,6 +1162,79 @@ const DYN_CODEC_GUEST: &str = r#"
   (export "haphe:demo/dyn-codec" (instance $i))
 )
 "#;
+
+/// A dyn codec whose generic return is MAP-instantiated: pair-list case
+/// payloads — empty and populated — must arrive as the declared `HashMap`.
+#[cfg(feature = "dyn-generics")]
+#[script(foreign, thread_safety = none)]
+trait DynStock {
+    #[script(dyn, instantiate(std::collections::HashMap<String, i64>), instantiate(i64))]
+    fn restock<T>(&self, seed: T) -> T;
+}
+
+/// One guest export `restock`: the s64 case adds 1; the map case answers an
+/// EMPTY seed with `[("k", 7)]` and a populated seed with an empty
+/// pair-list. Variant param flattens to (disc: i32, join: i64, len: i32);
+/// the variant result returns indirectly (disc u8 at +0, payload at +8).
+#[cfg(feature = "dyn-generics")]
+const DYN_STOCK_GUEST: &str = r#"
+(component
+  (type $vt (variant (case "s64" s64) (case "map-string-s64" (list (tuple string s64)))))
+  (core module $m
+    (memory (export "mem") 1)
+    (func (export "realloc") (param i32 i32 i32 i32) (result i32) (i32.const 8192))
+    ;; populated answer: "k"@200; element ("k",7)@208
+    (data (i32.const 200) "k")
+    (data (i32.const 208) "\c8\00\00\00\01\00\00\00\07\00\00\00\00\00\00\00")
+    (func (export "restock") (param i32 i64 i32) (result i32)
+      (if (i32.eqz (local.get 0))
+        (then
+          (i64.store offset=8 (i32.const 16) (i64.add (local.get 1) (i64.const 1)))
+          (i32.store8 (i32.const 16) (i32.const 0)))
+        (else
+          (i32.store8 (i32.const 16) (i32.const 1))
+          (if (i32.eqz (local.get 2))
+            (then
+              (i32.store offset=8 (i32.const 16) (i32.const 208))
+              (i32.store offset=12 (i32.const 16) (i32.const 1)))
+            (else
+              (i32.store offset=8 (i32.const 16) (i32.const 64))
+              (i32.store offset=12 (i32.const 16) (i32.const 0))))))
+      (i32.const 16))
+  )
+  (core instance $mi (instantiate $m))
+  (func $restock (param "seed" $vt) (result $vt)
+    (canon lift (core func $mi "restock")
+      (memory (core memory $mi "mem")) (realloc (core func $mi "realloc"))))
+  (instance $i
+    (export "restock-dyn-seed" (type $vt))
+    (export "restock" (func $restock)))
+  (export "haphe:demo/dyn-stock" (instance $i))
+)
+"#;
+
+/// Empty and populated map payloads both roundtrip as the DECLARED
+/// `HashMap`; the scalar case is untouched.
+#[cfg(feature = "dyn-generics")]
+#[test]
+fn dyn_foreign_map_instantiation_roundtrips_case_payloads() {
+    use std::collections::HashMap;
+    let stock: DynStockHandle = foreign_handle_from_wat(DYN_STOCK_GUEST).unwrap();
+
+    // Empty map out → populated map back.
+    let restocked: HashMap<String, i64> = stock.restock(HashMap::new());
+    assert_eq!(restocked.len(), 1);
+    assert_eq!(restocked.get("k"), Some(&7));
+
+    // Populated map out → EMPTY map back (the empty payload arrives as the
+    // declared map, not a bare list).
+    let cleared: HashMap<String, i64> = stock.restock(restocked);
+    assert!(cleared.is_empty());
+
+    // The scalar case still routes through the same erased export.
+    let n: i64 = stock.restock(41);
+    assert_eq!(n, 42);
+}
 
 /// Both cases route through the single erased export; the case tag carries
 /// the instantiation, so type-ambiguous payloads never guess.
@@ -1282,6 +1477,108 @@ const GRADE_GUEST: &str = r#"
   (func (export "run") (result s64) (canon lift (core func $mi "run")))
 )
 "#;
+
+/// A grade twin whose generic companion takes a MAP-instantiated parameter
+/// (whole fixture set feature-gated: registration requires cfg-free items).
+#[cfg(feature = "generics")]
+mod weigh_grade {
+    use super::*;
+
+    pub trait Weighable {
+        fn total(&self) -> i64;
+    }
+
+    impl Weighable for std::collections::HashMap<String, i64> {
+        fn total(&self) -> i64 {
+            self.values().sum()
+        }
+    }
+
+    #[derive(Script, Debug, PartialEq, Clone, Copy)]
+    #[script(methods, thread_safety = send_sync)]
+    pub enum WeighGrade {
+        Poor,
+        Fine,
+    }
+
+    #[script]
+    impl WeighGrade {
+        /// The monomorph's shape must substitute the method's own type
+        /// args, so the guest's pair-list reshapes before conversion.
+        #[script(instantiate(std::collections::HashMap<String, i64>))]
+        fn weigh<T: Weighable>(&self, w: T) -> i64 {
+            let base = match self {
+                WeighGrade::Poor => 1,
+                WeighGrade::Fine => 10,
+            };
+            base + w.total()
+        }
+    }
+
+    haphe::registry! {
+        pub static WEIGH_GRADE_REGISTRY = {
+            enums: [WeighGrade],
+        };
+    }
+}
+
+/// Calls the map-instantiated generic companion:
+/// `weigh-grade-weigh-map-string-s64(fine, [("a",4),("b",5)])` -> 19.
+#[cfg(feature = "generics")]
+const GRADE_GENERIC_GUEST: &str = r#"
+(component
+  (type $grade-def (enum "poor" "fine"))
+  (import "haphe:demo/types" (instance $t
+    (export "weigh-grade" (type $grade (eq $grade-def)))
+    (export "weigh-grade-weigh-map-string-s64" (func (param "self" $grade) (param "w" (list (tuple string s64))) (result s64)))
+  ))
+  (core module $libc
+    (memory (export "mem") 16)
+    (func (export "realloc") (param i32 i32 i32 i32) (result i32) (i32.const 8192))
+  )
+  (core instance $li (instantiate $libc))
+  (core func $weigh (canon lower (func $t "weigh-grade-weigh-map-string-s64")
+    (memory (core memory $li "mem")) (realloc (core func $li "realloc"))))
+  (core module $m
+    (import "libc" "mem" (memory 1))
+    (import "t" "weigh" (func $weigh (param i32 i32 i32) (result i64)))
+    (data (i32.const 256) "ab")
+    (func $init
+      (i32.store (i32.const 0) (i32.const 256))
+      (i32.store (i32.const 4) (i32.const 1))
+      (i64.store (i32.const 8) (i64.const 4))
+      (i32.store (i32.const 16) (i32.const 257))
+      (i32.store (i32.const 20) (i32.const 1))
+      (i64.store (i32.const 24) (i64.const 5)))
+    (func (export "run") (result i64)
+      (call $init)
+      (call $weigh (i32.const 1) (i32.const 0) (i32.const 2)))
+  )
+  (core instance $mi (instantiate $m
+    (with "libc" (instance
+      (export "mem" (memory $li "mem"))))
+    (with "t" (instance (export "weigh" (func $weigh))))
+  ))
+  (func (export "run") (result s64) (canon lift (core func $mi "run")))
+)
+"#;
+
+/// Repro for the second-pass review: enum-companion shapes must carry the
+/// monomorph's substitution — the pair-list reshapes to a map and the
+/// wrapper converts it.
+#[cfg(feature = "generics")]
+#[test]
+fn generic_enum_companion_map_param_reshapes() {
+    use weigh_grade::{WEIGH_GRADE_REGISTRY, WeighGrade};
+    let engine = Engine::default();
+    let mut linker = Linker::new(&engine);
+    let mut binder = WasmBinder::new(WitGenerator::new("haphe:demo"));
+    binder.register_enum::<WeighGrade>().unwrap();
+    haphe::bind(&binder, &WEIGH_GRADE_REGISTRY, &mut linker).expect("binding succeeds");
+
+    let result = run_guest(&engine, &linker, (), GRADE_GENERIC_GUEST).expect("guest runs");
+    assert!(matches!(result, Val::S64(19)), "got: {result:?}");
+}
 
 #[test]
 fn enum_companion_method_dispatches_live() {
@@ -4184,9 +4481,8 @@ struct FlagT(bool);
 )]
 struct Toggle {
     powered: FlagT,
-    // Container FIELDS still fail the macro's field gate (reported); the
-    // map surface is exposed as a computed property below.
-    #[script(skip)]
+    /// Map-typed FIELD: registers through the widened field gate; the guest
+    /// writes it through the field setter (declared-descriptor reshaping).
     weights: std::collections::HashMap<String, i64>,
 }
 
@@ -4265,15 +4561,15 @@ impl Toggle {
         self.weights.values().sum()
     }
 
-    /// Map-typed computed property: the setter's value is lifted by the
-    /// declared descriptor.
+    /// Map-typed computed property (the `define_prop_set` path), mirroring
+    /// the `weights` field storage under its own name.
     #[script(getter)]
-    fn weights(&self) -> std::collections::HashMap<String, i64> {
+    fn mirror(&self) -> std::collections::HashMap<String, i64> {
         self.weights.clone()
     }
 
     #[script(setter)]
-    fn set_weights(&mut self, weights: std::collections::HashMap<String, i64>) {
+    fn set_mirror(&mut self, weights: std::collections::HashMap<String, i64>) {
         self.weights = weights;
     }
 }
@@ -4898,8 +5194,8 @@ const MAP_METHOD_GUEST: &str = r#"
 )
 "#;
 
-/// The map PROPERTY round trip: set-weights([("a",4),("b",5)]) then
-/// `stored()` = 9.
+/// The map FIELD round trip: the field setter `set-weights([("a",4),("b",5)])`
+/// then `stored()` = 9.
 const MAP_FIELD_GUEST: &str = r#"
 (component
   (import "haphe:demo/toggles" (instance $tg
@@ -5005,6 +5301,72 @@ fn map_call_projection_lifts_by_declared_descriptor() {
 
     let out = run_guest(&engine, &linker, (), MAP_CALL_GUEST).expect("map call arg lifts");
     assert_eq!(out, Val::S64(10));
+}
+
+/// The map computed-property round trip (`define_prop_set`):
+/// `set-mirror([("a",4),("b",5)])` then `stored()` = 9.
+const MAP_PROP_GUEST: &str = r#"
+(component
+  (import "haphe:demo/toggles" (instance $tg
+    (export "toggle" (type $t (sub resource)))
+    (export "[constructor]toggle" (func (param "on" bool) (result (own $t))))
+    (export "[method]toggle.set-mirror" (func (param "self" (borrow $t)) (param "value" (list (tuple string s64)))))
+    (export "[method]toggle.stored" (func (param "self" (borrow $t)) (result s64)))
+  ))
+  (core module $libc
+    (memory (export "mem") 16)
+    (func (export "realloc") (param i32 i32 i32 i32) (result i32) (i32.const 8192))
+  )
+  (core instance $li (instantiate $libc))
+  (core func $ctor (canon lower (func $tg "[constructor]toggle")))
+  (core func $set (canon lower (func $tg "[method]toggle.set-mirror")
+    (memory (core memory $li "mem")) (realloc (core func $li "realloc"))))
+  (core func $stored (canon lower (func $tg "[method]toggle.stored")))
+  (core module $m
+    (import "libc" "mem" (memory 1))
+    (import "tg" "ctor" (func $ctor (param i32) (result i32)))
+    (import "tg" "set" (func $set (param i32 i32 i32)))
+    (import "tg" "stored" (func $stored (param i32) (result i64)))
+    (data (i32.const 256) "ab")
+    (func $init
+      (i32.store (i32.const 0) (i32.const 256))
+      (i32.store (i32.const 4) (i32.const 1))
+      (i64.store (i32.const 8) (i64.const 4))
+      (i32.store (i32.const 16) (i32.const 257))
+      (i32.store (i32.const 20) (i32.const 1))
+      (i64.store (i32.const 24) (i64.const 5)))
+    (func (export "run") (result i64) (local $h i32)
+      (call $init)
+      (local.set $h (call $ctor (i32.const 1)))
+      (call $set (local.get $h) (i32.const 0) (i32.const 2))
+      (call $stored (local.get $h)))
+  )
+  (core instance $mi (instantiate $m
+    (with "libc" (instance
+      (export "mem" (memory $li "mem"))))
+    (with "tg" (instance
+      (export "ctor" (func $ctor))
+      (export "set" (func $set))
+      (export "stored" (func $stored))))
+  ))
+  (func (export "run") (result s64) (canon lift (core func $mi "run")))
+)
+"#;
+
+#[test]
+fn map_property_setter_lifts_by_declared_descriptor() {
+    let engine = Engine::default();
+    let mut linker = Linker::new(&engine);
+    let mut b = WasmBinder::new(WitGenerator::new("haphe:demo"));
+    b.register_type::<Toggle>().unwrap();
+    b.register_fn::<invert_later>().unwrap();
+    b.register_fn::<flip_deep>().unwrap();
+    b.register_fn::<max_tag>().unwrap();
+    b.register_fn::<echo_tag>().unwrap();
+    haphe::bind(&b, &TOGGLE_REGISTRY, &mut linker).expect("binding succeeds");
+
+    let out = run_guest(&engine, &linker, (), MAP_PROP_GUEST).expect("map property setter lifts");
+    assert_eq!(out, Val::S64(9));
 }
 
 #[test]

@@ -116,6 +116,15 @@ fn field_expr(field: &syn::Field, ctx: &TyCtx, errors: &mut Errors) -> Option<To
     if args.skip.is_some() {
         return None;
     }
+    // A nested reference has no bridge conversion at any surface — error at
+    // the declaration instead of leaving the field silently accessor-less.
+    if let Some(span) = crate::bind::nested_reference_span(&field.ty) {
+        errors.spanned(
+            span,
+            "references inside composite types cannot cross the bridge; \
+             use owned element types (e.g. `Vec<String>` instead of `Vec<&str>`)",
+        );
+    }
     let ident = field.ident.as_ref().expect("named field");
     let name = args
         .rename
@@ -571,12 +580,15 @@ fn expand_inner(input: &DeriveInput) -> syn::Result<TokenStream> {
                             lit: syn::Lit::Int(lit),
                             ..
                         }) => {
-                            if let Ok(v) = lit.base10_parse::<i64>() {
-                                Some(v)
+                            // Values above `i64::MAX` (a `repr(u64)` chain)
+                            // follow the bridge's u64 policy: they cross as
+                            // the i64 BIT PATTERN.
+                            if let Ok(v) = lit.base10_parse::<u64>() {
+                                Some(v as i64)
                             } else {
                                 errors.spanned(
                                     lit.span(),
-                                    "script enum discriminants must fit in 64 bits (i64)",
+                                    "script enum discriminants must fit in 64 bits",
                                 );
                                 None
                             }

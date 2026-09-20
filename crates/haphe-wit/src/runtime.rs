@@ -571,11 +571,13 @@ impl<T: 'static> RuntimeBinder for WasmBinder<T> {
                 if let Some(TypeKind::Enum(e)) = registry.get_type(&haphe::TypeId::new(id)) {
                     let value = self.regs.values.get(*id).cloned();
                     for m in e.methods {
-                        for (name, key) in enum_companion_defs(
+                        for (name, key, shapes) in enum_companion_defs(
                             e.name,
                             "_",
                             m,
                             value.as_deref(),
+                            &[],
+                            &[],
                             &mut member_names,
                         )? {
                             match (key, value.as_ref()) {
@@ -585,7 +587,7 @@ impl<T: 'static> RuntimeBinder for WasmBinder<T> {
                                         &name,
                                         v.clone(),
                                         key,
-                                        arg_shapes(m.params, &[], &[]),
+                                        shapes,
                                         &cx,
                                     )?;
                                 }
@@ -618,11 +620,13 @@ impl<T: 'static> RuntimeBinder for WasmBinder<T> {
                         .ok()
                         .and_then(|k| self.regs.values.get(&k).cloned());
                     for m in e.methods {
-                        for (name, key) in enum_companion_defs(
+                        for (name, key, shapes) in enum_companion_defs(
                             &planned.wit_name,
                             "-",
                             m,
                             value.as_deref(),
+                            e.generic_params,
+                            planned.args,
                             &mut member_names,
                         )? {
                             match (key, value.as_ref()) {
@@ -632,7 +636,7 @@ impl<T: 'static> RuntimeBinder for WasmBinder<T> {
                                         &name,
                                         v.clone(),
                                         key,
-                                        arg_shapes(m.params, &[], &[]),
+                                        shapes,
                                         &cx,
                                     )?;
                                 }
@@ -1122,11 +1126,15 @@ fn resolve_foreign<T: 'static>(
     // resolve to one guest export (e.g. a hand-written `echo_s64` next
     // to a monomorphized `echo<i64>`). Runs before any guest lookup.
     let mut export_names = NameMap::new();
-    let mut planned: Vec<(ForeignKey, String)> = Vec::new();
+    let mut planned: Vec<(ForeignKey, String, Shape)> = Vec::new();
     let mut planned_dyn: Vec<(&'static haphe::FunctionDescriptor<'static>, String)> = Vec::new();
     for f in descriptor.functions {
         if f.generic_params.is_empty() {
-            planned.push(((f.name, &[] as _), export_names.insert(f.name)?));
+            planned.push((
+                (f.name, &[] as _),
+                export_names.insert(f.name)?,
+                Shape::of(f.return_type, &[], &[], &[], &[]),
+            ));
             continue;
         }
         if !cfg!(feature = "generics") {
@@ -1155,7 +1163,11 @@ fn resolve_foreign<T: 'static>(
                 Some(p) => p.mangle_fn_instance(f.name, args, None)?,
                 None => format!("{}-{}", to_kebab(f.name), mangle_args(args)?),
             };
-            planned.push(((f.name, args), export_names.insert(&mangled)?));
+            planned.push((
+                (f.name, args),
+                export_names.insert(&mangled)?,
+                Shape::of(f.return_type, f.generic_params, args, &[], &[]),
+            ));
         }
     }
 
@@ -1184,16 +1196,30 @@ fn resolve_foreign<T: 'static>(
                 func,
                 params: fty.params().map(|(_, t)| t).collect(),
                 result: fty.results().next(),
+                ret_shape: Shape::Other,
             })
         };
-        for (key, export_name) in planned {
-            funcs.push((key, resolve(&mut store, &export_name)?));
+        for (key, export_name, ret_shape) in planned {
+            let mut f = resolve(&mut store, &export_name)?;
+            f.ret_shape = ret_shape;
+            funcs.push((key, f));
         }
         for (f, export_name) in planned_dyn {
-            let resolved = resolve(&mut store, &export_name)?;
+            let mut resolved = resolve(&mut store, &export_name)?;
             // Case keys: one per declared instantiation, deduplicated —
             // KEEP IN SYNC with the generator's variant case naming.
-            let mut cases: Vec<(String, &'static [TypeDescriptor<'static>])> = Vec::new();
+            let ret = crate::types::peel_borrowed(f.return_type);
+            let unwrap_return =
+                !matches!(ret, TypeDescriptor::Unit) && crate::types::mentions_generic(ret);
+            // A generic return crosses wrapped in the case variant: the
+            // OUTER lift must not reshape (the per-case shape applies after
+            // unwrapping); a concrete return reshapes like a named fn's.
+            resolved.ret_shape = if unwrap_return {
+                Shape::Other
+            } else {
+                Shape::of(f.return_type, f.generic_params, &[], &[], &[])
+            };
+            let mut cases: Vec<DynCase> = Vec::new();
             for args in f.instantiations {
                 let key = match plan {
                     Some(p) => {
@@ -1205,11 +1231,11 @@ fn resolve_foreign<T: 'static>(
                     }
                     None => mangle_args(args)?,
                 };
-                if !cases.iter().any(|(k, _)| *k == key) {
-                    cases.push((key, args));
+                if !cases.iter().any(|(k, ..)| *k == key) {
+                    let shape = Shape::of(ret, f.generic_params, args, &[], &[]);
+                    cases.push((key, args, shape));
                 }
             }
-            let ret = crate::types::peel_borrowed(f.return_type);
             dyn_funcs.push((
                 f.name,
                 DynForeignFn {
@@ -1220,8 +1246,7 @@ fn resolve_foreign<T: 'static>(
                         .iter()
                         .map(|p| crate::types::mentions_generic(p.ty))
                         .collect(),
-                    unwrap_return: !matches!(ret, TypeDescriptor::Unit)
-                        && crate::types::mentions_generic(ret),
+                    unwrap_return,
                 },
             ));
         }
@@ -1258,17 +1283,29 @@ struct ForeignFn {
     func: Func,
     params: Vec<Type>,
     result: Option<Type>,
+    /// The DECLARED return's shape: a map return shares its wire shape with
+    /// a list of pairs, so the lift reshapes by declaration (empty ones
+    /// included), mirroring the provided direction.
+    ret_shape: Shape,
 }
 
 /// A pre-resolved `dyn` (erased) foreign export: one guest function under
 /// the plain name whose generic-typed positions are the synthesized case
 /// variants. The call's concrete `type_args` select the case by declared
 /// instantiation — a tag lookup, never a resolver.
+/// One dyn-foreign case: `(case key, declared type arguments, unwrapped
+/// payload's declared shape)`.
+type DynCase = (String, &'static [TypeDescriptor<'static>], Shape);
+
+/// A wrapped dyn call's parts: the case-wrapped arguments, and — when the
+/// return is generic — the expected case with the unwrapped payload's shape.
+type DynCallParts = (Vec<ScriptValue>, Option<(String, Shape)>);
+
 struct DynForeignFn {
     f: ForeignFn,
-    /// `(case key, declared type arguments)` per instantiation, in
+    /// One [`DynCase`] per instantiation, in
     /// declaration order, deduplicated.
-    cases: Vec<(String, &'static [TypeDescriptor<'static>])>,
+    cases: Vec<DynCase>,
     /// Which parameter positions cross wrapped in the case variant.
     wrap_param: Vec<bool>,
     /// Whether the return crosses wrapped in the case variant.
@@ -1480,9 +1517,10 @@ impl<T: 'static> CallerInner<T> {
         function: &'static str,
         type_args: &[TypeDescriptor<'static>],
         args: &[ScriptValue],
-    ) -> Result<(Vec<ScriptValue>, Option<String>), ForeignError> {
-        let Some((case, _)) = d.cases.iter().find(|(_, cargs)| *cargs == type_args) else {
-            let declared: Vec<&str> = d.cases.iter().map(|(k, _)| k.as_str()).collect();
+    ) -> Result<DynCallParts, ForeignError> {
+        let Some((case, _, ret_shape)) = d.cases.iter().find(|(_, cargs, _)| *cargs == type_args)
+        else {
+            let declared: Vec<&str> = d.cases.iter().map(|(k, ..)| k.as_str()).collect();
             return Err(call_error(
                 function,
                 format!(
@@ -1512,7 +1550,10 @@ impl<T: 'static> CallerInner<T> {
                 }
             })
             .collect();
-        Ok((wrapped, d.unwrap_return.then(|| case.clone())))
+        Ok((
+            wrapped,
+            d.unwrap_return.then(|| (case.clone(), ret_shape.clone())),
+        ))
     }
 
     /// Unwraps a `dyn` call's variant return, verifying the guest answered
@@ -1520,6 +1561,7 @@ impl<T: 'static> CallerInner<T> {
     fn dyn_unwrap(
         function: &'static str,
         expected: &str,
+        ret_shape: &Shape,
         value: ScriptValue,
     ) -> Result<ScriptValue, ForeignError> {
         // The return lifts as a single-pair map — or as `ScriptValue::Enum`
@@ -1540,6 +1582,8 @@ impl<T: 'static> CallerInner<T> {
             }
         };
         if case == expected {
+            let mut payload = payload;
+            reshape(&mut payload, ret_shape);
             Ok(payload)
         } else {
             Err(call_error(
@@ -1671,7 +1715,11 @@ impl<T: 'static> CallerInner<T> {
             // downcast target; a payload that is not the record shape falls
             // back to the rendered-message path.
             Some(Val::Result(r)) if matches!(f.result, Some(Type::Result(_))) => match r {
-                Ok(Some(v)) => self.lift(&v).map_err(|e| convert_error(function, e)),
+                Ok(Some(v)) => {
+                    let mut out = self.lift(&v).map_err(|e| convert_error(function, e))?;
+                    reshape(&mut out, &f.ret_shape);
+                    Ok(out)
+                }
                 Ok(None) => Ok(ScriptValue::Unit),
                 Err(payload) => {
                     if let Some(boxed) = &payload
@@ -1694,7 +1742,11 @@ impl<T: 'static> CallerInner<T> {
                     Err(call_error(function, detail))
                 }
             },
-            Some(v) => self.lift(&v).map_err(|e| convert_error(function, e)),
+            Some(v) => {
+                let mut out = self.lift(&v).map_err(|e| convert_error(function, e))?;
+                reshape(&mut out, &f.ret_shape);
+                Ok(out)
+            }
         }
     }
 
@@ -1708,7 +1760,7 @@ impl<T: 'static> CallerInner<T> {
             let (wrapped, expect) = Self::dyn_call_parts(d, function, type_args, args)?;
             let out = self.call_sync(&d.f, function, &wrapped)?;
             return match expect {
-                Some(case) => Self::dyn_unwrap(function, &case, out),
+                Some((case, shape)) => Self::dyn_unwrap(function, &case, &shape, out),
                 None => Ok(out),
             };
         }
@@ -1749,7 +1801,7 @@ impl<T: Send + 'static> CallerInner<T> {
             let (wrapped, expect) = Self::dyn_call_parts(d, function, type_args, args)?;
             let out = self.call_async_inner(&d.f, function, &wrapped).await?;
             return match expect {
-                Some(case) => Self::dyn_unwrap(function, &case, out),
+                Some((case, shape)) => Self::dyn_unwrap(function, &case, &shape, out),
                 None => Ok(out),
             };
         }
@@ -3425,13 +3477,27 @@ enum ValueMethodKey {
 /// one entry for a plain method, one per declared instantiation for a
 /// generic one (same mangled names the generator emits). A `None` key marks
 /// a companion with no dispatch channel (stubbed by the caller).
+/// One enum-companion definition: linker name, dispatch key (when the
+/// method is registered), and per-parameter reshape shapes.
+type CompanionDef = (String, Option<ValueMethodKey>, Vec<Shape>);
+
 fn enum_companion_defs(
     owner: &str,
     sep: &str,
     m: &haphe::FunctionDescriptor<'_>,
     value: Option<&ValueEntry>,
+    self_params: &[haphe::GenericParam<'_>],
+    self_args: &[TypeDescriptor<'_>],
     member_names: &mut NameMap,
-) -> Result<Vec<(String, Option<ValueMethodKey>)>, WasmBindError> {
+) -> Result<Vec<CompanionDef>, WasmBindError> {
+    // Per-key shapes: the method's own instantiation composes with the
+    // enum's (a companion parameter may reference either side's params).
+    let shapes = |args: &[TypeDescriptor<'_>]| -> Vec<Shape> {
+        m.params
+            .iter()
+            .map(|p| Shape::of(p.ty, m.generic_params, args, self_params, self_args))
+            .collect()
+    };
     let mut out = Vec::new();
     if m.generic_params.is_empty() {
         let name = member_names.insert(&format!("{owner}{sep}{}", m.name))?;
@@ -3446,7 +3512,7 @@ fn enum_companion_defs(
                     .then(|| ValueMethodKey::Named(m.name.to_string()))
             }
         });
-        out.push((name, key));
+        out.push((name, key, shapes(&[])));
         return Ok(out);
     }
     for args in m.instantiations {
@@ -3482,7 +3548,7 @@ fn enum_companion_defs(
             });
             key
         });
-        out.push((name, key));
+        out.push((name, key, shapes(args)));
     }
     Ok(out)
 }
@@ -4225,20 +4291,22 @@ fn define_method<T: 'static>(
         .ok_or_else(|| trap(&msg, "method has no bridge channel"))?;
         let out = match (m, receiver) {
             // Owned receiver: the wrapper acquires by borrow-and-clone (the
-            // dyn dispatcher's policy), and the entry is consumed only when
-            // the call actually RAN — an argument-conversion rejection
-            // leaves the resource intact; stale later use traps.
+            // dyn dispatcher's policy). The entry is TAKEN atomically before
+            // the call — exactly one concurrent consumer wins — and put back
+            // under the same rep only when the call never ran (its argument
+            // conversion rejected); stale later use traps.
             (EMethod::Cow(f), Receiver::Owned) => {
-                let out = {
-                    let guard = cx.table.lock();
-                    let e = guard
-                        .get(&rep)
-                        .ok_or_else(|| trap(&msg, "stale or already-consumed resource handle"))?;
-                    check_type(&msg, e.type_name, entry.type_name)?;
-                    f(&*e.value, &args)
-                };
-                if !matches!(out, Err(ScriptCallError::Convert(_))) {
-                    cx.table.remove(rep);
+                let taken = cx
+                    .table
+                    .remove(rep)
+                    .ok_or_else(|| trap(&msg, "stale or already-consumed resource handle"))?;
+                if let Err(e) = check_type(&msg, taken.type_name, entry.type_name) {
+                    cx.table.lock().insert(rep, taken);
+                    return Err(e);
+                }
+                let out = f(&*taken.value, &args);
+                if matches!(out, Err(ScriptCallError::Convert(_))) {
+                    cx.table.lock().insert(rep, taken);
                 }
                 out
             }
@@ -4264,16 +4332,18 @@ fn define_method<T: 'static>(
             // borrowed receivers — re-entrant calls into the same binder's
             // resources from inside the future would deadlock (documented).
             (EMethod::AsyncCow(f), Receiver::Owned) => {
-                let out = {
-                    let guard = cx.table.lock();
-                    let e = guard
-                        .get(&rep)
-                        .ok_or_else(|| trap(&msg, "stale or already-consumed resource handle"))?;
-                    check_type(&msg, e.type_name, entry.type_name)?;
-                    block_on(f(&*e.value, &args))
-                };
-                if !matches!(out, Err(ScriptCallError::Convert(_))) {
-                    cx.table.remove(rep);
+                // Same atomic take as the sync arm.
+                let taken = cx
+                    .table
+                    .remove(rep)
+                    .ok_or_else(|| trap(&msg, "stale or already-consumed resource handle"))?;
+                if let Err(e) = check_type(&msg, taken.type_name, entry.type_name) {
+                    cx.table.lock().insert(rep, taken);
+                    return Err(e);
+                }
+                let out = block_on(f(&*taken.value, &args));
+                if matches!(out, Err(ScriptCallError::Convert(_))) {
+                    cx.table.lock().insert(rep, taken);
                 }
                 out
             }

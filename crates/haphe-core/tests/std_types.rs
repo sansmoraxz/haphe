@@ -229,3 +229,52 @@ fn char_conversion_never_truncates() {
     assert!(char::from_script(ScriptValue::String("xy".into())).is_err());
     assert!(char::from_script(ScriptValue::String(String::new())).is_err());
 }
+
+/// The empty-shape rule: an empty sequence and an empty associative
+/// container carry identical information, so either empty shape converts —
+/// and ONLY empty ones; populated mismatches still reject.
+#[test]
+fn empty_shapes_convert_interchangeably() {
+    use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+
+    use haphe_core::{FromScript, ScriptValue};
+
+    let empty_map = || ScriptValue::Map(Vec::new());
+    let empty_list = || ScriptValue::List(Vec::new());
+
+    assert_eq!(Vec::<i64>::from_script(empty_map()).unwrap(), vec![]);
+    assert!(
+        VecDeque::<i64>::from_script(empty_map())
+            .unwrap()
+            .is_empty()
+    );
+    assert!(HashSet::<i64>::from_script(empty_map()).unwrap().is_empty());
+    assert!(
+        BTreeSet::<i64>::from_script(empty_map())
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        HashMap::<String, i64>::from_script(empty_list())
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        BTreeMap::<String, i64>::from_script(empty_list())
+            .unwrap()
+            .is_empty()
+    );
+
+    // Nested positions inherit the rule through recursion.
+    let nested = ScriptValue::List(vec![ScriptValue::Map(Vec::new())]);
+    assert_eq!(
+        Vec::<Vec<i64>>::from_script(nested).unwrap(),
+        vec![Vec::<i64>::new()]
+    );
+
+    // Populated mismatches still reject.
+    let full_map = ScriptValue::Map(vec![("a".into(), ScriptValue::I64(1))]);
+    assert!(Vec::<i64>::from_script(full_map).is_err());
+    let full_list = ScriptValue::List(vec![ScriptValue::I64(1)]);
+    assert!(HashMap::<String, i64>::from_script(full_list).is_err());
+}

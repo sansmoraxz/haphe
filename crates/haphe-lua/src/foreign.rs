@@ -48,7 +48,9 @@ pub fn foreign_caller(
             name: descriptor.name,
         });
     }
-    // One table serves every instantiation of a generic interface.
+    // One callbacks table serves every instantiation of a generic
+    // interface: type arguments are erased at this boundary (Lua values are
+    // self-describing).
     let _ = type_args;
 
     let resolve = |name: &str| -> Result<Option<Function>, LuaBindError> {

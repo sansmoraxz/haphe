@@ -264,6 +264,16 @@ string errors — boundary misuse, not a structured outcome.
 Names cross the boundary verbatim — the exposed (post-`rename`) haphe names,
 no case conversion.
 
+Lua has ONE table type, so an empty `{}` is shape-ambiguous between an
+empty list and an empty map. Core's conversions resolve it (the empty-shape
+rule: an empty sequence and an empty associative container carry identical
+information, so either empty shape converts) — `{}` for a `Vec<i64>`, or
+`{ {} }` for a `Vec<Vec<i64>>`, or `{ a = {} }` values for a
+`HashMap<String, Vec<i64>>`, arrives as the empty list, while `{}` for a
+map-typed parameter stays the empty map, in every direction (arguments,
+returns, and the foreign boundary). Non-empty tables convert strictly by
+their own shape.
+
 | haphe value | Lua value |
 |---|---|
 | unit / `Option::None` | `nil` |

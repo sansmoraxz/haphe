@@ -126,11 +126,15 @@ pub(crate) fn needs_bridge_dispatch(ty: &Type, generic_params: &[String]) -> boo
 /// type, or a standard container (`Vec`, `Option`, sets, deques,
 /// string-keyed maps, tuples) of such types — each spelled bare or through
 /// an explicit `std`/`alloc`/`core` path — mirroring the blanket
-/// `FromScript`/`IntoScript` impls. Used to gate free function wrapper
-/// emission (methods keep the narrower primitive whitelist plus
-/// trait-presence dispatch).
+/// `FromScript`/`IntoScript` impls. References are NOT value types at any
+/// depth (`Vec<&str>` has no conversion); callers strip one outer reference
+/// before asking. Used to gate wrapper emission for free functions, methods,
+/// properties, and fields (with trait-presence dispatch covering the rest).
 pub fn is_bridge_value_type(ty: &Type) -> bool {
-    if is_bridge_compatible_type(ty) || is_bridge_std_semantic(ty) {
+    if is_reference(ty) {
+        return false;
+    }
+    if is_bridge_primitive(ty) || is_bridge_std_semantic(ty) {
         return true;
     }
     let stripped = strip_carriers(ty);
@@ -236,4 +240,27 @@ pub(crate) fn strip_ref(ty: &Type) -> Type {
 
 pub(crate) fn is_reference(ty: &Type) -> bool {
     matches!(ty, Type::Reference(_))
+}
+
+/// The span of a reference nested INSIDE a composite type — one outer
+/// reference is legitimate (wrappers strip it), but `Vec<&str>` has no
+/// conversion at any bridge surface. `None` when no nested reference exists.
+pub(crate) fn nested_reference_span(ty: &Type) -> Option<proc_macro2::Span> {
+    struct Find(Option<proc_macro2::Span>);
+    impl syn::visit::Visit<'_> for Find {
+        fn visit_type_reference(&mut self, r: &syn::TypeReference) {
+            if self.0.is_none() {
+                self.0 = Some(r.and_token.span);
+            }
+            syn::visit::visit_type_reference(self, r);
+        }
+        fn visit_type_fn_ptr(&mut self, _: &syn::TypeFnPtr) {
+            // Callback signatures have their own reference rules and
+            // diagnostics; don't descend.
+        }
+    }
+    let inner = strip_ref(ty);
+    let mut find = Find(None);
+    syn::visit::Visit::visit_type(&mut find, &inner);
+    find.0
 }

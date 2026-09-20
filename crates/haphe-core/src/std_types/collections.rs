@@ -29,6 +29,9 @@ impl<V: FromScript> FromScript for BTreeMap<String, V> {
                 .into_iter()
                 .map(|(k, v)| Ok((k, V::from_script(v)?)))
                 .collect(),
+            // The empty-shape rule (see `Vec` in the bridge module): either
+            // empty shape converts, losslessly.
+            ScriptValue::List(items) if items.is_empty() => Ok(Self::default()),
             other => Err(ScriptConvertError {
                 expected: "map",
                 got: other.variant_name(),
@@ -61,6 +64,9 @@ where
     fn from_script(v: ScriptValue) -> Result<Self, ScriptConvertError> {
         match v {
             ScriptValue::List(items) => items.into_iter().map(T::from_script).collect(),
+            // The empty-shape rule (see `Vec` in the bridge module): either
+            // empty shape converts, losslessly.
+            ScriptValue::Map(entries) if entries.is_empty() => Ok(Self::default()),
             other => Err(ScriptConvertError {
                 expected: "list",
                 got: other.variant_name(),
@@ -87,6 +93,9 @@ impl<T: FromScript + Ord> FromScript for BTreeSet<T> {
     fn from_script(v: ScriptValue) -> Result<Self, ScriptConvertError> {
         match v {
             ScriptValue::List(items) => items.into_iter().map(T::from_script).collect(),
+            // The empty-shape rule (see `Vec` in the bridge module): either
+            // empty shape converts, losslessly.
+            ScriptValue::Map(entries) if entries.is_empty() => Ok(Self::default()),
             other => Err(ScriptConvertError {
                 expected: "list",
                 got: other.variant_name(),
@@ -113,6 +122,9 @@ impl<T: FromScript> FromScript for VecDeque<T> {
     fn from_script(v: ScriptValue) -> Result<Self, ScriptConvertError> {
         match v {
             ScriptValue::List(items) => items.into_iter().map(T::from_script).collect(),
+            // The empty-shape rule (see `Vec` in the bridge module): either
+            // empty shape converts, losslessly.
+            ScriptValue::Map(entries) if entries.is_empty() => Ok(Self::default()),
             other => Err(ScriptConvertError {
                 expected: "list",
                 got: other.variant_name(),

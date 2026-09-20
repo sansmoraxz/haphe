@@ -232,16 +232,6 @@ pub fn bind_type<
     binder.set_idiv_fallback(declared_idiv_fallback(
         <T as ScriptStruct>::DESCRIPTOR.trait_impls,
     ));
-    binder.set_descriptors(
-        <T as ScriptStruct>::DESCRIPTOR
-            .methods
-            .iter()
-            .chain(<T as ScriptStruct>::DESCRIPTOR.constructors),
-        <T as ScriptStruct>::DESCRIPTOR
-            .properties
-            .iter()
-            .map(|prop| (prop.name, prop.ty)),
-    );
     T::bind(&mut binder)?;
     binder.register(lua, type_table)
 }
@@ -269,10 +259,6 @@ pub fn bind_enum_type<
     binder.set_idiv_fallback(declared_idiv_fallback(
         <E as haphe::ScriptEnum>::DESCRIPTOR.trait_impls,
     ));
-    binder.set_descriptors(
-        <E as haphe::ScriptEnum>::DESCRIPTOR.methods.iter(),
-        std::iter::empty(),
-    );
     E::bind(&mut binder)?;
     binder.register(lua, type_table)
 }
@@ -361,12 +347,8 @@ fn declared_iter_pairing(trait_impls: &[haphe::TraitImpl<'_>]) -> binder::IterPa
 /// bind_fn::<add>(&lua, &math).unwrap();
 /// // Now lua code can call math.add(1, 2)
 /// ```
-pub fn bind_fn<F: ScriptBindFn + haphe::ScriptFunction>(
-    lua: &mlua::Lua,
-    table: &mlua::Table,
-) -> Result<(), LuaBindError> {
+pub fn bind_fn<F: ScriptBindFn>(lua: &mlua::Lua, table: &mlua::Table) -> Result<(), LuaBindError> {
     let mut binder = binder::LuaFnBinder::new();
-    binder.add_descriptor(&F::DESCRIPTOR);
     F::bind(&mut binder)?;
     binder.apply(lua, table)
 }

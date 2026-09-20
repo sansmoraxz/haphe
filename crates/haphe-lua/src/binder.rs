@@ -239,126 +239,6 @@ fn lua_table_to_script(t: &mlua::Table) -> mlua::Result<ScriptValue> {
 }
 
 // ---------------------------------------------------------------------------
-// Empty-table reshaping — Lua's `{}` is shape-ambiguous
-// ---------------------------------------------------------------------------
-
-/// Generic-parameter resolution for [`reshape_empty_tables`]: up to two
-/// `(params, args)` segments — the SELF instantiation first for methods on
-/// generic self types, then the function's own.
-#[derive(Clone, Copy)]
-pub(crate) struct ParamSubst<'a> {
-    segments: [(
-        &'a [haphe::GenericParam<'a>],
-        &'a [haphe::TypeDescriptor<'a>],
-    ); 2],
-}
-
-impl<'a> ParamSubst<'a> {
-    pub(crate) const NONE: ParamSubst<'static> = ParamSubst {
-        segments: [(&[], &[]), (&[], &[])],
-    };
-
-    /// Used by the generic monomorph installs.
-    #[cfg(feature = "generics")]
-    pub(crate) fn one(
-        params: &'a [haphe::GenericParam<'a>],
-        args: &'a [haphe::TypeDescriptor<'a>],
-    ) -> Self {
-        Self {
-            segments: [(params, args), (&[], &[])],
-        }
-    }
-
-    /// Used by the dyn candidate reshape.
-    #[cfg(feature = "generics")]
-    pub(crate) fn merged(
-        self_params: &'a [haphe::GenericParam<'a>],
-        self_args: &'a [haphe::TypeDescriptor<'a>],
-        params: &'a [haphe::GenericParam<'a>],
-        args: &'a [haphe::TypeDescriptor<'a>],
-    ) -> Self {
-        Self {
-            segments: [(self_params, self_args), (params, args)],
-        }
-    }
-
-    fn resolve(&self, name: &str) -> Option<&'a haphe::TypeDescriptor<'a>> {
-        self.segments.iter().find_map(|(params, args)| {
-            params
-                .iter()
-                .position(|p| p.name == name)
-                .and_then(|i| args.get(i))
-        })
-    }
-}
-
-/// Whether a declared parameter type carries values as a list.
-fn is_list_shaped(ty: &haphe::TypeDescriptor<'_>, subst: &ParamSubst<'_>, depth: u8) -> bool {
-    use haphe::TypeDescriptor as Td;
-    if depth > 4 {
-        return false;
-    }
-    match ty {
-        Td::List(_) | Td::Array(_, _) => true,
-        Td::Borrowed { inner, .. } | Td::Option(inner) => is_list_shaped(inner, subst, depth + 1),
-        Td::GenericParam(name) => subst
-            .resolve(name)
-            .is_some_and(|resolved| is_list_shaped(resolved, subst, depth + 1)),
-        _ => false,
-    }
-}
-
-/// Lua has ONE table type, so `{}` converts as an empty MAP — shape-blind.
-/// Where the DECLARED parameter is list-shaped, re-shape empty-map arguments
-/// into empty lists so core's strict conversions accept the ordinary
-/// empty-table call. The ambiguity is this runtime's, so the fix lives here,
-/// not in core; only empty values are ever touched, and an unknown
-/// declaration (empty `params`) leaves everything as-is.
-pub(crate) fn reshape_empty_tables(
-    args: &mut [ScriptValue],
-    params: &[haphe::ParamDescriptor<'_>],
-    subst: &ParamSubst<'_>,
-) {
-    if !args
-        .iter()
-        .any(|a| matches!(a, ScriptValue::Map(m) if m.is_empty()))
-    {
-        return;
-    }
-    for (arg, param) in args.iter_mut().zip(params.iter()) {
-        if matches!(arg, ScriptValue::Map(m) if m.is_empty()) && is_list_shaped(param.ty, subst, 0)
-        {
-            *arg = ScriptValue::List(Vec::new());
-        }
-    }
-}
-
-/// Per-candidate argument view for dyn scans: clones and reshapes only when
-/// an empty-table argument exists (the reshape depends on each candidate's
-/// declared parameters); borrows untouched otherwise.
-#[cfg(feature = "generics")]
-fn dyn_candidate_args<'s, F>(
-    sv_args: &'s [ScriptValue],
-    candidate: &DynFn<F>,
-) -> std::borrow::Cow<'s, [ScriptValue]> {
-    if !sv_args
-        .iter()
-        .any(|a| matches!(a, ScriptValue::Map(m) if m.is_empty()))
-    {
-        return std::borrow::Cow::Borrowed(sv_args);
-    }
-    let subst = ParamSubst::merged(
-        candidate.self_params,
-        candidate.self_args,
-        candidate.descriptor.generic_params,
-        candidate.type_args,
-    );
-    let mut fixed = sv_args.to_vec();
-    reshape_empty_tables(&mut fixed, candidate.descriptor.params, &subst);
-    std::borrow::Cow::Owned(fixed)
-}
-
-// ---------------------------------------------------------------------------
 // Collected registrations — type-erased closures
 // ---------------------------------------------------------------------------
 
@@ -569,13 +449,6 @@ pub(crate) struct LuaTypeBinder<T: 'static> {
     dyn_async_mut_methods: Vec<(&'static str, Vec<DynFn<AsyncMutFn<T>>>)>,
     pairing: IterPairing,
     idiv_fallback: bool,
-    /// Function descriptors of the bound type (methods + constructors +
-    /// associated fns), for name-to-declared-parameter pairing at install
-    /// time (empty-table reshaping).
-    fn_descs: Vec<&'static haphe::FunctionDescriptor<'static>>,
-    /// `(name, declared type)` of computed properties, for the setter's
-    /// empty-table reshaping.
-    prop_descs: Vec<(&'static str, &'static haphe::TypeDescriptor<'static>)>,
 }
 
 impl<T: 'static + Clone + mlua::MaybeSend + mlua::MaybeSync> LuaTypeBinder<T> {
@@ -638,32 +511,11 @@ impl<T: 'static + Clone + mlua::MaybeSend + mlua::MaybeSync> LuaTypeBinder<T> {
             dyn_async_mut_methods: Vec::new(),
             pairing: IterPairing::default(),
             idiv_fallback: false,
-            fn_descs: Vec::new(),
-            prop_descs: Vec::new(),
         }
     }
 
     /// Sets the iteration pairing, decided from the type's declared iterator
     /// item type.
-    /// Supplies the bound type's descriptors for empty-table reshaping.
-    pub fn set_descriptors(
-        &mut self,
-        fns: impl IntoIterator<Item = &'static haphe::FunctionDescriptor<'static>>,
-        props: impl IntoIterator<Item = (&'static str, &'static haphe::TypeDescriptor<'static>)>,
-    ) {
-        self.fn_descs = fns.into_iter().collect();
-        self.prop_descs = props.into_iter().collect();
-    }
-
-    fn desc_of(&self, name: &str) -> Option<&'static haphe::FunctionDescriptor<'static>> {
-        self.fn_descs.iter().copied().find(|d| d.name == name)
-    }
-
-    /// Declared parameters for `name`; empty (reshape no-op) when unknown.
-    fn params_of(&self, name: &str) -> &'static [haphe::ParamDescriptor<'static>] {
-        self.desc_of(name).map_or(&[], |d| d.params)
-    }
-
     pub fn set_pairing(&mut self, pairing: IterPairing) {
         self.pairing = pairing;
     }
@@ -802,15 +654,12 @@ impl<T: 'static + Clone + mlua::MaybeSend + mlua::MaybeSync> LuaTypeBinder<T> {
         // Constructors → Lua functions on the type table.
         for ctor in &self.constructors {
             let f = ctor.f;
-            let params = self.params_of(ctor.name);
-            let subst = ParamSubst::NONE;
             let lua_fn = lua.create_function(move |lua, args: mlua::MultiValue| {
-                let mut sv_args: Vec<ScriptValue> = args
+                let sv_args: Vec<ScriptValue> = args
                     .into_vec()
                     .iter()
                     .map(lua_to_script)
                     .collect::<mlua::Result<_>>()?;
-                reshape_empty_tables(&mut sv_args, params, &subst);
                 let value = f(&sv_args).map_err(crate::error::call_error)?;
                 lua.create_any_userdata(value)
             })?;
@@ -820,16 +669,13 @@ impl<T: 'static + Clone + mlua::MaybeSend + mlua::MaybeSync> LuaTypeBinder<T> {
         #[cfg(all(feature = "async", not(feature = "send")))]
         for (name, f) in &self.async_ctors {
             let f = *f;
-            let params = self.params_of(name);
-            let subst = ParamSubst::NONE;
             let lua_fn =
                 lua.create_async_function(move |lua, args: mlua::MultiValue| async move {
-                    let mut sv_args: Vec<ScriptValue> = args
+                    let sv_args: Vec<ScriptValue> = args
                         .into_vec()
                         .iter()
                         .map(lua_to_script)
                         .collect::<mlua::Result<_>>()?;
-                    reshape_empty_tables(&mut sv_args, params, &subst);
                     let value = f(&sv_args).await.map_err(crate::error::call_error)?;
                     lua.create_any_userdata(value)
                 })?;
@@ -840,15 +686,12 @@ impl<T: 'static + Clone + mlua::MaybeSend + mlua::MaybeSync> LuaTypeBinder<T> {
         // constructors: no receiver, so `Type.assoc(...)` with no instance.
         for (name, f) in &self.associated {
             let f = *f;
-            let params = self.params_of(name);
-            let subst = ParamSubst::NONE;
             let lua_fn = lua.create_function(move |lua, args: mlua::MultiValue| {
-                let mut sv_args: Vec<ScriptValue> = args
+                let sv_args: Vec<ScriptValue> = args
                     .into_vec()
                     .iter()
                     .map(lua_to_script)
                     .collect::<mlua::Result<_>>()?;
-                reshape_empty_tables(&mut sv_args, params, &subst);
                 let result = f(&sv_args).map_err(crate::error::call_error)?;
                 script_to_lua(lua, result)
             })?;
@@ -858,14 +701,11 @@ impl<T: 'static + Clone + mlua::MaybeSend + mlua::MaybeSync> LuaTypeBinder<T> {
         #[cfg(all(feature = "async", not(feature = "send")))]
         for (name, f) in &self.async_associated {
             let f = *f;
-            let params = self.params_of(name);
-            let subst = ParamSubst::NONE;
             let lua_fn = lua.create_async_function(move |lua, args: mlua::MultiValue| {
                 let sv_args: mlua::Result<Vec<ScriptValue>> =
                     args.into_vec().iter().map(lua_to_script).collect();
                 async move {
-                    let mut sv_args = sv_args?;
-                    reshape_empty_tables(&mut sv_args, params, &subst);
+                    let sv_args = sv_args?;
                     let out = f(&sv_args).await.map_err(crate::error::call_error)?;
                     script_to_lua(&lua, out)
                 }
@@ -875,35 +715,27 @@ impl<T: 'static + Clone + mlua::MaybeSend + mlua::MaybeSync> LuaTypeBinder<T> {
         // Static generic associated monomorphs: one entry per declared
         // instantiation under its mangled name — dispatch is exact, no scan.
         #[cfg(feature = "generics")]
-        for (name, base, type_args, f) in &self.generic_associated {
+        for (name, _base, _type_args, f) in &self.generic_associated {
             let f = *f;
-            let (params, subst) = self.desc_of(base).map_or((&[][..], ParamSubst::NONE), |d| {
-                (d.params, ParamSubst::one(d.generic_params, type_args))
-            });
             let lua_fn = lua.create_function(move |lua, args: mlua::MultiValue| {
-                let mut sv_args: Vec<ScriptValue> = args
+                let sv_args: Vec<ScriptValue> = args
                     .into_vec()
                     .iter()
                     .map(lua_to_script)
                     .collect::<mlua::Result<_>>()?;
-                reshape_empty_tables(&mut sv_args, params, &subst);
                 let result = f(&sv_args).map_err(crate::error::call_error)?;
                 script_to_lua(lua, result)
             })?;
             type_table.set(name.as_str(), lua_fn)?;
         }
         #[cfg(all(feature = "generics", feature = "async", not(feature = "send")))]
-        for (name, base, type_args, f) in &self.generic_async_associated {
+        for (name, _base, _type_args, f) in &self.generic_async_associated {
             let f = *f;
-            let (params, subst) = self.desc_of(base).map_or((&[][..], ParamSubst::NONE), |d| {
-                (d.params, ParamSubst::one(d.generic_params, type_args))
-            });
             let lua_fn = lua.create_async_function(move |lua, args: mlua::MultiValue| {
                 let sv_args: mlua::Result<Vec<ScriptValue>> =
                     args.into_vec().iter().map(lua_to_script).collect();
                 async move {
-                    let mut sv_args = sv_args?;
-                    reshape_empty_tables(&mut sv_args, params, &subst);
+                    let sv_args = sv_args?;
                     let out = f(&sv_args).await.map_err(crate::error::call_error)?;
                     script_to_lua(&lua, out)
                 }
@@ -929,8 +761,7 @@ impl<T: 'static + Clone + mlua::MaybeSend + mlua::MaybeSync> LuaTypeBinder<T> {
                     .collect::<mlua::Result<_>>()?;
                 let mut last_err = None;
                 for i in scan.call_order(&sv_args) {
-                    let sv_args_i = dyn_candidate_args(&sv_args, &candidates[i]);
-                    match (candidates[i].wrapper)(&sv_args_i) {
+                    match (candidates[i].wrapper)(&sv_args) {
                         Ok(out) => return script_to_lua(lua, out),
                         Err(haphe::ScriptCallError::Convert(e)) => last_err = Some(e),
                         Err(host) => {
@@ -958,8 +789,7 @@ impl<T: 'static + Clone + mlua::MaybeSend + mlua::MaybeSync> LuaTypeBinder<T> {
                     let sv_args = sv_args?;
                     let mut last_err = None;
                     for i in scan.call_order(&sv_args) {
-                        let sv_args_i = dyn_candidate_args(&sv_args, &candidates[i]);
-                        match (candidates[i].wrapper)(&sv_args_i).await {
+                        match (candidates[i].wrapper)(&sv_args).await {
                             Ok(out) => return script_to_lua(&lua, out),
                             Err(haphe::ScriptCallError::Convert(e)) => last_err = Some(e),
                             Err(host) => {
@@ -1000,19 +830,8 @@ impl<T: 'static + Clone + mlua::MaybeSend + mlua::MaybeSync> LuaTypeBinder<T> {
             }
             for (name, set) in &self.prop_sets {
                 let set = *set;
-                let prop_ty = self
-                    .prop_descs
-                    .iter()
-                    .find(|(n, _)| n == name)
-                    .map(|(_, ty)| *ty);
                 reg.add_field_function_set(*name, move |lua, ud, val| {
-                    let mut sv = lua_to_script(&val)?;
-                    if let Some(ty) = prop_ty
-                        && matches!(&sv, ScriptValue::Map(m) if m.is_empty())
-                        && is_list_shaped(ty, &ParamSubst::NONE, 0)
-                    {
-                        sv = ScriptValue::List(Vec::new());
-                    }
+                    let sv = lua_to_script(&val)?;
                     let _ = lua;
                     set(&mut *ud.borrow_mut::<T>()?, sv)
                         .map_err(|e| mlua::Error::runtime(e.to_string()))
@@ -1022,15 +841,12 @@ impl<T: 'static + Clone + mlua::MaybeSend + mlua::MaybeSync> LuaTypeBinder<T> {
             // Methods (&self).
             for method in &self.methods {
                 let f = method.f;
-                let params = self.params_of(method.name);
-                let subst = ParamSubst::NONE;
                 reg.add_function(method.name, move |lua, args: mlua::MultiValue| {
                     let mut v = args.into_vec();
                     let ud: mlua::AnyUserData = mlua::FromLua::from_lua(v.remove(0), lua)?;
                     let this = ud.borrow::<T>()?;
-                    let mut sv_args: Vec<ScriptValue> =
+                    let sv_args: Vec<ScriptValue> =
                         v.iter().map(lua_to_script).collect::<mlua::Result<_>>()?;
-                    reshape_empty_tables(&mut sv_args, params, &subst);
                     // Borrowed carrier while the guard is held: zero clones
                     // for `&self`; a consuming method clones inside the
                     // wrapper via `into_owned`.
@@ -1051,8 +867,6 @@ impl<T: 'static + Clone + mlua::MaybeSend + mlua::MaybeSync> LuaTypeBinder<T> {
             #[cfg(all(feature = "async", not(feature = "send")))]
             for (name, f) in &self.async_methods {
                 let f = *f;
-                let params = self.params_of(name);
-                let subst = ParamSubst::NONE;
                 reg.add_async_method(
                     *name,
                     move |lua, this: mlua::UserDataRef<T>, args: mlua::MultiValue| {
@@ -1060,11 +874,7 @@ impl<T: 'static + Clone + mlua::MaybeSend + mlua::MaybeSync> LuaTypeBinder<T> {
                             .into_vec()
                             .iter()
                             .map(lua_to_script)
-                            .collect::<mlua::Result<Vec<ScriptValue>>>()
-                            .map(|mut sv: Vec<ScriptValue>| {
-                                reshape_empty_tables(&mut sv, params, &subst);
-                                sv
-                            });
+                            .collect::<mlua::Result<Vec<ScriptValue>>>();
                         async move {
                             // The async block owns the guard; the wrapper's
                             // future borrows it — zero-clone dispatch.
@@ -1083,8 +893,6 @@ impl<T: 'static + Clone + mlua::MaybeSend + mlua::MaybeSync> LuaTypeBinder<T> {
             #[cfg(all(feature = "async", not(feature = "send")))]
             for (name, f) in &self.async_mut_methods {
                 let f = *f;
-                let params = self.params_of(name);
-                let subst = ParamSubst::NONE;
                 reg.add_async_method_mut(
                     *name,
                     move |lua, this: mlua::UserDataRefMut<T>, args: mlua::MultiValue| {
@@ -1092,11 +900,7 @@ impl<T: 'static + Clone + mlua::MaybeSend + mlua::MaybeSync> LuaTypeBinder<T> {
                             .into_vec()
                             .iter()
                             .map(lua_to_script)
-                            .collect::<mlua::Result<Vec<ScriptValue>>>()
-                            .map(|mut sv: Vec<ScriptValue>| {
-                                reshape_empty_tables(&mut sv, params, &subst);
-                                sv
-                            });
+                            .collect::<mlua::Result<Vec<ScriptValue>>>();
                         async move {
                             let mut this = this;
                             let sv_args = sv_args?;
@@ -1112,15 +916,12 @@ impl<T: 'static + Clone + mlua::MaybeSend + mlua::MaybeSync> LuaTypeBinder<T> {
             // Methods (&mut self).
             for method in &self.mut_methods {
                 let f = method.f;
-                let params = self.params_of(method.name);
-                let subst = ParamSubst::NONE;
                 reg.add_function(method.name, move |lua, args: mlua::MultiValue| {
                     let mut v = args.into_vec();
                     let ud: mlua::AnyUserData = mlua::FromLua::from_lua(v.remove(0), lua)?;
                     let mut this = ud.borrow_mut::<T>()?;
-                    let mut sv_args: Vec<ScriptValue> =
+                    let sv_args: Vec<ScriptValue> =
                         v.iter().map(lua_to_script).collect::<mlua::Result<_>>()?;
-                    reshape_empty_tables(&mut sv_args, params, &subst);
                     let result = f(&mut *this, &sv_args).map_err(crate::error::call_error)?;
                     script_to_lua(lua, result)
                 });
@@ -1131,36 +932,28 @@ impl<T: 'static + Clone + mlua::MaybeSend + mlua::MaybeSync> LuaTypeBinder<T> {
             // scan, no fall-through; a wrong-typed argument is a conversion
             // error like any non-generic method).
             #[cfg(feature = "generics")]
-            for (name, base, type_args, f) in &self.generic_methods {
+            for (name, _base, _type_args, f) in &self.generic_methods {
                 let f = *f;
-                let (params, subst) = self.desc_of(base).map_or((&[][..], ParamSubst::NONE), |d| {
-                    (d.params, ParamSubst::one(d.generic_params, type_args))
-                });
                 reg.add_function(name.as_str(), move |lua, args: mlua::MultiValue| {
                     let mut v = args.into_vec();
                     let ud: mlua::AnyUserData = mlua::FromLua::from_lua(v.remove(0), lua)?;
                     let this = ud.borrow::<T>()?;
-                    let mut sv_args: Vec<ScriptValue> =
+                    let sv_args: Vec<ScriptValue> =
                         v.iter().map(lua_to_script).collect::<mlua::Result<_>>()?;
-                    reshape_empty_tables(&mut sv_args, params, &subst);
                     let result = f(ScriptCow::Borrowed(&this), &sv_args)
                         .map_err(crate::error::call_error)?;
                     script_to_lua(lua, result)
                 });
             }
             #[cfg(feature = "generics")]
-            for (name, base, type_args, f) in &self.generic_mut_methods {
+            for (name, _base, _type_args, f) in &self.generic_mut_methods {
                 let f = *f;
-                let (params, subst) = self.desc_of(base).map_or((&[][..], ParamSubst::NONE), |d| {
-                    (d.params, ParamSubst::one(d.generic_params, type_args))
-                });
                 reg.add_function(name.as_str(), move |lua, args: mlua::MultiValue| {
                     let mut v = args.into_vec();
                     let ud: mlua::AnyUserData = mlua::FromLua::from_lua(v.remove(0), lua)?;
                     let mut this = ud.borrow_mut::<T>()?;
-                    let mut sv_args: Vec<ScriptValue> =
+                    let sv_args: Vec<ScriptValue> =
                         v.iter().map(lua_to_script).collect::<mlua::Result<_>>()?;
-                    reshape_empty_tables(&mut sv_args, params, &subst);
                     let result = f(&mut *this, &sv_args).map_err(crate::error::call_error)?;
                     script_to_lua(lua, result)
                 });
@@ -1171,11 +964,8 @@ impl<T: 'static + Clone + mlua::MaybeSend + mlua::MaybeSync> LuaTypeBinder<T> {
             // guard, the wrapper's future borrows it (mutably for
             // `&mut self`, so mutation persists).
             #[cfg(all(feature = "generics", feature = "async", not(feature = "send")))]
-            for (name, base, type_args, f) in &self.generic_async_methods {
+            for (name, _base, _type_args, f) in &self.generic_async_methods {
                 let f = *f;
-                let (params, subst) = self.desc_of(base).map_or((&[][..], ParamSubst::NONE), |d| {
-                    (d.params, ParamSubst::one(d.generic_params, type_args))
-                });
                 reg.add_async_method(
                     name.as_str(),
                     move |lua, this: mlua::UserDataRef<T>, args: mlua::MultiValue| {
@@ -1183,11 +973,7 @@ impl<T: 'static + Clone + mlua::MaybeSend + mlua::MaybeSync> LuaTypeBinder<T> {
                             .into_vec()
                             .iter()
                             .map(lua_to_script)
-                            .collect::<mlua::Result<Vec<ScriptValue>>>()
-                            .map(|mut sv: Vec<ScriptValue>| {
-                                reshape_empty_tables(&mut sv, params, &subst);
-                                sv
-                            });
+                            .collect::<mlua::Result<Vec<ScriptValue>>>();
                         async move {
                             let sv_args = sv_args?;
                             let out = f(ScriptCow::Borrowed(&this), &sv_args)
@@ -1199,11 +985,8 @@ impl<T: 'static + Clone + mlua::MaybeSend + mlua::MaybeSync> LuaTypeBinder<T> {
                 );
             }
             #[cfg(all(feature = "generics", feature = "async", not(feature = "send")))]
-            for (name, base, type_args, f) in &self.generic_async_mut_methods {
+            for (name, _base, _type_args, f) in &self.generic_async_mut_methods {
                 let f = *f;
-                let (params, subst) = self.desc_of(base).map_or((&[][..], ParamSubst::NONE), |d| {
-                    (d.params, ParamSubst::one(d.generic_params, type_args))
-                });
                 reg.add_async_method_mut(
                     name.as_str(),
                     move |lua, this: mlua::UserDataRefMut<T>, args: mlua::MultiValue| {
@@ -1211,11 +994,7 @@ impl<T: 'static + Clone + mlua::MaybeSend + mlua::MaybeSync> LuaTypeBinder<T> {
                             .into_vec()
                             .iter()
                             .map(lua_to_script)
-                            .collect::<mlua::Result<Vec<ScriptValue>>>()
-                            .map(|mut sv: Vec<ScriptValue>| {
-                                reshape_empty_tables(&mut sv, params, &subst);
-                                sv
-                            });
+                            .collect::<mlua::Result<Vec<ScriptValue>>>();
                         async move {
                             let mut this = this;
                             let sv_args = sv_args?;
@@ -1254,8 +1033,7 @@ impl<T: 'static + Clone + mlua::MaybeSend + mlua::MaybeSync> LuaTypeBinder<T> {
                         v.iter().map(lua_to_script).collect::<mlua::Result<_>>()?;
                     let mut last_err = None;
                     for i in scan.call_order(&sv_args) {
-                        let sv_args_i = dyn_candidate_args(&sv_args, &candidates[i]);
-                        match (candidates[i].wrapper)(ScriptCow::Borrowed(&this), &sv_args_i) {
+                        match (candidates[i].wrapper)(ScriptCow::Borrowed(&this), &sv_args) {
                             Ok(out) => return script_to_lua(lua, out),
                             Err(haphe::ScriptCallError::Convert(e)) => last_err = Some(e),
                             Err(host) => {
@@ -1285,8 +1063,7 @@ impl<T: 'static + Clone + mlua::MaybeSend + mlua::MaybeSync> LuaTypeBinder<T> {
                         v.iter().map(lua_to_script).collect::<mlua::Result<_>>()?;
                     let mut last_err = None;
                     for i in scan.call_order(&sv_args) {
-                        let sv_args_i = dyn_candidate_args(&sv_args, &candidates[i]);
-                        match (candidates[i].wrapper)(&mut this, &sv_args_i) {
+                        match (candidates[i].wrapper)(&mut this, &sv_args) {
                             Ok(out) => return script_to_lua(lua, out),
                             Err(haphe::ScriptCallError::Convert(e)) => last_err = Some(e),
                             Err(host) => {
@@ -1318,12 +1095,8 @@ impl<T: 'static + Clone + mlua::MaybeSend + mlua::MaybeSync> LuaTypeBinder<T> {
                             let sv_args = sv_args?;
                             let mut last_err = None;
                             for i in scan.call_order(&sv_args) {
-                                let sv_args_i = dyn_candidate_args(&sv_args, &candidates[i]);
-                                match (candidates[i].wrapper)(
-                                    ScriptCow::Borrowed(&this),
-                                    &sv_args_i,
-                                )
-                                .await
+                                match (candidates[i].wrapper)(ScriptCow::Borrowed(&this), &sv_args)
+                                    .await
                                 {
                                     Ok(out) => return script_to_lua(&lua, out),
                                     Err(haphe::ScriptCallError::Convert(e)) => last_err = Some(e),
@@ -1358,8 +1131,7 @@ impl<T: 'static + Clone + mlua::MaybeSend + mlua::MaybeSync> LuaTypeBinder<T> {
                             let sv_args = sv_args?;
                             let mut last_err = None;
                             for i in scan.call_order(&sv_args) {
-                                let sv_args_i = dyn_candidate_args(&sv_args, &candidates[i]);
-                                match (candidates[i].wrapper)(&mut this, &sv_args_i).await {
+                                match (candidates[i].wrapper)(&mut this, &sv_args).await {
                                     Ok(out) => return script_to_lua(&lua, out),
                                     Err(haphe::ScriptCallError::Convert(e)) => last_err = Some(e),
                                     Err(host) => {
@@ -2745,9 +2517,6 @@ pub(crate) struct LuaFnBinder {
     dyn_functions: Vec<(&'static str, Vec<DynFn<ScriptFnPtr>>)>,
     #[cfg(all(feature = "generics", feature = "async", not(feature = "send")))]
     dyn_async_functions: Vec<(&'static str, Vec<DynFn<AsyncFnPtr>>)>,
-    /// Descriptors of the bound functions, for name-to-declared-parameter
-    /// pairing at install time (empty-table reshaping).
-    descs: Vec<&'static haphe::FunctionDescriptor<'static>>,
 }
 
 impl LuaFnBinder {
@@ -2764,22 +2533,7 @@ impl LuaFnBinder {
             dyn_functions: Vec::new(),
             #[cfg(all(feature = "generics", feature = "async", not(feature = "send")))]
             dyn_async_functions: Vec::new(),
-            descs: Vec::new(),
         }
-    }
-
-    /// Supplies a bound function's descriptor for empty-table reshaping.
-    pub fn add_descriptor(&mut self, desc: &'static haphe::FunctionDescriptor<'static>) {
-        self.descs.push(desc);
-    }
-
-    fn desc_of(&self, name: &str) -> Option<&'static haphe::FunctionDescriptor<'static>> {
-        self.descs.iter().copied().find(|d| d.name == name)
-    }
-
-    /// Declared parameters for `name`; empty (reshape no-op) when unknown.
-    fn params_of(&self, name: &str) -> &'static [haphe::ParamDescriptor<'static>] {
-        self.desc_of(name).map_or(&[], |d| d.params)
     }
 
     /// Register all collected functions onto the given Lua table.
@@ -2810,35 +2564,27 @@ impl LuaFnBinder {
         // Static generic monomorphs: one plain callable per declared
         // instantiation under its mangled name — dispatch is exact, no scan.
         #[cfg(feature = "generics")]
-        for (name, base, type_args, f) in &self.generic_functions {
+        for (name, _base, _type_args, f) in &self.generic_functions {
             let f = *f;
-            let (params, subst) = self.desc_of(base).map_or((&[][..], ParamSubst::NONE), |d| {
-                (d.params, ParamSubst::one(d.generic_params, type_args))
-            });
             let lua_fn = lua.create_function(move |lua, args: mlua::MultiValue| {
-                let mut script_args: Vec<ScriptValue> = args
+                let script_args: Vec<ScriptValue> = args
                     .into_vec()
                     .iter()
                     .map(lua_to_script)
                     .collect::<mlua::Result<_>>()?;
-                reshape_empty_tables(&mut script_args, params, &subst);
                 let result = f(&script_args).map_err(crate::error::call_error)?;
                 script_to_lua(lua, result)
             })?;
             table.set(name.as_str(), lua_fn)?;
         }
         #[cfg(all(feature = "generics", feature = "async", not(feature = "send")))]
-        for (name, base, type_args, f) in &self.generic_async_functions {
+        for (name, _base, _type_args, f) in &self.generic_async_functions {
             let f = *f;
-            let (params, subst) = self.desc_of(base).map_or((&[][..], ParamSubst::NONE), |d| {
-                (d.params, ParamSubst::one(d.generic_params, type_args))
-            });
             let lua_fn = lua.create_async_function(move |lua, args: mlua::MultiValue| {
                 let sv_args: mlua::Result<Vec<ScriptValue>> =
                     args.into_vec().iter().map(lua_to_script).collect();
                 async move {
-                    let mut sv_args = sv_args?;
-                    reshape_empty_tables(&mut sv_args, params, &subst);
+                    let sv_args = sv_args?;
                     let out = f(&sv_args).await.map_err(crate::error::call_error)?;
                     script_to_lua(&lua, out)
                 }
@@ -2847,14 +2593,12 @@ impl LuaFnBinder {
         }
         for (name, f) in &self.functions {
             let (name, f) = (*name, *f);
-            let params = self.params_of(name);
             let lua_fn = lua.create_function(move |lua, args: mlua::MultiValue| {
-                let mut script_args: Vec<ScriptValue> = args
+                let script_args: Vec<ScriptValue> = args
                     .into_vec()
                     .iter()
                     .map(lua_to_script)
                     .collect::<mlua::Result<_>>()?;
-                reshape_empty_tables(&mut script_args, params, &ParamSubst::NONE);
                 let result = f(&script_args).map_err(crate::error::call_error)?;
                 script_to_lua(lua, result)
             })?;
@@ -2878,8 +2622,7 @@ impl LuaFnBinder {
                     .collect::<mlua::Result<_>>()?;
                 let mut last_err = None;
                 for i in dyn_call_order(&script_args, &scan) {
-                    let script_args_i = dyn_candidate_args(&script_args, &candidates[i]);
-                    match (candidates[i].wrapper)(&script_args_i) {
+                    match (candidates[i].wrapper)(&script_args) {
                         Ok(out) => return script_to_lua(lua, out),
                         Err(haphe::ScriptCallError::Convert(e)) => last_err = Some(e),
                         Err(host) => {
@@ -2906,8 +2649,7 @@ impl LuaFnBinder {
                     let script_args = sv_args?;
                     let mut last_err = None;
                     for i in dyn_call_order(&script_args, &scan) {
-                        let script_args_i = dyn_candidate_args(&script_args, &candidates[i]);
-                        match (candidates[i].wrapper)(&script_args_i).await {
+                        match (candidates[i].wrapper)(&script_args).await {
                             Ok(out) => return script_to_lua(&lua, out),
                             Err(haphe::ScriptCallError::Convert(e)) => last_err = Some(e),
                             Err(host) => {

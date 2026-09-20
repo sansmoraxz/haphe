@@ -478,6 +478,8 @@ pub fn expand(mut item: ItemImpl) -> TokenStream {
                         async_methods.push(extract_bind_method(func, &info, fallible, &fn_args));
                     } else if !has_type_params && is_dispatch_eligible(func, &info) {
                         dispatch_methods.push(extract_bind_method(func, &info, fallible, &fn_args));
+                    } else if !has_type_params {
+                        reject_nested_references(func, &info, &mut errors);
                     }
                 } else if has_type_params || is_bind_compatible(func, &info) {
                     bind_methods.push(extract_bind_method(func, &info, fallible, &fn_args));
@@ -486,6 +488,8 @@ pub fn expand(mut item: ItemImpl) -> TokenStream {
                     // primitive newtypes): registration is decided by
                     // compile-time trait-presence dispatch instead.
                     dispatch_methods.push(extract_bind_method(func, &info, fallible, &fn_args));
+                } else if !has_type_params {
+                    reject_nested_references(func, &info, &mut errors);
                 }
             }
             methods.push(Entry {
@@ -513,6 +517,19 @@ pub fn expand(mut item: ItemImpl) -> TokenStream {
         };
         let bindable =
             bridgeable(&getter.ret_ty) && setter.as_ref().is_none_or(|st| bridgeable(&st.param_ty));
+        if !bindable {
+            for ty in std::iter::once(&getter.ret_ty).chain(setter.as_ref().map(|st| &st.param_ty))
+            {
+                if let Some(span) = crate::bind::nested_reference_span(ty) {
+                    errors.spanned(
+                        span,
+                        "references inside composite types cannot cross the bridge; \
+                         use owned element types (e.g. `Vec<String>` instead of `Vec<&str>`)",
+                    );
+                    break;
+                }
+            }
+        }
         if bindable {
             has_async_props |= getter.is_async || setter.as_ref().is_some_and(|st| st.is_async);
             property_regs.push(crate::bind::gen_property_registration(
@@ -693,6 +710,35 @@ fn is_bind_compatible(func: &syn::ImplItemFn, info: &crate::fn_desc::FnInfo) -> 
         return false;
     }
     true
+}
+
+/// The one unbindable cause we can name precisely: a reference nested inside
+/// a composite type has no bridge conversion at any surface — error at the
+/// declaration instead of leaving the method silently descriptor-only.
+fn reject_nested_references(
+    func: &syn::ImplItemFn,
+    info: &crate::fn_desc::FnInfo,
+    errors: &mut Errors,
+) {
+    let tys = func
+        .sig
+        .inputs
+        .iter()
+        .filter_map(|input| match input {
+            syn::FnArg::Typed(pat_ty) => Some(&*pat_ty.ty),
+            syn::FnArg::Receiver(_) => None,
+        })
+        .chain(info.return_ty.as_ref());
+    for ty in tys {
+        if let Some(span) = crate::bind::nested_reference_span(ty) {
+            errors.spanned(
+                span,
+                "references inside composite types cannot cross the bridge; \
+                 use owned element types (e.g. `Vec<String>` instead of `Vec<&str>`)",
+            );
+            return;
+        }
+    }
 }
 
 /// Extracts bind-relevant info from a processed function.
