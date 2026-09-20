@@ -114,3 +114,26 @@ fn flags_enum_descriptor() {
             .all(|v| matches!(v.kind, haphe::VariantKind::Unit))
     );
 }
+
+/// `i64::MIN` as an explicit discriminant is recorded exactly — its inner
+/// literal overflows i64 before negation, which must not silently fall back
+/// to the implicit chain.
+#[derive(Script)]
+#[repr(i64)]
+enum Extremes {
+    Min = -9_223_372_036_854_775_808,
+    NegOne = -1,
+    Max = 9_223_372_036_854_775_807,
+}
+
+#[test]
+fn extreme_discriminants_record_exactly() {
+    use haphe::ScriptEnum;
+    let desc = <Extremes as ScriptEnum>::DESCRIPTOR;
+    let discs: Vec<Option<i64>> = desc.variants.iter().map(|v| v.discriminant).collect();
+    assert_eq!(
+        discs,
+        [Some(i64::MIN), Some(-1), Some(i64::MAX)],
+        "explicit extreme discriminants must survive parsing"
+    );
+}

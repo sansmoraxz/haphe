@@ -542,17 +542,12 @@ fn check_fns_callbacks<'a>(
     fns: &[crate::function::FunctionDescriptor<'a>],
     errors: &mut Vec<CompatibilityError<'a>>,
 ) {
+    // One error per offending FUNCTION, and every function is scanned —
+    // `check` promises a list describing every mismatch.
     for f in fns {
-        for param in f.params {
-            if contains_callback(param.ty) {
-                errors.push(CompatibilityError::UnsupportedCallback {
-                    type_id,
-                    context: f.name,
-                });
-                return;
-            }
-        }
-        if contains_callback(f.return_type) {
+        if f.params.iter().any(|param| contains_callback(param.ty))
+            || contains_callback(f.return_type)
+        {
             errors.push(CompatibilityError::UnsupportedCallback {
                 type_id,
                 context: f.name,
@@ -566,17 +561,11 @@ fn check_fns_streams<'a>(
     fns: &[crate::function::FunctionDescriptor<'a>],
     errors: &mut Vec<CompatibilityError<'a>>,
 ) {
+    // One error per offending FUNCTION, and every function is scanned —
+    // `check` promises a list describing every mismatch.
     for f in fns {
-        for param in f.params {
-            if contains_stream(param.ty) {
-                errors.push(CompatibilityError::UnsupportedStream {
-                    type_id,
-                    context: f.name,
-                });
-                return;
-            }
-        }
-        if contains_stream(f.return_type) {
+        if f.params.iter().any(|param| contains_stream(param.ty)) || contains_stream(f.return_type)
+        {
             errors.push(CompatibilityError::UnsupportedStream {
                 type_id,
                 context: f.name,
@@ -613,17 +602,11 @@ fn check_fns_futures<'a>(
     fns: &[crate::function::FunctionDescriptor<'a>],
     errors: &mut Vec<CompatibilityError<'a>>,
 ) {
+    // One error per offending FUNCTION, and every function is scanned —
+    // `check` promises a list describing every mismatch.
     for f in fns {
-        for param in f.params {
-            if contains_future(param.ty) {
-                errors.push(CompatibilityError::UnsupportedFuture {
-                    type_id,
-                    context: f.name,
-                });
-                return;
-            }
-        }
-        if contains_future(f.return_type) {
+        if f.params.iter().any(|param| contains_future(param.ty)) || contains_future(f.return_type)
+        {
             errors.push(CompatibilityError::UnsupportedFuture {
                 type_id,
                 context: f.name,

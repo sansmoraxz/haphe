@@ -505,11 +505,14 @@ pub fn expand(mut item: ItemImpl) -> TokenStream {
         let setter = setters.remove(name);
         let readonly = setter.is_none();
         // Properties bind only when their script types pass the bridge
-        // whitelist (mirroring methods); others stay descriptor-only.
-        let bindable = crate::bind::is_bridge_compatible_type(&getter.ret_ty)
-            && setter
-                .as_ref()
-                .is_none_or(|st| crate::bind::is_bridge_compatible_type(&st.param_ty));
+        // whitelist (mirroring methods, full value-type gate); others stay
+        // descriptor-only.
+        let bridgeable = |ty: &Type| {
+            crate::bind::is_bridge_compatible_type(ty)
+                || crate::bind::is_bridge_value_type(&crate::bind::strip_ref(ty))
+        };
+        let bindable =
+            bridgeable(&getter.ret_ty) && setter.as_ref().is_none_or(|st| bridgeable(&st.param_ty));
         if bindable {
             has_async_props |= getter.is_async || setter.as_ref().is_some_and(|st| st.is_async);
             property_regs.push(crate::bind::gen_property_registration(
@@ -671,16 +674,21 @@ fn is_dispatch_eligible(func: &syn::ImplItemFn, info: &crate::fn_desc::FnInfo) -
 }
 
 fn is_bind_compatible(func: &syn::ImplItemFn, info: &crate::fn_desc::FnInfo) -> bool {
-    use crate::bind::is_bridge_compatible_type;
+    use crate::bind::{is_bridge_compatible_type, is_bridge_value_type, is_reference, strip_ref};
     for input in &func.sig.inputs {
         if let syn::FnArg::Typed(pat_ty) = input
             && !is_bridge_compatible_type(&pat_ty.ty)
+            // The full value-type whitelist (containers, std semantic types),
+            // judged like the wrapper converts: one reference stripped. Free
+            // functions use the same gate — methods must not be narrower.
+            && !is_bridge_value_type(&strip_ref(&pat_ty.ty))
         {
             return false;
         }
     }
     if let Some(ret) = &info.return_ty
         && !is_bridge_compatible_type(ret)
+        && (is_reference(ret) || !is_bridge_value_type(ret))
     {
         return false;
     }

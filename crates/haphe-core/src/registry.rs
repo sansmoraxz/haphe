@@ -487,6 +487,16 @@ impl<'a> TypeRegistry<'a> {
             }
         }
 
+        // Exposed type names, for the module-namespace check: a module's
+        // type entries share the namespace with its functions, constants,
+        // and submodules.
+        let type_names: std::collections::HashMap<TypeId<'a>, &'a str> = self
+            .structs
+            .iter()
+            .map(|s| (s.id, s.name))
+            .chain(self.enums.iter().map(|e| (e.id, e.name)))
+            .chain(self.type_aliases.iter().map(|a| (a.id, a.name)))
+            .collect();
         let mut top_level_names = HashSet::new();
         for module in self.modules {
             if !top_level_names.insert(module.name) {
@@ -495,7 +505,7 @@ impl<'a> TypeRegistry<'a> {
                     name: module.name,
                 });
             }
-            validate_module(module, &known, &mut errors);
+            validate_module(module, &known, &type_names, &mut errors);
         }
 
         if errors.is_empty() {
@@ -548,6 +558,7 @@ fn collect_duplicate_members<'a>(
 fn validate_module<'a>(
     module: &'a ModuleDescriptor<'a>,
     known: &HashSet<TypeId<'a>>,
+    type_names: &std::collections::HashMap<TypeId<'a>, &'a str>,
     errors: &mut Vec<RegistryError<'a>>,
 ) {
     let collect = |ty: &TypeDescriptor<'a>, errors: &mut Vec<RegistryError<'a>>| {
@@ -623,6 +634,12 @@ fn validate_module<'a>(
         .map(|f| f.name)
         .chain(module.constants.iter().map(|c| c.name))
         .chain(module.submodules.iter().map(|m| m.name))
+        .chain(
+            module
+                .type_ids
+                .iter()
+                .filter_map(|id| type_names.get(id).copied()),
+        )
     {
         if !seen.insert(name) {
             errors.push(RegistryError::DuplicateModuleEntry {
@@ -633,7 +650,7 @@ fn validate_module<'a>(
     }
 
     for submodule in module.submodules {
-        validate_module(submodule, known, errors);
+        validate_module(submodule, known, type_names, errors);
     }
 }
 

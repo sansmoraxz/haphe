@@ -1575,3 +1575,46 @@ fn flags_enum_with_payload_variant_fails_validation() {
         "got: {errors:?}"
     );
 }
+
+/// A module type entry shares the module namespace with functions,
+/// constants, and submodules: a constant named like an exposed type is a
+/// validation error, never a silent backend-side overwrite.
+#[test]
+fn module_type_names_share_the_namespace() {
+    static POINT_CONST_TY: TypeDescriptor<'static> = TypeDescriptor::Primitive(PrimitiveType::F64);
+    static CONSTS: [ConstantDescriptor<'static>; 1] = [ConstantDescriptor {
+        name: "Point",
+        doc: None,
+        ty: &POINT_CONST_TY,
+        value: "4.5",
+    }];
+    static TYPE_IDS: [TypeId<'static>; 1] = [TypeId::new("Point")];
+    static MODULES: [ModuleDescriptor<'static>; 1] = [ModuleDescriptor {
+        name: "geo",
+        doc: None,
+        functions: &[],
+        type_ids: &TYPE_IDS,
+        submodules: &[],
+        constants: &CONSTS,
+        function_instantiations: &[],
+    }];
+    let registry = TypeRegistry::new(
+        std::slice::from_ref(&POINT_DESC),
+        &[],
+        &[],
+        &MODULES,
+        &[],
+        &[],
+    );
+    let errors = registry.validate().unwrap_err();
+    assert!(
+        errors.iter().any(|e| matches!(
+            e,
+            haphe_core::RegistryError::DuplicateModuleEntry {
+                module: "geo",
+                name: "Point"
+            }
+        )),
+        "{errors:?}"
+    );
+}

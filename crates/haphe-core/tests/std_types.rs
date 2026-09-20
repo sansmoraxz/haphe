@@ -192,3 +192,40 @@ fn system_time_is_signed_since_epoch() {
         other => panic!("expected tuple, got {other:?}"),
     }
 }
+
+// ---------------------------------------------------------------------------
+// Numeric boundary policy: narrow integers range-check; u64 keeps the
+// bit-pattern policy; char never truncates.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn narrow_integers_range_check_instead_of_wrapping() {
+    use haphe_core::{FromScript, ScriptValue};
+    assert_eq!(u8::from_script(ScriptValue::I64(255)).unwrap(), 255);
+    assert!(u8::from_script(ScriptValue::I64(300)).is_err());
+    assert!(u8::from_script(ScriptValue::I64(-1)).is_err());
+    assert!(i8::from_script(ScriptValue::I64(128)).is_err());
+    assert_eq!(i32::from_script(ScriptValue::I64(-5)).unwrap(), -5);
+    assert!(i32::from_script(ScriptValue::I64(i64::from(i32::MAX) + 1)).is_err());
+    assert!(u32::from_script(ScriptValue::I64(i64::from(u32::MAX) + 1)).is_err());
+}
+
+#[test]
+fn u64_keeps_the_bit_pattern_policy() {
+    use haphe_core::{FromScript, ScriptValue};
+    // u64 has no lossless i64 representation: it crosses as the bit pattern.
+    let v = ScriptValue::from(u64::MAX);
+    assert!(matches!(v, ScriptValue::I64(-1)));
+    assert_eq!(u64::from_script(ScriptValue::I64(-1)).unwrap(), u64::MAX);
+}
+
+#[test]
+fn char_conversion_never_truncates() {
+    use haphe_core::{FromScript, ScriptValue};
+    assert_eq!(
+        char::from_script(ScriptValue::String("x".into())).unwrap(),
+        'x'
+    );
+    assert!(char::from_script(ScriptValue::String("xy".into())).is_err());
+    assert!(char::from_script(ScriptValue::String(String::new())).is_err());
+}

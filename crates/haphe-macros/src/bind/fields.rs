@@ -6,7 +6,7 @@ use quote::quote;
 use syn::Type;
 
 use super::BindField;
-use super::gates::{is_bridge_primitive, is_generic_type_param, needs_bridge_dispatch};
+use super::gates::{is_bridge_value_type, is_generic_type_param, needs_bridge_dispatch};
 
 // ---------------------------------------------------------------------------
 // Field registration
@@ -102,13 +102,23 @@ pub(crate) fn gen_field_registrations(
     } else {
         fields
             .iter()
-            .filter(|f| needs_bridge_dispatch(&f.ty, generic_params))
+            // Value-whitelisted fields register directly below; dispatch
+            // covers only the syntactically unjudgeable rest.
+            .filter(|f| {
+                !is_bridge_value_type(&f.ty) && needs_bridge_dispatch(&f.ty, generic_params)
+            })
             .map(|f| gen_dispatched_field_registration(self_ty, f))
             .collect()
     };
+    // The full value-type whitelist (containers, std semantic types), like
+    // methods and free functions — fields must not be narrower. OWNED types
+    // only: the `field` channel's accessors clone and store by value.
     let regs = fields
         .iter()
-        .filter(|f| is_bridge_primitive(&f.ty) || is_generic_type_param(&f.ty, generic_params))
+        .filter(|f| {
+            (!super::gates::is_reference(&f.ty) && is_bridge_value_type(&f.ty))
+                || is_generic_type_param(&f.ty, generic_params)
+        })
         .map(|f| {
             let ident = &f.ident;
             let name = &f.name;

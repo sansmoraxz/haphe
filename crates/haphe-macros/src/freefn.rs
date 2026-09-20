@@ -227,11 +227,14 @@ pub fn expand(mut item: ItemFn) -> TokenStream {
             .enumerate()
             .map(|(i, (name, ty))| {
                 let ty = substitute_type_params(ty, subst);
+                // Rendered at expansion time: `stringify!` on interpolated
+                // tokens would space every punct ("Vec < i64 >").
+                let expected = crate::derive::stringify_bound(&quote!(#ty));
                 quote! {
                     let #name = <#ty as ::haphe::FromScript>::from_script(
                         __args.get(#i).cloned().unwrap_or(::haphe::ScriptValue::Unit)
                     ).map_err(|__e| ::haphe::ScriptConvertError {
-                        expected: stringify!(#ty),
+                        expected: #expected,
                         got: __e.got,
                     })?;
                 }

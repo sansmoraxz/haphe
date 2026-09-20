@@ -37,6 +37,7 @@ type AsyncCtorFn<T> = for<'a> fn(&'a [ScriptValue]) -> haphe::ScriptCtorFuture<'
 type CowMethodFn<T> =
     for<'a> fn(haphe::ScriptCow<'a, T>, &[ScriptValue]) -> Result<ScriptValue, ScriptCallError>;
 type AssocFn = fn(&[ScriptValue]) -> Result<ScriptValue, ScriptCallError>;
+type MutMethodFn<T> = fn(&mut T, &[ScriptValue]) -> Result<ScriptValue, ScriptCallError>;
 type AsyncAssocFn = for<'a> fn(&'a [ScriptValue]) -> haphe::ScriptCallFuture<'a>;
 
 #[derive(Default)]
@@ -50,6 +51,7 @@ struct MockBinder<T> {
     bnot: Option<fn(&T) -> T>,
     fields: Vec<&'static str>,
     methods: Vec<(&'static str, CowMethodFn<T>)>,
+    mut_methods: Vec<(&'static str, MutMethodFn<T>)>,
     hash: Option<fn(&T) -> u64>,
     debug: Option<fn(&T) -> String>,
     constructors: Vec<(&'static str, CtorFn<T>)>,
@@ -93,9 +95,10 @@ impl<T> TypeBinder<T> for MockBinder<T> {
 
     fn method_mut(
         &mut self,
-        _: &'static str,
-        _: fn(&mut T, &[ScriptValue]) -> Result<ScriptValue, ScriptCallError>,
+        name: &'static str,
+        f: fn(&mut T, &[ScriptValue]) -> Result<ScriptValue, ScriptCallError>,
     ) -> Result<(), NeverError> {
+        self.mut_methods.push((name, f));
         Ok(())
     }
 
@@ -368,6 +371,7 @@ fn bound<T: ScriptBind>() -> MockBinder<T> {
         bnot: None,
         fields: Vec::new(),
         methods: Vec::new(),
+        mut_methods: Vec::new(),
         hash: None,
         debug: None,
         constructors: Vec::new(),
@@ -1599,4 +1603,127 @@ fn dispatched_async_associated_fn_binds_and_awaits() {
             .iter()
             .any(|(n, _)| *n == "flipped_later")
     );
+}
+
+// ---------------------------------------------------------------------------
+// Container-typed methods and properties bind (free-fn gate parity)
+// ---------------------------------------------------------------------------
+
+#[derive(Script, Clone)]
+#[script(methods)]
+struct Basket {
+    #[script(skip)]
+    #[allow(
+        dead_code,
+        reason = "fixtures are exercised through their generated descriptors and bridge wrappers, not direct calls"
+    )]
+    items: Vec<i64>,
+}
+
+#[haphe::script]
+impl Basket {
+    fn snapshot(&self) -> Vec<i64> {
+        self.items.clone()
+    }
+
+    fn add_all(&mut self, more: Vec<i64>) -> i64 {
+        self.items.extend(more);
+        self.items.iter().sum()
+    }
+
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "the OWNED map parameter is the surface under test (the boundary contract)"
+    )]
+    fn tally(&self, weights: std::collections::HashMap<String, i64>) -> i64 {
+        weights.values().sum::<i64>() + self.items.iter().sum::<i64>()
+    }
+
+    #[script(getter)]
+    fn labels(&self) -> Vec<String> {
+        self.items.iter().map(ToString::to_string).collect()
+    }
+}
+
+/// Transparent newtype over a container: conversions delegate to the inner
+/// container's blanket impls.
+#[derive(Script, Clone)]
+#[script(transparent)]
+struct Readings(Vec<i64>);
+
+#[test]
+fn container_typed_methods_and_properties_bind() {
+    let binder = bound::<Basket>();
+    let b = Basket { items: vec![1, 2] };
+
+    let (_, f) = binder
+        .methods
+        .iter()
+        .find(|(n, _)| *n == "snapshot")
+        .expect("container-returning method bound");
+    let out = f(haphe::ScriptCow::Borrowed(&b), &[]).unwrap();
+    assert!(matches!(out, ScriptValue::List(items) if items.len() == 2));
+
+    let (_, add) = binder
+        .mut_methods
+        .iter()
+        .find(|(n, _)| *n == "add_all")
+        .expect("container-parameter method bound");
+    let mut b2 = Basket { items: vec![1] };
+    let out = add(
+        &mut b2,
+        &[ScriptValue::List(vec![
+            ScriptValue::I64(2),
+            ScriptValue::I64(3),
+        ])],
+    )
+    .unwrap();
+    assert!(matches!(out, ScriptValue::I64(6)));
+
+    let (_, tally) = binder
+        .methods
+        .iter()
+        .find(|(n, _)| *n == "tally")
+        .expect("map-parameter method bound");
+    let out = tally(
+        haphe::ScriptCow::Borrowed(&b),
+        &[ScriptValue::Map(vec![("a".into(), ScriptValue::I64(4))])],
+    )
+    .unwrap();
+    assert!(matches!(out, ScriptValue::I64(7)));
+
+    assert!(
+        binder.prop_gets.iter().any(|(n, _)| *n == "labels"),
+        "container-typed property bound"
+    );
+}
+
+#[test]
+fn transparent_newtype_over_container_converts() {
+    let v = ScriptValue::from(Readings(vec![4, 5]));
+    assert!(matches!(&v, ScriptValue::List(items) if items.len() == 2));
+    let back = <Readings as haphe::FromScript>::from_script(v).unwrap();
+    assert_eq!(back.0, vec![4, 5]);
+}
+
+/// Container-typed FIELDS register through the plain `field` channel — the
+/// field gate is as wide as methods and free fns.
+#[derive(Script, Clone)]
+struct Inventory {
+    weights: std::collections::HashMap<String, i64>,
+    tags: Vec<String>,
+    #[script(readonly)]
+    home: std::path::PathBuf,
+}
+
+#[test]
+fn container_typed_fields_bind() {
+    let binder = bound::<Inventory>();
+    for name in ["weights", "tags", "home"] {
+        assert!(
+            binder.fields.contains(&name),
+            "field `{name}` must register; got {:?}",
+            binder.fields
+        );
+    }
 }

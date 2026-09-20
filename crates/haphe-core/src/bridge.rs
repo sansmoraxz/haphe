@@ -294,7 +294,12 @@ macro_rules! impl_int_bridge {
             impl FromScript for $ty {
                 fn from_script(v: ScriptValue) -> Result<Self, ScriptConvertError> {
                     match v {
-                        ScriptValue::I64(n) => Ok(n as $ty),
+                        // Range-checked: an out-of-range value is a caller
+                        // error, never a silent wrap.
+                        ScriptValue::I64(n) => n.try_into().map_err(|_| ScriptConvertError {
+                            expected: concat!("value in range of ", stringify!($ty)),
+                            got: "out-of-range integer",
+                        }),
                         other => Err(ScriptConvertError {
                             expected: stringify!($ty),
                             got: other.variant_name(),
@@ -365,10 +370,22 @@ impl FromScript for char {
     fn from_script(v: ScriptValue) -> Result<Self, ScriptConvertError> {
         match v {
             ScriptValue::Char(c) => Ok(c),
-            ScriptValue::String(s) => s.chars().next().ok_or(ScriptConvertError {
-                expected: "char",
-                got: "empty string",
-            }),
+            // Only a single-character string converts; anything longer would
+            // silently drop data.
+            ScriptValue::String(s) => {
+                let mut chars = s.chars();
+                match (chars.next(), chars.next()) {
+                    (Some(c), None) => Ok(c),
+                    (None, _) => Err(ScriptConvertError {
+                        expected: "char",
+                        got: "empty string",
+                    }),
+                    (Some(_), Some(_)) => Err(ScriptConvertError {
+                        expected: "char",
+                        got: "multi-character string",
+                    }),
+                }
+            }
             other => Err(ScriptConvertError {
                 expected: "char",
                 got: other.variant_name(),

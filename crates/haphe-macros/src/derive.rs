@@ -591,7 +591,21 @@ fn expand_inner(input: &DeriveInput) -> syn::Result<TokenStream> {
                                 ..
                             }) = expr.as_ref()
                             {
-                                lit.base10_parse::<i64>().ok().map(|v| -v)
+                                // Parsed wide then negated so `i64::MIN`
+                                // (whose inner literal overflows i64) is
+                                // accepted, and genuine overflow errors
+                                // instead of silently falling back to the
+                                // implicit chain.
+                                match lit.base10_parse::<i128>().map(|v| -v) {
+                                    Ok(v) if i64::try_from(v).is_ok() => Some(v as i64),
+                                    _ => {
+                                        errors.spanned(
+                                            lit.span(),
+                                            "script enum discriminants must fit in 64 bits (i64)",
+                                        );
+                                        None
+                                    }
+                                }
                             } else {
                                 errors.spanned(
                                     expr.span(),
@@ -1136,17 +1150,20 @@ fn expand_newtype(
     // the inner value itself, so runtimes see their native primitive — e.g.
     // a `bool` newtype participates in Lua truthiness. The conversions
     // delegate through the inner type's own `From`/`FromScript`, so chains
-    // of transparent newtypes recurse down to the primitive; a transparent
-    // newtype over a non-convertible inner is a compile error. Opaque
-    // newtypes stay distinct named types with no generated conversions.
-    let is_value_convertible = match &field.ty {
-        syn::Type::Path(p) => p
-            .path
-            .segments
-            .last()
-            .is_some_and(|seg| seg.arguments.is_none()),
-        _ => false,
-    };
+    // of transparent newtypes recurse down to the primitive, and containers
+    // of value types (`Vec<i64>`, maps, tuples) convert through their
+    // blanket impls; a transparent newtype over a non-convertible bare-ident
+    // inner is a compile error. Opaque newtypes stay distinct named types
+    // with no generated conversions.
+    let is_value_convertible = crate::bind::is_bridge_value_type(&field.ty)
+        || match &field.ty {
+            syn::Type::Path(p) => p
+                .path
+                .segments
+                .last()
+                .is_some_and(|seg| seg.arguments.is_none()),
+            _ => false,
+        };
     let conversions = if transparent && is_value_convertible && field_args.bytes.is_none() {
         let inner_ty = &field.ty;
         let (access, construct) = match &field.ident {

@@ -465,14 +465,14 @@ pub struct EnumDescriptor<'a> {
     pub thread_safety: ThreadSafety,
     /// Generic type parameters declared on this enum.
     pub generic_params: &'a [GenericParam<'a>],
-    /// Whether this enum is a bitflags set: each (unit) variant names one
-    /// independent bit, in declaration order. Backends map it to their native
-    /// bitset construct.
     /// Numeric script representation, propagated from the Rust `#[repr]`
     /// integer type (the exact type — backends that can express `u8`
     /// should). `None` means the enum crosses as its declared case names
     /// (the default).
     pub repr: Option<PrimitiveType>,
+    /// Whether this enum is a bitflags set: each (unit) variant names one
+    /// independent bit, in declaration order. Backends map it to their native
+    /// bitset construct.
     pub is_flags: bool,
 }
 
