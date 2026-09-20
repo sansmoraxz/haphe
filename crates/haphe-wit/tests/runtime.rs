@@ -4177,16 +4177,34 @@ struct FlagT(bool);
 /// Newtype-typed async methods bind through trait-presence dispatch onto the
 /// async channels; WIT sees plain `bool`s.
 #[derive(Script, Clone)]
-#[script(thread_safety = send_sync, methods)]
+#[script(
+    thread_safety = send_sync,
+    traits(Call(args = (std::collections::HashMap<String, i64>,), output = i64)),
+    methods
+)]
 struct Toggle {
     powered: FlagT,
+    // Container FIELDS still fail the macro's field gate (reported); the
+    // map surface is exposed as a computed property below.
+    #[script(skip)]
+    weights: std::collections::HashMap<String, i64>,
+}
+
+impl haphe::ops::Call<(std::collections::HashMap<String, i64>,)> for Toggle {
+    type Output = i64;
+    fn call(&self, (weights,): (std::collections::HashMap<String, i64>,)) -> i64 {
+        i64::from(self.powered.0) + weights.values().sum::<i64>()
+    }
 }
 
 #[script]
 impl Toggle {
     #[script(constructor)]
     fn new(on: bool) -> Self {
-        Toggle { powered: FlagT(on) }
+        Toggle {
+            powered: FlagT(on),
+            weights: std::collections::HashMap::new(),
+        }
     }
 
     async fn toggled_later(&self, next: FlagT) -> FlagT {
@@ -4224,6 +4242,52 @@ impl Toggle {
             Err(TextError("already off".into()))
         }
     }
+
+    /// Consuming receiver: acquired borrow-and-clone, the table entry is
+    /// consumed only when the call actually runs.
+    fn unwrap_flag(self) -> bool {
+        self.powered.0
+    }
+
+    /// Container-typed method: binds through the full value-type gate, like
+    /// free functions.
+    fn history(&self) -> Vec<i64> {
+        vec![7, 9]
+    }
+
+    /// Map-typed parameter on a METHOD: lifted by the declared descriptor.
+    fn weigh_up(&self, weights: std::collections::HashMap<String, i64>) -> i64 {
+        i64::from(self.powered.0) + weights.values().sum::<i64>()
+    }
+
+    /// Reads back the map a guest stored through the property setter.
+    fn stored(&self) -> i64 {
+        self.weights.values().sum()
+    }
+
+    /// Map-typed computed property: the setter's value is lifted by the
+    /// declared descriptor.
+    #[script(getter)]
+    fn weights(&self) -> std::collections::HashMap<String, i64> {
+        self.weights.clone()
+    }
+
+    #[script(setter)]
+    fn set_weights(&mut self, weights: std::collections::HashMap<String, i64>) {
+        self.weights = weights;
+    }
+}
+
+/// The `u64` bit-pattern policy end to end: `u64::MAX` crosses as `I64(-1)`
+/// between wrapper and runtime, and reaches the guest as `u64::MAX`.
+#[script]
+fn max_tag() -> u64 {
+    u64::MAX
+}
+
+#[script]
+fn echo_tag(tag: u64) -> u64 {
+    tag
 }
 
 #[script]
@@ -4269,7 +4333,7 @@ haphe::registry! {
     static TOGGLE_REGISTRY = {
         structs: [Toggle],
         modules: [
-            mod toggles { functions: [invert_later, flip_deep], types: [Toggle] },
+            mod toggles { functions: [invert_later, flip_deep, max_tag, echo_tag], types: [Toggle] },
         ],
     };
 }
@@ -4613,6 +4677,22 @@ fn transparent_newtype_async_signatures_render_as_bool() {
         text.contains("checked-flip: static func(flag: bool) -> result<bool, script-error>;"),
         "got:\n{text}"
     );
+    // A consuming receiver renders as a static taking the owned handle.
+    assert!(
+        text.contains("unwrap-flag: static func(this: toggle) -> bool;"),
+        "got:\n{text}"
+    );
+    // Container-typed methods bind through the full value-type gate.
+    assert!(
+        text.contains("history: func() -> list<s64>;"),
+        "got:\n{text}"
+    );
+    // u64 stays u64 in the text; the runtime carries the i64 bit pattern.
+    assert!(text.contains("max-tag: func() -> u64;"), "got:\n{text}");
+    assert!(
+        text.contains("echo-tag: func(tag: u64) -> u64;"),
+        "got:\n{text}"
+    );
 }
 
 /// A message-only fixture error: `String` itself no longer crosses (host
@@ -4627,3 +4707,346 @@ impl std::fmt::Display for TextError {
 }
 
 impl std::error::Error for TextError {}
+
+/// u64 bit-pattern round trip, a consuming static, and a list-returning
+/// method, all live: echo-tag(max-tag()) must be `u64::MAX` (core `i64` -1),
+/// unwrap-flag consumes an owned handle and yields its flag, history lifts
+/// as a two-element list starting with 7.
+const TOGGLE_POLICY_GUEST: &str = r#"
+(component
+  (import "haphe:demo/toggles" (instance $tg
+    (export "toggle" (type $t (sub resource)))
+    (export "[constructor]toggle" (func (param "on" bool) (result (own $t))))
+    (export "[static]toggle.unwrap-flag" (func (param "this" (own $t)) (result bool)))
+    (export "[method]toggle.history" (func (param "self" (borrow $t)) (result (list s64))))
+    (export "max-tag" (func (result u64)))
+    (export "echo-tag" (func (param "tag" u64) (result u64)))
+  ))
+  (alias export $tg "toggle" (type $t-t))
+  (core module $libc
+    (memory (export "mem") 16)
+    (global $next (mut i32) (i32.const 4096))
+    (func (export "realloc") (param i32 i32 i32 i32) (result i32)
+      (local $ptr i32)
+      (global.set $next (i32.and (i32.add (global.get $next) (i32.const 7)) (i32.const -8)))
+      (local.set $ptr (global.get $next))
+      (global.set $next (i32.add (global.get $next) (local.get 3)))
+      (local.get $ptr))
+  )
+  (core instance $li (instantiate $libc))
+  (core func $ctor (canon lower (func $tg "[constructor]toggle")))
+  (core func $unwrap (canon lower (func $tg "[static]toggle.unwrap-flag")))
+  (core func $hist (canon lower (func $tg "[method]toggle.history")
+    (memory (core memory $li "mem")) (realloc (core func $li "realloc"))))
+  (core func $max (canon lower (func $tg "max-tag")))
+  (core func $echo (canon lower (func $tg "echo-tag")))
+  (core func $dropt (canon resource.drop $t-t))
+  (core module $m
+    (import "libc" "mem" (memory 1))
+    (import "libc" "realloc" (func $ra (param i32 i32 i32 i32) (result i32)))
+    (import "tg" "ctor" (func $ctor (param i32) (result i32)))
+    (import "tg" "unwrap" (func $unwrap (param i32) (result i32)))
+    (import "tg" "hist" (func $hist (param i32 i32)))
+    (import "tg" "max" (func $max (result i64)))
+    (import "tg" "echo" (func $echo (param i64) (result i64)))
+    (import "tg" "drop" (func $dropt (param i32)))
+    (func (export "run") (result i32) (local $h i32) (local $p i32) (local $ok i32)
+      ;; u64::MAX survives the round trip (core repr: i64 -1).
+      (local.set $ok (i64.eq (call $echo (call $max)) (i64.const -1)))
+      ;; A consuming static takes the owned handle and reads its flag.
+      (local.set $ok (i32.and (local.get $ok)
+        (call $unwrap (call $ctor (i32.const 1)))))
+      ;; history() lifts as [7, 9].
+      (local.set $h (call $ctor (i32.const 0)))
+      (local.set $p (call $ra (i32.const 0) (i32.const 0) (i32.const 8) (i32.const 8)))
+      (call $hist (local.get $h) (local.get $p))
+      (local.set $ok (i32.and (local.get $ok) (i32.and
+        (i32.eq (i32.load offset=4 (local.get $p)) (i32.const 2))
+        (i64.eq (i64.load (i32.load (local.get $p))) (i64.const 7)))))
+      (call $dropt (local.get $h))
+      (local.get $ok))
+  )
+  (core instance $mi (instantiate $m
+    (with "libc" (instance
+      (export "mem" (memory $li "mem"))
+      (export "realloc" (func $li "realloc"))))
+    (with "tg" (instance
+      (export "ctor" (func $ctor))
+      (export "unwrap" (func $unwrap))
+      (export "hist" (func $hist))
+      (export "max" (func $max))
+      (export "echo" (func $echo))
+      (export "drop" (func $dropt))))
+  ))
+  (func (export "run") (result bool) (canon lift (core func $mi "run")))
+)
+"#;
+
+#[test]
+fn u64_policy_consuming_static_and_container_method_execute_live() {
+    let engine = Engine::default();
+    let mut linker = Linker::new(&engine);
+    let mut b = WasmBinder::new(WitGenerator::new("haphe:demo"));
+    b.register_type::<Toggle>().unwrap();
+    b.register_fn::<invert_later>().unwrap();
+    b.register_fn::<flip_deep>().unwrap();
+    b.register_fn::<max_tag>().unwrap();
+    b.register_fn::<echo_tag>().unwrap();
+    haphe::bind(&b, &TOGGLE_REGISTRY, &mut linker).expect("binding succeeds");
+
+    let out = run_guest(&engine, &linker, (), TOGGLE_POLICY_GUEST).expect("policy guest runs");
+    assert_eq!(out, Val::Bool(true));
+}
+
+/// Map-typed parameters, provided direction: the guest passes the declared
+/// `list<tuple<string, s64>>` shape and the host must lift it as a MAP for
+/// the wrapper's `FromScript<HashMap>` — the declared descriptor, not the
+/// wire shape, decides.
+#[script]
+fn weigh(weights: std::collections::HashMap<String, i64>) -> i64 {
+    weights.values().sum()
+}
+
+const MAP_PARAM_GUEST: &str = r#"
+(component
+  (import "haphe:demo/scales" (instance $sc
+    (export "weigh" (func (param "weights" (list (tuple string s64))) (result s64)))
+  ))
+  (core module $libc
+    (memory (export "mem") 16)
+    (func (export "realloc") (param i32 i32 i32 i32) (result i32) (i32.const 8192))
+  )
+  (core instance $li (instantiate $libc))
+  (core func $weigh (canon lower (func $sc "weigh")
+    (memory (core memory $li "mem")) (realloc (core func $li "realloc"))))
+  (core module $m
+    (import "libc" "mem" (memory 1))
+    (import "sc" "weigh" (func $weigh (param i32 i32) (result i64)))
+    ;; tuple<string, s64>: string ptr@0 len@4, s64@8 — stride 16.
+    (data (i32.const 256) "ab")
+    (func $init
+      ;; entry 0: ("a", 4)
+      (i32.store (i32.const 0) (i32.const 256))
+      (i32.store (i32.const 4) (i32.const 1))
+      (i64.store (i32.const 8) (i64.const 4))
+      ;; entry 1: ("b", 5)
+      (i32.store (i32.const 16) (i32.const 257))
+      (i32.store (i32.const 20) (i32.const 1))
+      (i64.store (i32.const 24) (i64.const 5)))
+    (func (export "run") (result i64)
+      (call $init)
+      (call $weigh (i32.const 0) (i32.const 2)))
+  )
+  (core instance $mi (instantiate $m
+    (with "libc" (instance
+      (export "mem" (memory $li "mem"))))
+    (with "sc" (instance
+      (export "weigh" (func $weigh))))
+  ))
+  (func (export "run") (result s64) (canon lift (core func $mi "run")))
+)
+"#;
+
+haphe::registry! {
+    static SCALES_REGISTRY = {
+        modules: [
+            mod scales { functions: [weigh] },
+        ],
+    };
+}
+
+/// Same wire value through the METHOD path: weigh-up(toggle(true), [("a",4),("b",5)]) = 10.
+const MAP_METHOD_GUEST: &str = r#"
+(component
+  (import "haphe:demo/toggles" (instance $tg
+    (export "toggle" (type $t (sub resource)))
+    (export "[constructor]toggle" (func (param "on" bool) (result (own $t))))
+    (export "[method]toggle.weigh-up" (func (param "self" (borrow $t)) (param "weights" (list (tuple string s64))) (result s64)))
+  ))
+  (core module $libc
+    (memory (export "mem") 16)
+    (func (export "realloc") (param i32 i32 i32 i32) (result i32) (i32.const 8192))
+  )
+  (core instance $li (instantiate $libc))
+  (core func $ctor (canon lower (func $tg "[constructor]toggle")))
+  (core func $weigh (canon lower (func $tg "[method]toggle.weigh-up")
+    (memory (core memory $li "mem")) (realloc (core func $li "realloc"))))
+  (core module $m
+    (import "libc" "mem" (memory 1))
+    (import "tg" "ctor" (func $ctor (param i32) (result i32)))
+    (import "tg" "weigh" (func $weigh (param i32 i32 i32) (result i64)))
+    (data (i32.const 256) "ab")
+    (func $init
+      (i32.store (i32.const 0) (i32.const 256))
+      (i32.store (i32.const 4) (i32.const 1))
+      (i64.store (i32.const 8) (i64.const 4))
+      (i32.store (i32.const 16) (i32.const 257))
+      (i32.store (i32.const 20) (i32.const 1))
+      (i64.store (i32.const 24) (i64.const 5)))
+    (func (export "run") (result i64)
+      (call $init)
+      (call $weigh (call $ctor (i32.const 1)) (i32.const 0) (i32.const 2)))
+  )
+  (core instance $mi (instantiate $m
+    (with "libc" (instance
+      (export "mem" (memory $li "mem"))))
+    (with "tg" (instance
+      (export "ctor" (func $ctor))
+      (export "weigh" (func $weigh))))
+  ))
+  (func (export "run") (result s64) (canon lift (core func $mi "run")))
+)
+"#;
+
+/// The map PROPERTY round trip: set-weights([("a",4),("b",5)]) then
+/// `stored()` = 9.
+const MAP_FIELD_GUEST: &str = r#"
+(component
+  (import "haphe:demo/toggles" (instance $tg
+    (export "toggle" (type $t (sub resource)))
+    (export "[constructor]toggle" (func (param "on" bool) (result (own $t))))
+    (export "[method]toggle.set-weights" (func (param "self" (borrow $t)) (param "value" (list (tuple string s64)))))
+    (export "[method]toggle.stored" (func (param "self" (borrow $t)) (result s64)))
+  ))
+  (core module $libc
+    (memory (export "mem") 16)
+    (func (export "realloc") (param i32 i32 i32 i32) (result i32) (i32.const 8192))
+  )
+  (core instance $li (instantiate $libc))
+  (core func $ctor (canon lower (func $tg "[constructor]toggle")))
+  (core func $set (canon lower (func $tg "[method]toggle.set-weights")
+    (memory (core memory $li "mem")) (realloc (core func $li "realloc"))))
+  (core func $stored (canon lower (func $tg "[method]toggle.stored")))
+  (core module $m
+    (import "libc" "mem" (memory 1))
+    (import "tg" "ctor" (func $ctor (param i32) (result i32)))
+    (import "tg" "set" (func $set (param i32 i32 i32)))
+    (import "tg" "stored" (func $stored (param i32) (result i64)))
+    (data (i32.const 256) "ab")
+    (func $init
+      (i32.store (i32.const 0) (i32.const 256))
+      (i32.store (i32.const 4) (i32.const 1))
+      (i64.store (i32.const 8) (i64.const 4))
+      (i32.store (i32.const 16) (i32.const 257))
+      (i32.store (i32.const 20) (i32.const 1))
+      (i64.store (i32.const 24) (i64.const 5)))
+    (func (export "run") (result i64) (local $h i32)
+      (call $init)
+      (local.set $h (call $ctor (i32.const 1)))
+      (call $set (local.get $h) (i32.const 0) (i32.const 2))
+      (call $stored (local.get $h)))
+  )
+  (core instance $mi (instantiate $m
+    (with "libc" (instance
+      (export "mem" (memory $li "mem"))))
+    (with "tg" (instance
+      (export "ctor" (func $ctor))
+      (export "set" (func $set))
+      (export "stored" (func $stored))))
+  ))
+  (func (export "run") (result s64) (canon lift (core func $mi "run")))
+)
+"#;
+
+/// Map argument through a TRAIT PROJECTION: call(toggle(true), pairs) = 10.
+const MAP_CALL_GUEST: &str = r#"
+(component
+  (import "haphe:demo/toggles" (instance $tg
+    (export "toggle" (type $t (sub resource)))
+    (export "[constructor]toggle" (func (param "on" bool) (result (own $t))))
+    (export "[method]toggle.call" (func (param "self" (borrow $t)) (param "a0" (list (tuple string s64))) (result s64)))
+  ))
+  (core module $libc
+    (memory (export "mem") 16)
+    (func (export "realloc") (param i32 i32 i32 i32) (result i32) (i32.const 8192))
+  )
+  (core instance $li (instantiate $libc))
+  (core func $ctor (canon lower (func $tg "[constructor]toggle")))
+  (core func $call (canon lower (func $tg "[method]toggle.call")
+    (memory (core memory $li "mem")) (realloc (core func $li "realloc"))))
+  (core module $m
+    (import "libc" "mem" (memory 1))
+    (import "tg" "ctor" (func $ctor (param i32) (result i32)))
+    (import "tg" "call" (func $call (param i32 i32 i32) (result i64)))
+    (data (i32.const 256) "ab")
+    (func $init
+      (i32.store (i32.const 0) (i32.const 256))
+      (i32.store (i32.const 4) (i32.const 1))
+      (i64.store (i32.const 8) (i64.const 4))
+      (i32.store (i32.const 16) (i32.const 257))
+      (i32.store (i32.const 20) (i32.const 1))
+      (i64.store (i32.const 24) (i64.const 5)))
+    (func (export "run") (result i64)
+      (call $init)
+      (call $call (call $ctor (i32.const 1)) (i32.const 0) (i32.const 2)))
+  )
+  (core instance $mi (instantiate $m
+    (with "libc" (instance
+      (export "mem" (memory $li "mem"))))
+    (with "tg" (instance
+      (export "ctor" (func $ctor))
+      (export "call" (func $call))))
+  ))
+  (func (export "run") (result s64) (canon lift (core func $mi "run")))
+)
+"#;
+
+#[test]
+fn map_call_projection_lifts_by_declared_descriptor() {
+    let engine = Engine::default();
+    let mut linker = Linker::new(&engine);
+    let mut b = WasmBinder::new(WitGenerator::new("haphe:demo"));
+    b.register_type::<Toggle>().unwrap();
+    b.register_fn::<invert_later>().unwrap();
+    b.register_fn::<flip_deep>().unwrap();
+    b.register_fn::<max_tag>().unwrap();
+    b.register_fn::<echo_tag>().unwrap();
+    haphe::bind(&b, &TOGGLE_REGISTRY, &mut linker).expect("binding succeeds");
+
+    let out = run_guest(&engine, &linker, (), MAP_CALL_GUEST).expect("map call arg lifts");
+    assert_eq!(out, Val::S64(10));
+}
+
+#[test]
+fn map_field_setter_lifts_by_declared_descriptor() {
+    let engine = Engine::default();
+    let mut linker = Linker::new(&engine);
+    let mut b = WasmBinder::new(WitGenerator::new("haphe:demo"));
+    b.register_type::<Toggle>().unwrap();
+    b.register_fn::<invert_later>().unwrap();
+    b.register_fn::<flip_deep>().unwrap();
+    b.register_fn::<max_tag>().unwrap();
+    b.register_fn::<echo_tag>().unwrap();
+    haphe::bind(&b, &TOGGLE_REGISTRY, &mut linker).expect("binding succeeds");
+
+    let out = run_guest(&engine, &linker, (), MAP_FIELD_GUEST).expect("map field setter lifts");
+    assert_eq!(out, Val::S64(9));
+}
+
+#[test]
+fn map_method_params_lift_by_declared_descriptor() {
+    let engine = Engine::default();
+    let mut linker = Linker::new(&engine);
+    let mut b = WasmBinder::new(WitGenerator::new("haphe:demo"));
+    b.register_type::<Toggle>().unwrap();
+    b.register_fn::<invert_later>().unwrap();
+    b.register_fn::<flip_deep>().unwrap();
+    b.register_fn::<max_tag>().unwrap();
+    b.register_fn::<echo_tag>().unwrap();
+    haphe::bind(&b, &TOGGLE_REGISTRY, &mut linker).expect("binding succeeds");
+
+    let out = run_guest(&engine, &linker, (), MAP_METHOD_GUEST).expect("map method param lifts");
+    assert_eq!(out, Val::S64(10));
+}
+
+#[test]
+fn map_params_lift_by_declared_descriptor() {
+    let engine = Engine::default();
+    let mut linker = Linker::new(&engine);
+    let mut b = WasmBinder::new(WitGenerator::new("haphe:demo"));
+    b.register_fn::<weigh>().unwrap();
+    haphe::bind(&b, &SCALES_REGISTRY, &mut linker).expect("binding succeeds");
+
+    let out = run_guest(&engine, &linker, (), MAP_PARAM_GUEST).expect("map param lifts");
+    assert_eq!(out, Val::S64(9));
+}

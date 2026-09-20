@@ -56,5 +56,5 @@ fn stream_fn_binds_as_stub() {
         .load("events.subscribe('news')")
         .exec()
         .expect_err("stub should error");
-    assert!(err.to_string().contains("not yet implemented"));
+    assert!(err.to_string().contains("not bound"));
 }

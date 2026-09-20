@@ -260,7 +260,7 @@ fn function_stubs_error_on_call() {
         .exec()
         .expect_err("stub should error");
     let msg = err.to_string();
-    assert!(msg.contains("not yet implemented"), "got: {msg}");
+    assert!(msg.contains("not bound"), "got: {msg}");
 }
 
 #[test]
@@ -272,7 +272,7 @@ fn submodule_function_stubs_error_on_call() {
         .exec()
         .expect_err("stub should error");
     let msg = err.to_string();
-    assert!(msg.contains("not yet implemented"), "got: {msg}");
+    assert!(msg.contains("not bound"), "got: {msg}");
 }
 
 #[test]

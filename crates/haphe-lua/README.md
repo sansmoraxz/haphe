@@ -60,6 +60,10 @@ lua.load("local p = geometry.Point.new(3, 4); return geometry.add(1, 2)")
 Modules become nested global tables mirroring the registry hierarchy;
 constants become plain Lua values on their module table.
 
+Order matters: `bind()` (re)creates the module tables, so it runs FIRST —
+`bind_fn`/`bind_type` refinements installed before it would be wiped by the
+fresh tables.
+
 ## Exposing types
 
 `#[derive(Script)]` + `#[script] impl` turn a struct into Lua UserData with

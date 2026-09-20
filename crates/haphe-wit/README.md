@@ -29,7 +29,7 @@ let output = haphe::generate(&generator, &REGISTRY)?;
 | `&T`/`&mut T` params where `T` is a resource | `borrow<t>` |
 | `Borrowed { lifetime, inner }` (lifetime carriers, e.g. `Cow<'a, T>`) | lowered as `inner` — WIT values cross by copy, so the carried lifetime does not exist in the text |
 | `Result<T, E>` | `result<t, e>` (unit sides collapse) |
-| `HashMap<K, V>` | `list<tuple<k, v>>` |
+| `HashMap<K, V>` | `list<tuple<k, v>>` (WIT has no map type; the runtime lifts a map-DECLARED argument position back into a map by the declared descriptor, since the wire shape alone cannot distinguish it from a genuine list of pairs) |
 | `[T; N]` | `list<T, N>` (fixed-length list) |
 | `async fn` | `async func` (component-model async, WASI 0.3+) |
 | `haphe::Stream<T>` (haphe's `streams` feature) | `stream<T>` |
@@ -85,6 +85,18 @@ properties, generic monomorphs and `dyn` dispatchers, enum companions, trait
 projections, and constants. Anything declared in the registry but not
 registered is defined as a stub that traps descriptively when called, so
 guests always link.
+
+Numeric policy matches core's: narrow integers (`u8`–`u32`, `s8`–`s32`)
+range-check at the boundary and reject out-of-range values descriptively;
+`u64` crosses as the `i64` **bit pattern** (core's declared policy — the
+bridge carries `i64`), so `u64::MAX` reaches the guest intact rather than
+trapping.
+
+A consuming (`self`) method renders as `static func(this: T, ...)` and
+acquires its receiver by borrow-and-clone, like the `dyn` dispatcher: the
+live table entry is consumed only when the call actually RUNS — an
+argument-conversion rejection leaves the resource intact, and later use of a
+consumed handle traps descriptively.
 
 ## Errors: guest-visible results and conversion traps
 

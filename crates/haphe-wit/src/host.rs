@@ -605,17 +605,17 @@ impl<U: 'static> TypeBinder<U> for RawTable<U> {
 // Erased resource entry (values live in the HostTable)
 // ---------------------------------------------------------------------------
 
-/// Receiver carrier at the erased layer, mirroring [`ScriptCow`].
-pub(crate) enum CowAny<'a> {
-    Borrowed(&'a (dyn Any + Send)),
-    Owned(AnyBox),
-}
+/// Receiver reference at the erased layer. Every acquisition is
+/// borrow-and-clone (consuming wrappers `into_owned` a borrowed
+/// [`ScriptCow`]), so table entries are consumed only AFTER a call actually
+/// ran — there is deliberately no owned carrier.
+pub(crate) type AnyRef<'a> = &'a (dyn Any + Send);
 
 type EGet = Box<dyn Fn(&(dyn Any + Send)) -> Result<Sv, Sce> + Send + Sync>;
 type ESet = Box<dyn Fn(&mut (dyn Any + Send), Sv) -> Result<(), Sce> + Send + Sync>;
-type ECow = Box<dyn for<'a> Fn(CowAny<'a>, &[Sv]) -> Result<Sv, Ce> + Send + Sync>;
+type ECow = Box<dyn for<'a> Fn(AnyRef<'a>, &[Sv]) -> Result<Sv, Ce> + Send + Sync>;
 type EMut = Box<dyn Fn(&mut (dyn Any + Send), &[Sv]) -> Result<Sv, Ce> + Send + Sync>;
-type EAsyncCow = Box<dyn for<'a> Fn(CowAny<'a>, &'a [Sv]) -> ScriptCallFuture<'a> + Send + Sync>;
+type EAsyncCow = Box<dyn for<'a> Fn(AnyRef<'a>, &'a [Sv]) -> ScriptCallFuture<'a> + Send + Sync>;
 type EAsyncMut =
     Box<dyn for<'a> Fn(&'a mut (dyn Any + Send), &'a [Sv]) -> ScriptCallFuture<'a> + Send + Sync>;
 type ECtor = Box<dyn Fn(&[Sv]) -> Result<AnyBox, Ce> + Send + Sync>;
@@ -626,7 +626,7 @@ type EScalar = Box<dyn Fn(AnyBox, &[Sv]) -> Result<AnyBox, Sce> + Send + Sync>;
 type EIndex = Box<dyn Fn(&(dyn Any + Send), &[Sv]) -> Result<Sv, Sce> + Send + Sync>;
 type ENewIndex = Box<dyn Fn(&mut (dyn Any + Send), &[Sv]) -> Result<(), Sce> + Send + Sync>;
 
-type EAsyncGet = Box<dyn for<'a> Fn(CowAny<'a>) -> ScriptCallFuture<'a> + Send + Sync>;
+type EAsyncGet = Box<dyn for<'a> Fn(AnyRef<'a>) -> ScriptCallFuture<'a> + Send + Sync>;
 type EAsyncSet =
     Box<dyn for<'a> Fn(&'a mut (dyn Any + Send), Sv) -> ScriptCallFuture<'a> + Send + Sync>;
 type EAsyncCtorFut<'a> =
@@ -738,11 +738,8 @@ fn expect_u_box<U: 'static>(any: AnyBox) -> U {
         .unwrap_or_else(|_| panic!("host table entry type_name was checked before dispatch"))
 }
 
-fn cow_of<U: 'static>(recv: CowAny<'_>) -> ScriptCow<'_, U> {
-    match recv {
-        CowAny::Borrowed(any) => ScriptCow::Borrowed(expect_u::<U>(any)),
-        CowAny::Owned(any) => ScriptCow::Owned(expect_u_box::<U>(any)),
-    }
+fn cow_of<U: 'static>(recv: AnyRef<'_>) -> ScriptCow<'_, U> {
+    ScriptCow::Borrowed(expect_u::<U>(recv))
 }
 
 /// Erases a collected [`RawTable`] into a [`ResourceEntry`] whose values
@@ -1323,20 +1320,39 @@ where
             }),
         );
     }
-    if let Some(f) = raw.call {
-        entry.projections.insert(
-            "call",
-            Box::new(move |args| Ok(f(&from_sv::<U>(this(args)?)?, &args[1..])?)),
-        );
-    }
-    if let Some(f) = raw.call_async {
-        entry.projections.insert(
-            "call",
-            Box::new(move |args| {
-                let u: U = from_sv(this(args)?)?;
-                block_on(f(ScriptCow::Owned(u), &args[1..]))
-            }),
-        );
+    // One `call` slot: declaring both `Call` and `AsyncCall` is ambiguous
+    // and rejected by the planning layer; a hand-built descriptor reaching
+    // here with both gets a descriptive per-call error, never a silent
+    // overwrite of the sync one.
+    match (raw.call, raw.call_async) {
+        (Some(_), Some(_)) => {
+            entry.projections.insert(
+                "call",
+                Box::new(|_| {
+                    Err(haphe::ScriptConvertError {
+                        expected: "a single call protocol",
+                        got: "both Call and AsyncCall declared (ambiguous)",
+                    }
+                    .into())
+                }),
+            );
+        }
+        (Some(f), None) => {
+            entry.projections.insert(
+                "call",
+                Box::new(move |args| Ok(f(&from_sv::<U>(this(args)?)?, &args[1..])?)),
+            );
+        }
+        (None, Some(f)) => {
+            entry.projections.insert(
+                "call",
+                Box::new(move |args| {
+                    let u: U = from_sv(this(args)?)?;
+                    block_on(f(ScriptCow::Owned(u), &args[1..]))
+                }),
+            );
+        }
+        (None, None) => {}
     }
 
     entry

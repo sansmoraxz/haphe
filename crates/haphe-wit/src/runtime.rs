@@ -17,7 +17,7 @@ use wasmtime::component::{
 use wasmtime::{AsContextMut, Store};
 
 use crate::host::{
-    AnyBox, CowAny, EAssoc, EMethod, GuestResource, HostRep, HostResState, HostResource, HostTable,
+    AnyBox, EAssoc, EMethod, GuestResource, HostRep, HostResState, HostResource, HostTable,
     RawTable, ResourceEntry, ValueEntry, block_on, erase_resource, erase_value, trap_call,
     trap_convert,
 };
@@ -580,7 +580,14 @@ impl<T: 'static> RuntimeBinder for WasmBinder<T> {
                         )? {
                             match (key, value.as_ref()) {
                                 (Some(key), Some(v)) => {
-                                    define_enum_companion(&mut inst, &name, v.clone(), key, &cx)?;
+                                    define_enum_companion(
+                                        &mut inst,
+                                        &name,
+                                        v.clone(),
+                                        key,
+                                        arg_shapes(m.params, &[], &[]),
+                                        &cx,
+                                    )?;
                                 }
                                 _ => stub_func_msg(
                                     &mut inst,
@@ -620,7 +627,14 @@ impl<T: 'static> RuntimeBinder for WasmBinder<T> {
                         )? {
                             match (key, value.as_ref()) {
                                 (Some(key), Some(v)) => {
-                                    define_enum_companion(&mut inst, &name, v.clone(), key, &cx)?;
+                                    define_enum_companion(
+                                        &mut inst,
+                                        &name,
+                                        v.clone(),
+                                        key,
+                                        arg_shapes(m.params, &[], &[]),
+                                        &cx,
+                                    )?;
                                 }
                                 _ => stub_func_msg(
                                     &mut inst,
@@ -664,6 +678,9 @@ impl<T: 'static> RuntimeBinder for WasmBinder<T> {
                                 &name,
                                 v.clone(),
                                 proj.source_name,
+                                std::iter::once(Shape::Other)
+                                    .chain(proj_shapes(&proj.kind))
+                                    .collect(),
                                 &cx,
                             )?,
                             None => stub_func(&mut inst, &name)?,
@@ -701,6 +718,9 @@ impl<T: 'static> RuntimeBinder for WasmBinder<T> {
                                 &name,
                                 v.clone(),
                                 proj.source_name,
+                                std::iter::once(Shape::Other)
+                                    .chain(proj_shapes(&proj.kind))
+                                    .collect(),
                                 &cx,
                             )?,
                             None => stub_func(&mut inst, &name)?,
@@ -720,14 +740,15 @@ impl<T: 'static> RuntimeBinder for WasmBinder<T> {
             for func in iface.functions {
                 if func.generic_params.is_empty() {
                     let name = member_names.insert(func.name)?;
+                    let shapes = arg_shapes(func.params, &[], &[]);
                     if func.is_async {
                         match self.find_async_fn(func.name, &[]) {
-                            Some(f) => define_value_fn_async(&mut inst, &name, f, &cx)?,
+                            Some(f) => define_value_fn_async(&mut inst, &name, f, shapes, &cx)?,
                             None => stub_func(&mut inst, &name)?,
                         }
                     } else {
                         match self.find_fn(func.name, &[]) {
-                            Some(f) => define_value_fn(&mut inst, &name, f, &cx)?,
+                            Some(f) => define_value_fn(&mut inst, &name, f, shapes, &cx)?,
                             None => stub_func(&mut inst, &name)?,
                         }
                     }
@@ -740,6 +761,7 @@ impl<T: 'static> RuntimeBinder for WasmBinder<T> {
                 for args in haphe::union_instantiations(func, iface.fn_instantiations) {
                     let mangled = plan.mangle_fn_instance(func.name, args, None)?;
                     let name = member_names.insert(&mangled)?;
+                    let shapes = arg_shapes(func.params, func.generic_params, args);
                     if func.is_async {
                         // A dyn fn registers its monomorph wrappers through
                         // the dyn channel only; the static monomorph members
@@ -748,7 +770,7 @@ impl<T: 'static> RuntimeBinder for WasmBinder<T> {
                         #[cfg(feature = "dyn-generics")]
                         let found = found.or_else(|| self.find_dyn_async_fn(func.name, args));
                         match found {
-                            Some(f) => define_value_fn_async(&mut inst, &name, f, &cx)?,
+                            Some(f) => define_value_fn_async(&mut inst, &name, f, shapes, &cx)?,
                             None => stub_func(&mut inst, &name)?,
                         }
                     } else {
@@ -756,7 +778,7 @@ impl<T: 'static> RuntimeBinder for WasmBinder<T> {
                         #[cfg(feature = "dyn-generics")]
                         let found = found.or_else(|| self.find_dyn_fn(func.name, args));
                         match found {
-                            Some(f) => define_value_fn(&mut inst, &name, f, &cx)?,
+                            Some(f) => define_value_fn(&mut inst, &name, f, shapes.clone(), &cx)?,
                             None => stub_func(&mut inst, &name)?,
                         }
                     }
@@ -1860,7 +1882,10 @@ fn script_to_val(
         Type::U8 => Val::U8(int("u8")?.try_into().map_err(|_| err("u8"))?),
         Type::U16 => Val::U16(int("u16")?.try_into().map_err(|_| err("u16"))?),
         Type::U32 => Val::U32(int("u32")?.try_into().map_err(|_| err("u32"))?),
-        Type::U64 => Val::U64(int("u64")?.try_into().map_err(|_| err("u64"))?),
+        // Core's declared policy: `u64` crosses as the `i64` BIT PATTERN
+        // (values above `i64::MAX` arrive as negative `I64`s), so the cast
+        // reinterprets rather than range-checks.
+        Type::U64 => Val::U64(int("u64")? as u64),
         Type::Float32 => match v {
             ScriptValue::F64(n) => Val::Float32(*n as f32),
             ScriptValue::I64(n) => Val::Float32(*n as f32),
@@ -2157,7 +2182,8 @@ fn val_to_script(
         Val::U8(n) => ScriptValue::I64((*n).into()),
         Val::U16(n) => ScriptValue::I64((*n).into()),
         Val::U32(n) => ScriptValue::I64((*n).into()),
-        Val::U64(n) => ScriptValue::I64(i64::try_from(*n).map_err(|_| err)?),
+        // The `u64` bit pattern crosses in an `I64`, per core's policy.
+        Val::U64(n) => ScriptValue::I64(*n as i64),
         Val::Float32(n) => ScriptValue::F64((*n).into()),
         Val::Float64(n) => ScriptValue::F64(*n),
         Val::Char(c) => ScriptValue::Char(*c),
@@ -2414,18 +2440,199 @@ fn self_rep<S: AsContextMut>(store: &mut S, params: &[Val], name: &str) -> wasmt
     Ok(resource.rep())
 }
 
-/// Lifts the non-receiver arguments.
+/// The lift-relevant part of a declared parameter type, OWNED so define-time
+/// closures can capture it ('static) after the borrowed registry is gone.
+///
+/// WIT has no map type: a declared `Map` and a genuine list of pairs are the
+/// SAME wire shape (`list<tuple<string, v>>`), so lifting is directed by the
+/// declared descriptor — mirroring how lowering already turns `Map` into
+/// `list<tuple>`.
+#[derive(Clone, Debug)]
+pub(crate) enum Shape {
+    Map(Box<Shape>),
+    List(Box<Shape>),
+    Tuple(Vec<Shape>),
+    Option(Box<Shape>),
+    /// Anything whose lifted form needs no reshaping.
+    Other,
+}
+
+impl Shape {
+    /// Builds the shape of one declared type, resolving
+    /// [`TypeDescriptor::GenericParam`]s through the `(params, args)`
+    /// substitution (empty for non-generic surfaces; unresolved parameters
+    /// fold to [`Shape::Other`]).
+    pub(crate) fn of(
+        ty: &TypeDescriptor<'_>,
+        params: &[haphe::GenericParam<'_>],
+        args: &[TypeDescriptor<'_>],
+        self_params: &[haphe::GenericParam<'_>],
+        self_args: &[TypeDescriptor<'_>],
+    ) -> Self {
+        match ty {
+            TypeDescriptor::Map(_, v) => {
+                Self::Map(Box::new(Self::of(v, params, args, self_params, self_args)))
+            }
+            TypeDescriptor::List(e) | TypeDescriptor::Array(e, _) => {
+                Self::List(Box::new(Self::of(e, params, args, self_params, self_args)))
+            }
+            TypeDescriptor::Tuple(elems) => Self::Tuple(
+                elems
+                    .iter()
+                    .map(|e| Self::of(e, params, args, self_params, self_args))
+                    .collect(),
+            ),
+            TypeDescriptor::Option(e) => {
+                Self::Option(Box::new(Self::of(e, params, args, self_params, self_args)))
+            }
+            TypeDescriptor::Borrowed { inner, .. } => {
+                Self::of(inner, params, args, self_params, self_args)
+            }
+            TypeDescriptor::GenericParam(name) => params
+                .iter()
+                .position(|p| p.name == *name)
+                .and_then(|i| args.get(i))
+                .or_else(|| {
+                    self_params
+                        .iter()
+                        .position(|p| p.name == *name)
+                        .and_then(|i| self_args.get(i))
+                })
+                .map_or(Self::Other, |t| {
+                    Self::of(t, params, args, self_params, self_args)
+                }),
+            _ => Self::Other,
+        }
+    }
+}
+
+/// Shapes for a parameter list under one substitution.
+pub(crate) fn arg_shapes(
+    fn_params: &[haphe::ParamDescriptor<'_>],
+    generic_params: &[haphe::GenericParam<'_>],
+    type_args: &[TypeDescriptor<'_>],
+) -> Vec<Shape> {
+    fn_params
+        .iter()
+        .map(|p| Shape::of(p.ty, generic_params, type_args, &[], &[]))
+        .collect()
+}
+
+/// [`arg_shapes`] for a `dyn` candidate: the method's own substitution plus
+/// the SELF type's instantiation.
+#[cfg(feature = "dyn-generics")]
+fn dyn_arg_shapes(desc: &haphe::FunctionDescriptor<'_>, cand: &DynCand) -> Vec<Shape> {
+    desc.params
+        .iter()
+        .map(|p| {
+            Shape::of(
+                p.ty,
+                desc.generic_params,
+                cand.type_args,
+                cand.self_inst.params,
+                cand.self_inst.args,
+            )
+        })
+        .collect()
+}
+
+/// Shapes of one trait projection's non-receiver arguments, from the
+/// declared operand descriptors.
+fn proj_shapes(kind: &crate::model::ProjKind<'_>) -> Vec<Shape> {
+    use crate::model::ProjKind as K;
+    match kind {
+        K::ArithScalar { rhs, .. } => vec![Shape::of(rhs, &[], &[], &[], &[])],
+        K::Call { args, .. } => args
+            .iter()
+            .map(|t| Shape::of(t, &[], &[], &[], &[]))
+            .collect(),
+        K::IndexGet { index, .. } => vec![Shape::of(index, &[], &[], &[], &[])],
+        K::IndexSet { index, output } => vec![
+            Shape::of(index, &[], &[], &[], &[]),
+            Shape::of(output, &[], &[], &[], &[]),
+        ],
+        _ => Vec::new(),
+    }
+}
+
+/// Rebuilds map-declared positions from their wire shape: a lifted list of
+/// `[key, value]` pairs becomes [`ScriptValue::Map`]. Anything that does not
+/// match the pair shape is left as lifted — the wrapper's `FromScript` stays
+/// authoritative and rejects descriptively.
+fn reshape(v: &mut ScriptValue, shape: &Shape) {
+    match shape {
+        Shape::Map(vs) => {
+            let ScriptValue::List(items) = v else { return };
+            let pairs = items.iter().all(|item| {
+                matches!(item, ScriptValue::List(kv)
+                    if kv.len() == 2 && matches!(kv[0], ScriptValue::String(_)))
+            });
+            if !pairs {
+                return;
+            }
+            let entries = std::mem::take(items)
+                .into_iter()
+                .map(|item| {
+                    let ScriptValue::List(mut kv) = item else {
+                        unreachable!("checked above");
+                    };
+                    let mut value = kv.pop().expect("len 2");
+                    let ScriptValue::String(key) = kv.pop().expect("len 2") else {
+                        unreachable!("checked above");
+                    };
+                    reshape(&mut value, vs);
+                    (key, value)
+                })
+                .collect();
+            *v = ScriptValue::Map(entries);
+        }
+        Shape::List(es) => {
+            if let ScriptValue::List(items) = v {
+                for item in items {
+                    reshape(item, es);
+                }
+            }
+        }
+        Shape::Tuple(ts) => {
+            if let ScriptValue::List(items) = v {
+                for (item, t) in items.iter_mut().zip(ts) {
+                    reshape(item, t);
+                }
+            }
+        }
+        Shape::Option(t) => {
+            if let ScriptValue::Optional(Some(inner)) = v {
+                reshape(inner, t);
+            }
+        }
+        Shape::Other => {}
+    }
+}
+
+/// Applies [`reshape`] positionally; extra shapes or values are ignored.
+pub(crate) fn reshape_args(args: &mut [ScriptValue], shapes: &[Shape]) {
+    for (v, s) in args.iter_mut().zip(shapes) {
+        reshape(v, s);
+    }
+}
+
+/// Lifts the non-receiver arguments, reshaping map-declared positions per
+/// `shapes` (pass an empty slice for surfaces with no map-bearing declared
+/// types in scope).
 fn lift_args<S: AsContextMut>(
     cx: &DispatchCx,
     store: &mut S,
     params: &[Val],
     skip: usize,
+    shapes: &[Shape],
     name: &str,
 ) -> wasmtime::Result<Vec<ScriptValue>> {
-    params[skip..]
+    let mut args: Vec<ScriptValue> = params[skip..]
         .iter()
         .map(|v| cx.lift(store, v).map_err(|e| trap_convert(name, &e)))
-        .collect()
+        .collect::<wasmtime::Result<_>>()?;
+    reshape_args(&mut args, shapes);
+    Ok(args)
 }
 
 /// Lowers an optional single result.
@@ -2738,13 +2945,16 @@ fn define_dyn_value_fn<T: 'static>(
 ) -> Result<(), WasmBindError> {
     let cx = cx.clone();
     let msg = name.to_string();
+    let cand_shapes: Vec<Vec<Shape>> = cands.iter().map(|c| dyn_arg_shapes(desc, &c.0)).collect();
     inst.func_new(name, move |mut store, fty, params, results| {
-        let raw = lift_args(&cx, &mut store, params, 0, &msg)?;
+        let raw = lift_args(&cx, &mut store, params, 0, &[], &msg)?;
         let (tag, values) = unwrap_dyn_args(desc, raw, &msg)?;
         let order = dyn_attempt_order(desc, &cands, tag.as_deref(), &values, &msg)?;
         let mut last = None;
         for i in order {
-            match (cands[i].1)(&values) {
+            let mut values_i = values.clone();
+            reshape_args(&mut values_i, &cand_shapes[i]);
+            match (cands[i].1)(&values_i) {
                 Ok(out) => {
                     let out = wrap_dyn_result(desc, &cands[i].0.key, out);
                     return lower_call_outcome(
@@ -2789,13 +2999,16 @@ fn define_dyn_value_fn_async<T: 'static>(
 ) -> Result<(), WasmBindError> {
     let cx = cx.clone();
     let msg = name.to_string();
+    let cand_shapes: Vec<Vec<Shape>> = cands.iter().map(|c| dyn_arg_shapes(desc, &c.0)).collect();
     inst.func_new(name, move |mut store, fty, params, results| {
-        let raw = lift_args(&cx, &mut store, params, 0, &msg)?;
+        let raw = lift_args(&cx, &mut store, params, 0, &[], &msg)?;
         let (tag, values) = unwrap_dyn_args(desc, raw, &msg)?;
         let order = dyn_attempt_order(desc, &cands, tag.as_deref(), &values, &msg)?;
         let mut last = None;
         for i in order {
-            match block_on((cands[i].1)(&values)) {
+            let mut values_i = values.clone();
+            reshape_args(&mut values_i, &cand_shapes[i]);
+            match block_on((cands[i].1)(&values_i)) {
                 Ok(out) => {
                     let out = wrap_dyn_result(desc, &cands[i].0.key, out);
                     return lower_call_outcome(
@@ -2845,13 +3058,16 @@ fn define_dyn_method<T: 'static>(
 ) -> Result<(), WasmBindError> {
     let cx = cx.clone();
     let msg = linker_name.to_string();
+    let cand_shapes: Vec<Vec<Shape>> = cands.iter().map(|c| dyn_arg_shapes(desc, &c.0)).collect();
     inst.func_new(linker_name, move |mut store, fty, params, results| {
         let rep = self_rep(&mut store, params, &msg)?;
-        let raw = lift_args(&cx, &mut store, params, 1, &msg)?;
+        let raw = lift_args(&cx, &mut store, params, 1, &[], &msg)?;
         let (tag, values) = unwrap_dyn_args(desc, raw, &msg)?;
         let order = dyn_attempt_order(desc, &cands, tag.as_deref(), &values, &msg)?;
         let mut last = None;
         for i in order {
+            let mut values_i = values.clone();
+            reshape_args(&mut values_i, &cand_shapes[i]);
             let (_, entry_index) = &cands[i];
             let m = &entry.dyn_methods[*entry_index].1;
             let attempt = match m {
@@ -2861,7 +3077,7 @@ fn define_dyn_method<T: 'static>(
                         .get(&rep)
                         .ok_or_else(|| trap(&msg, "stale resource handle"))?;
                     check_type(&msg, e.type_name, entry.type_name)?;
-                    f(CowAny::Borrowed(&*e.value), &values)
+                    f(&*e.value, &values_i)
                 }
                 EMethod::Mut(f) => {
                     let mut guard = cx.table.lock();
@@ -2869,7 +3085,7 @@ fn define_dyn_method<T: 'static>(
                         .get_mut(&rep)
                         .ok_or_else(|| trap(&msg, "stale resource handle"))?;
                     check_type(&msg, e.type_name, entry.type_name)?;
-                    f(&mut *e.value, &values)
+                    f(&mut *e.value, &values_i)
                 }
                 EMethod::AsyncCow(f) => {
                     let guard = cx.table.lock();
@@ -2877,7 +3093,7 @@ fn define_dyn_method<T: 'static>(
                         .get(&rep)
                         .ok_or_else(|| trap(&msg, "stale resource handle"))?;
                     check_type(&msg, e.type_name, entry.type_name)?;
-                    block_on(f(CowAny::Borrowed(&*e.value), &values))
+                    block_on(f(&*e.value, &values_i))
                 }
                 EMethod::AsyncMut(f) => {
                     let mut guard = cx.table.lock();
@@ -2885,7 +3101,7 @@ fn define_dyn_method<T: 'static>(
                         .get_mut(&rep)
                         .ok_or_else(|| trap(&msg, "stale resource handle"))?;
                     check_type(&msg, e.type_name, entry.type_name)?;
-                    block_on(f(&mut *e.value, &values))
+                    block_on(f(&mut *e.value, &values_i))
                 }
             };
             match attempt {
@@ -2935,8 +3151,9 @@ fn define_enum_dyn_companion<T: 'static>(
 ) -> Result<(), WasmBindError> {
     let cx = cx.clone();
     let msg = name.to_string();
+    let cand_shapes: Vec<Vec<Shape>> = cands.iter().map(|c| dyn_arg_shapes(desc, &c.0)).collect();
     inst.func_new(name, move |mut store, fty, params, results| {
-        let args = lift_args(&cx, &mut store, params, 0, &msg)?;
+        let args = lift_args(&cx, &mut store, params, 0, &[], &msg)?;
         let mut args = args.into_iter();
         let this = args
             .next()
@@ -2945,8 +3162,10 @@ fn define_enum_dyn_companion<T: 'static>(
         let order = dyn_attempt_order(desc, &cands, tag.as_deref(), &values, &msg)?;
         let mut last = None;
         for i in order {
+            let mut values_i = values.clone();
+            reshape_args(&mut values_i, &cand_shapes[i]);
             let m = &entry.dyn_methods[cands[i].1].1;
-            match m(this.clone(), &values) {
+            match m(this.clone(), &values_i) {
                 Ok(out) => {
                     let out = wrap_dyn_result(desc, &cands[i].0.key, out);
                     return lower_call_outcome(
@@ -2993,15 +3212,18 @@ fn define_enum_dyn_assoc_companion<T: 'static>(
 ) -> Result<(), WasmBindError> {
     let cx = cx.clone();
     let msg = name.to_string();
+    let cand_shapes: Vec<Vec<Shape>> = cands.iter().map(|c| dyn_arg_shapes(desc, &c.0)).collect();
     inst.func_new(name, move |mut store, fty, params, results| {
-        let raw = lift_args(&cx, &mut store, params, 0, &msg)?;
+        let raw = lift_args(&cx, &mut store, params, 0, &[], &msg)?;
         let (tag, values) = unwrap_dyn_args(desc, raw, &msg)?;
         let order = dyn_attempt_order(desc, &cands, tag.as_deref(), &values, &msg)?;
         let mut last = None;
         for i in order {
+            let mut values_i = values.clone();
+            reshape_args(&mut values_i, &cand_shapes[i]);
             let attempt = match entry.dyn_assoc[cands[i].1].1 {
-                EAssoc::Sync(f) => f(&values),
-                EAssoc::Async(f) => block_on(f(&values)),
+                EAssoc::Sync(f) => f(&values_i),
+                EAssoc::Async(f) => block_on(f(&values_i)),
             };
             match attempt {
                 Ok(out) => {
@@ -3040,12 +3262,13 @@ fn define_value_fn<T: 'static>(
     inst: &mut LinkerInstance<'_, T>,
     name: &str,
     f: ProvidedFn,
+    shapes: Vec<Shape>,
     cx: &DispatchCx,
 ) -> Result<(), WasmBindError> {
     let cx = cx.clone();
     let msg_name = name.to_string();
     inst.func_new(name, move |mut store, fty, params, results| {
-        let args = lift_args(&cx, &mut store, params, 0, &msg_name)?;
+        let args = lift_args(&cx, &mut store, params, 0, &shapes, &msg_name)?;
         lower_call_outcome(&cx, &mut store, fty.results(), f(&args), results, &msg_name)
     })?;
     Ok(())
@@ -3059,12 +3282,13 @@ fn define_value_fn_async<T: 'static>(
     inst: &mut LinkerInstance<'_, T>,
     name: &str,
     f: AsyncProvidedFn,
+    shapes: Vec<Shape>,
     cx: &DispatchCx,
 ) -> Result<(), WasmBindError> {
     let cx = cx.clone();
     let msg_name = name.to_string();
     inst.func_new(name, move |mut store, fty, params, results| {
-        let args = lift_args(&cx, &mut store, params, 0, &msg_name)?;
+        let args = lift_args(&cx, &mut store, params, 0, &shapes, &msg_name)?;
         let out = block_on(f(&args));
         lower_call_outcome(&cx, &mut store, fty.results(), out, results, &msg_name)
     })?;
@@ -3090,7 +3314,15 @@ fn bind_record_properties<T: 'static>(
             member_names.insert_as(&getter_raw, &format!("property accessor `{getter_raw}`"))?;
         match value.filter(|v| v.props_get.contains_key(prop.name)) {
             Some(v) => {
-                define_record_property(inst, &name, v.clone(), prop.name.to_string(), false, cx)?;
+                define_record_property(
+                    inst,
+                    &name,
+                    v.clone(),
+                    prop.name.to_string(),
+                    false,
+                    Vec::new(),
+                    cx,
+                )?;
             }
             None => stub_func(inst, &name)?,
         }
@@ -3106,6 +3338,7 @@ fn bind_record_properties<T: 'static>(
                         v.clone(),
                         prop.name.to_string(),
                         true,
+                        vec![Shape::Other, Shape::of(prop.ty, &[], &[], &[], &[])],
                         cx,
                     )?;
                 }
@@ -3125,12 +3358,13 @@ fn define_record_property<T: 'static>(
     entry: Arc<ValueEntry>,
     member: String,
     is_set: bool,
+    shapes: Vec<Shape>,
     cx: &DispatchCx,
 ) -> Result<(), WasmBindError> {
     let cx = cx.clone();
     let msg_name = name.to_string();
     inst.func_new(name, move |mut store, fty, params, results| {
-        let args = lift_args(&cx, &mut store, params, 0, &msg_name)?;
+        let args = lift_args(&cx, &mut store, params, 0, &shapes, &msg_name)?;
         let table = if is_set {
             &entry.props_set
         } else {
@@ -3150,12 +3384,13 @@ fn define_record_projection<T: 'static>(
     name: &str,
     entry: Arc<ValueEntry>,
     member: &'static str,
+    shapes: Vec<Shape>,
     cx: &DispatchCx,
 ) -> Result<(), WasmBindError> {
     let cx = cx.clone();
     let msg_name = name.to_string();
     inst.func_new(name, move |mut store, fty, params, results| {
-        let args = lift_args(&cx, &mut store, params, 0, &msg_name)?;
+        let args = lift_args(&cx, &mut store, params, 0, &shapes, &msg_name)?;
         let proj = entry
             .projections
             .get(member)
@@ -3313,12 +3548,26 @@ fn define_enum_companion<T: 'static>(
     name: &str,
     entry: Arc<ValueEntry>,
     method: ValueMethodKey,
+    shapes: Vec<Shape>,
     cx: &DispatchCx,
 ) -> Result<(), WasmBindError> {
     let cx = cx.clone();
     let msg_name = name.to_string();
+    // Shapes are positional over the DECLARED params; a receiver-taking
+    // companion lifts `this` first, so its slot pads the front.
+    let takes_this = match &method {
+        ValueMethodKey::Named(_) | ValueMethodKey::Generic(_) => true,
+        #[cfg(feature = "dyn-generics")]
+        ValueMethodKey::Dyn(_) => true,
+        _ => false,
+    };
+    let shapes: Vec<Shape> = if takes_this {
+        std::iter::once(Shape::Other).chain(shapes).collect()
+    } else {
+        shapes
+    };
     inst.func_new(name, move |mut store, fty, params, results| {
-        let args = lift_args(&cx, &mut store, params, 0, &msg_name)?;
+        let args = lift_args(&cx, &mut store, params, 0, &shapes, &msg_name)?;
         // Receiver-less associated companions take no `this`.
         let assoc = match &method {
             ValueMethodKey::Assoc(n) => entry.assoc.get(n.as_str()).copied(),
@@ -3378,7 +3627,15 @@ fn bind_resource_live<T: 'static>(
         define_field_get(inst, res, &getter, field.name, entry, cx)?;
         if !field.readonly {
             let setter = members.insert(&format!("set_{}", field.name))?;
-            define_field_set(inst, res, &setter, field.name, entry, cx)?;
+            define_field_set(
+                inst,
+                res,
+                &setter,
+                field.name,
+                Shape::of(field.ty, &[], &[], &[], &[]),
+                entry,
+                cx,
+            )?;
         }
     }
     for prop in s.properties {
@@ -3397,7 +3654,15 @@ fn bind_resource_live<T: 'static>(
         if !prop.readonly {
             let setter = members.insert(&format!("set_{}", prop.name))?;
             if entry.props.contains_key(prop.name) {
-                define_prop_set(inst, res, &setter, prop.name, entry, cx)?;
+                define_prop_set(
+                    inst,
+                    res,
+                    &setter,
+                    prop.name,
+                    Shape::of(prop.ty, &[], &[], &[], &[]),
+                    entry,
+                    cx,
+                )?;
             } else {
                 stub_func_msg(
                     inst,
@@ -3417,11 +3682,12 @@ fn bind_resource_live<T: 'static>(
             let name = members.insert(ctor.name)?;
             (format!("[static]{res}.{name}"), ctor.name.to_string())
         };
+        let shapes = arg_shapes(ctor.params, &[], &[]);
         if ctor.is_async {
-            define_ctor_async(inst, &linker_name, ctor_key, entry, cx)?;
+            define_ctor_async(inst, &linker_name, ctor_key, shapes, entry, cx)?;
             continue;
         }
-        define_ctor(inst, &linker_name, ctor_key, entry, cx)?;
+        define_ctor(inst, &linker_name, ctor_key, shapes, entry, cx)?;
     }
 
     for m in s.methods {
@@ -3469,8 +3735,9 @@ fn bind_resource_live<T: 'static>(
                     }
                     None => None,
                 };
+                let shapes = arg_shapes(m.params, m.generic_params, type_args.unwrap_or(&[]));
                 match key {
-                    Some(key) => define_assoc(inst, &prefixed, key, entry, cx)?,
+                    Some(key) => define_assoc(inst, &prefixed, key, shapes, entry, cx)?,
                     None => stub_func_msg(
                         inst,
                         &prefixed,
@@ -3516,6 +3783,7 @@ fn bind_resource_live<T: 'static>(
                 &prefixed,
                 key,
                 m.receiver.expect("checked above"),
+                arg_shapes(m.params, m.generic_params, type_args.unwrap_or(&[])),
                 entry,
                 cx,
             )?;
@@ -3617,15 +3885,17 @@ fn define_field_set<T: 'static>(
     res: &str,
     setter: &str,
     field: &str,
+    shape: Shape,
     entry: &Arc<ResourceEntry>,
     cx: &DispatchCx,
 ) -> Result<(), WasmBindError> {
     let linker_name = format!("[method]{res}.{setter}");
     let (entry, cx, field) = (entry.clone(), cx.clone(), field.to_string());
     let msg = linker_name.clone();
+    let shapes = [shape];
     inst.func_new(&linker_name, move |mut store, _fty, params, _results| {
         let rep = self_rep(&mut store, params, &msg)?;
-        let args = lift_args(&cx, &mut store, params, 1, &msg)?;
+        let args = lift_args(&cx, &mut store, params, 1, &shapes, &msg)?;
         let value = args
             .into_iter()
             .next()
@@ -3677,7 +3947,7 @@ fn define_prop_get<T: 'static>(
             } else if let Some(get) = &acc.get_async {
                 // Driven on-thread; the table lock is held across awaits
                 // (same re-entrancy caveat as async methods).
-                block_on(get(CowAny::Borrowed(&*e.value))).map_err(|e| trap_call(&msg, e))?
+                block_on(get(&*e.value)).map_err(|e| trap_call(&msg, e))?
             } else {
                 return Err(trap(&msg, "property has no getter channel"));
             }
@@ -3692,15 +3962,17 @@ fn define_prop_set<T: 'static>(
     res: &str,
     setter: &str,
     prop: &str,
+    shape: Shape,
     entry: &Arc<ResourceEntry>,
     cx: &DispatchCx,
 ) -> Result<(), WasmBindError> {
     let linker_name = format!("[method]{res}.{setter}");
     let (entry, cx, prop) = (entry.clone(), cx.clone(), prop.to_string());
     let msg = linker_name.clone();
+    let shapes = [shape];
     inst.func_new(&linker_name, move |mut store, _fty, params, _results| {
         let rep = self_rep(&mut store, params, &msg)?;
-        let args = lift_args(&cx, &mut store, params, 1, &msg)?;
+        let args = lift_args(&cx, &mut store, params, 1, &shapes, &msg)?;
         let value = args
             .into_iter()
             .next()
@@ -3732,13 +4004,14 @@ fn define_ctor_async<T: 'static>(
     inst: &mut LinkerInstance<'_, T>,
     linker_name: &str,
     ctor_key: String,
+    shapes: Vec<Shape>,
     entry: &Arc<ResourceEntry>,
     cx: &DispatchCx,
 ) -> Result<(), WasmBindError> {
     let (entry, cx) = (entry.clone(), cx.clone());
     let msg = linker_name.to_string();
     inst.func_new(linker_name, move |mut store, fty, params, results| {
-        let args = lift_args(&cx, &mut store, params, 0, &msg)?;
+        let args = lift_args(&cx, &mut store, params, 0, &shapes, &msg)?;
         let ctor = entry
             .ctors_async
             .get(ctor_key.as_str())
@@ -3796,13 +4069,14 @@ fn define_ctor<T: 'static>(
     inst: &mut LinkerInstance<'_, T>,
     linker_name: &str,
     ctor_key: String,
+    shapes: Vec<Shape>,
     entry: &Arc<ResourceEntry>,
     cx: &DispatchCx,
 ) -> Result<(), WasmBindError> {
     let (entry, cx) = (entry.clone(), cx.clone());
     let msg = linker_name.to_string();
     inst.func_new(linker_name, move |mut store, fty, params, results| {
-        let args = lift_args(&cx, &mut store, params, 0, &msg)?;
+        let args = lift_args(&cx, &mut store, params, 0, &shapes, &msg)?;
         let ctor = entry
             .ctors
             .get(ctor_key.as_str())
@@ -3842,13 +4116,14 @@ fn define_assoc<T: 'static>(
     inst: &mut LinkerInstance<'_, T>,
     linker_name: &str,
     key: AssocKey,
+    shapes: Vec<Shape>,
     entry: &Arc<ResourceEntry>,
     cx: &DispatchCx,
 ) -> Result<(), WasmBindError> {
     let (entry, cx) = (entry.clone(), cx.clone());
     let msg = linker_name.to_string();
     inst.func_new(linker_name, move |mut store, fty, params, results| {
-        let args = lift_args(&cx, &mut store, params, 0, &msg)?;
+        let args = lift_args(&cx, &mut store, params, 0, &shapes, &msg)?;
         let a = match &key {
             AssocKey::Named(name) => entry.assoc.get(name.as_str()).copied(),
             AssocKey::Generic(i) => entry.generic_assoc.get(*i).map(|(_, a)| *a),
@@ -3881,16 +4156,19 @@ fn define_dyn_assoc<T: 'static>(
 ) -> Result<(), WasmBindError> {
     let cx = cx.clone();
     let msg = linker_name.to_string();
+    let cand_shapes: Vec<Vec<Shape>> = cands.iter().map(|c| dyn_arg_shapes(desc, &c.0)).collect();
     inst.func_new(linker_name, move |mut store, fty, params, results| {
-        let raw = lift_args(&cx, &mut store, params, 0, &msg)?;
+        let raw = lift_args(&cx, &mut store, params, 0, &[], &msg)?;
         let (tag, values) = unwrap_dyn_args(desc, raw, &msg)?;
         let order = dyn_attempt_order(desc, &cands, tag.as_deref(), &values, &msg)?;
         let mut last = None;
         for i in order {
+            let mut values_i = values.clone();
+            reshape_args(&mut values_i, &cand_shapes[i]);
             let (_, entry_index) = &cands[i];
             let attempt = match entry.dyn_assoc[*entry_index].1 {
-                EAssoc::Sync(f) => f(&values),
-                EAssoc::Async(f) => block_on(f(&values)),
+                EAssoc::Sync(f) => f(&values_i),
+                EAssoc::Async(f) => block_on(f(&values_i)),
             };
             match attempt {
                 Ok(out) => {
@@ -3929,6 +4207,7 @@ fn define_method<T: 'static>(
     linker_name: &str,
     method: MethodKey,
     receiver: Receiver,
+    shapes: Vec<Shape>,
     entry: &Arc<ResourceEntry>,
     cx: &DispatchCx,
 ) -> Result<(), WasmBindError> {
@@ -3936,7 +4215,7 @@ fn define_method<T: 'static>(
     let msg = linker_name.to_string();
     inst.func_new(linker_name, move |mut store, fty, params, results| {
         let rep = self_rep(&mut store, params, &msg)?;
-        let args = lift_args(&cx, &mut store, params, 1, &msg)?;
+        let args = lift_args(&cx, &mut store, params, 1, &shapes, &msg)?;
         let m = match &method {
             MethodKey::Named(name) => entry.methods.get(name.as_str()),
             MethodKey::Generic(i) => entry.generic_methods.get(*i).map(|(_, m)| m),
@@ -3945,14 +4224,23 @@ fn define_method<T: 'static>(
         }
         .ok_or_else(|| trap(&msg, "method has no bridge channel"))?;
         let out = match (m, receiver) {
-            // Owned receiver: consume the entry (stale later use traps).
+            // Owned receiver: the wrapper acquires by borrow-and-clone (the
+            // dyn dispatcher's policy), and the entry is consumed only when
+            // the call actually RAN — an argument-conversion rejection
+            // leaves the resource intact; stale later use traps.
             (EMethod::Cow(f), Receiver::Owned) => {
-                let e = cx
-                    .table
-                    .remove(rep)
-                    .ok_or_else(|| trap(&msg, "stale or already-consumed resource handle"))?;
-                check_type(&msg, e.type_name, entry.type_name)?;
-                f(CowAny::Owned(e.value), &args)
+                let out = {
+                    let guard = cx.table.lock();
+                    let e = guard
+                        .get(&rep)
+                        .ok_or_else(|| trap(&msg, "stale or already-consumed resource handle"))?;
+                    check_type(&msg, e.type_name, entry.type_name)?;
+                    f(&*e.value, &args)
+                };
+                if !matches!(out, Err(ScriptCallError::Convert(_))) {
+                    cx.table.remove(rep);
+                }
+                out
             }
             (EMethod::Cow(f), _) => {
                 let guard = cx.table.lock();
@@ -3960,7 +4248,7 @@ fn define_method<T: 'static>(
                     .get(&rep)
                     .ok_or_else(|| trap(&msg, "stale resource handle"))?;
                 check_type(&msg, e.type_name, entry.type_name)?;
-                f(CowAny::Borrowed(&*e.value), &args)
+                f(&*e.value, &args)
             }
             (EMethod::Mut(f), _) => {
                 let mut guard = cx.table.lock();
@@ -3976,12 +4264,18 @@ fn define_method<T: 'static>(
             // borrowed receivers — re-entrant calls into the same binder's
             // resources from inside the future would deadlock (documented).
             (EMethod::AsyncCow(f), Receiver::Owned) => {
-                let e = cx
-                    .table
-                    .remove(rep)
-                    .ok_or_else(|| trap(&msg, "stale or already-consumed resource handle"))?;
-                check_type(&msg, e.type_name, entry.type_name)?;
-                block_on(f(CowAny::Owned(e.value), &args))
+                let out = {
+                    let guard = cx.table.lock();
+                    let e = guard
+                        .get(&rep)
+                        .ok_or_else(|| trap(&msg, "stale or already-consumed resource handle"))?;
+                    check_type(&msg, e.type_name, entry.type_name)?;
+                    block_on(f(&*e.value, &args))
+                };
+                if !matches!(out, Err(ScriptCallError::Convert(_))) {
+                    cx.table.remove(rep);
+                }
+                out
             }
             (EMethod::AsyncCow(f), _) => {
                 let guard = cx.table.lock();
@@ -3989,7 +4283,7 @@ fn define_method<T: 'static>(
                     .get(&rep)
                     .ok_or_else(|| trap(&msg, "stale resource handle"))?;
                 check_type(&msg, e.type_name, entry.type_name)?;
-                block_on(f(CowAny::Borrowed(&*e.value), &args))
+                block_on(f(&*e.value, &args))
             }
             (EMethod::AsyncMut(f), _) => {
                 let mut guard = cx.table.lock();
@@ -4025,12 +4319,14 @@ fn define_projection<T: 'static>(
             inst,
             &format!("[static]{res}.{name}"),
             "default".to_string(),
+            Vec::new(),
             entry,
             cx,
         );
     }
     let linker_name = format!("[method]{res}.{name}");
     let (entry, cx) = (entry.clone(), cx.clone());
+    let shapes = proj_shapes(&proj.kind);
     let msg = linker_name.clone();
     let kind = ProjDispatch::from(&proj.kind);
     inst.func_new(&linker_name, move |mut store, fty, params, results| {
@@ -4064,7 +4360,7 @@ fn define_projection<T: 'static>(
                 return Ok(());
             }
             ProjDispatch::ArithScalar(op) => {
-                let args = lift_args(&cx, &mut store, params, 1, &msg)?;
+                let args = lift_args(&cx, &mut store, params, 1, &shapes, &msg)?;
                 let f = entry.metas.arith_scalar.get(op).ok_or_else(missing)?;
                 let a = {
                     let guard = cx.table.lock();
@@ -4149,7 +4445,7 @@ fn define_projection<T: 'static>(
                 return Ok(());
             }
             ProjDispatch::Call { is_async } => {
-                let args = lift_args(&cx, &mut store, params, 1, &msg)?;
+                let args = lift_args(&cx, &mut store, params, 1, &shapes, &msg)?;
                 let guard = cx.table.lock();
                 let e = guard
                     .get(&rep)
@@ -4157,15 +4453,14 @@ fn define_projection<T: 'static>(
                 check_type(&msg, e.type_name, entry.type_name)?;
                 if is_async {
                     let f = entry.metas.call_async.as_ref().ok_or_else(missing)?;
-                    block_on(f(CowAny::Borrowed(&*e.value), &args))
-                        .map_err(|e| trap_call(&msg, e))?
+                    block_on(f(&*e.value, &args)).map_err(|e| trap_call(&msg, e))?
                 } else {
                     let f = entry.metas.call.as_ref().ok_or_else(missing)?;
                     f(&*e.value, &args).map_err(|e| trap_convert(&msg, &e))?
                 }
             }
             ProjDispatch::IndexGet => {
-                let args = lift_args(&cx, &mut store, params, 1, &msg)?;
+                let args = lift_args(&cx, &mut store, params, 1, &shapes, &msg)?;
                 let f = entry.metas.index.as_ref().ok_or_else(missing)?;
                 let guard = cx.table.lock();
                 let e = guard
@@ -4175,7 +4470,7 @@ fn define_projection<T: 'static>(
                 f(&*e.value, &args).map_err(|e| trap_convert(&msg, &e))?
             }
             ProjDispatch::IndexSet => {
-                let args = lift_args(&cx, &mut store, params, 1, &msg)?;
+                let args = lift_args(&cx, &mut store, params, 1, &shapes, &msg)?;
                 let f = entry.metas.newindex.as_ref().ok_or_else(missing)?;
                 let mut guard = cx.table.lock();
                 let e = guard

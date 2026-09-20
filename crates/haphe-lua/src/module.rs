@@ -88,16 +88,16 @@ pub(crate) fn bind_module(
         table.set(submodule.name, sub_table)?;
     }
 
-    // Free functions: stubs for now. Module-level free functions need
-    // a FnBinder (analogous to TypeBinder for types) which is not yet
-    // implemented. Each function gets a placeholder that errors with a
-    // helpful message.
+    // Free functions: descriptive stubs. Live dispatch is installed by
+    // `bind_fn::<f>` onto this table AFTER `bind()` — `bind()` (re)creates
+    // the module tables, so it must run FIRST; running it after would wipe
+    // earlier `bind_fn`/`bind_type` refinements.
     for function in module.functions {
         let fn_name = function.name.to_owned();
         let mod_name = module.name.to_owned();
         let stub = lua.create_function(move |_, _args: mlua::MultiValue| -> mlua::Result<()> {
             Err(mlua::Error::runtime(format!(
-                "{mod_name}.{fn_name}: free function binding not yet implemented"
+                "{mod_name}.{fn_name}: not bound — register it with `bind_fn` after `bind()`"
             )))
         })?;
         table.set(function.name, stub)?;

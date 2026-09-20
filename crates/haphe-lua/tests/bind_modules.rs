@@ -185,10 +185,7 @@ fn function_stubs_error_with_message() {
     let result: mlua::Result<()> = lua.load("math.add(1, 2)").exec();
     let err = result.unwrap_err();
     let msg = err.to_string();
-    assert!(
-        msg.contains("not yet implemented"),
-        "unexpected error: {msg}"
-    );
+    assert!(msg.contains("not bound"), "unexpected error: {msg}");
 }
 
 #[test]

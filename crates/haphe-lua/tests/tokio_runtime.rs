@@ -217,6 +217,6 @@ mod multi_thread {
         });
 
         let msg = handle.await.unwrap();
-        assert!(msg.contains("not yet implemented"), "got: {msg}");
+        assert!(msg.contains("not bound"), "got: {msg}");
     }
 }
