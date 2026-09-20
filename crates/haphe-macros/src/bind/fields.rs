@@ -110,6 +110,30 @@ pub(crate) fn gen_field_registrations(
             .map(|f| gen_dispatched_field_registration(self_ty, f))
             .collect()
     };
+    // READ-ONLY fields whose type converts outbound only (`Vec<&'static
+    // str>`): the `field_get` channel needs no inbound conversion. Field
+    // borrows must outlive the value, hence the explicit-`'static` demand.
+    let get_only: Vec<TokenStream> = fields
+        .iter()
+        .filter(|f| {
+            f.readonly
+                && !is_bridge_value_type(&f.ty)
+                && !super::gates::is_reference(&f.ty)
+                && super::gates::is_bridge_outbound_type(&f.ty)
+                && super::gates::nested_refs_all_static(&f.ty)
+        })
+        .map(|f| {
+            let ident = &f.ident;
+            let name = &f.name;
+            let ty = &f.ty;
+            quote! {
+                __b.field_get::<#ty>(
+                    #name,
+                    (|__t: &#self_ty| __t.#ident.clone()) as fn(&#self_ty) -> #ty,
+                )?;
+            }
+        })
+        .collect();
     // The full value-type whitelist (containers, std semantic types), like
     // methods and free functions — fields must not be narrower. OWNED types
     // only: the `field` channel's accessors clone and store by value.
@@ -143,5 +167,5 @@ pub(crate) fn gen_field_registrations(
             }
         });
 
-    quote! { #(#regs)* #(#dispatched)* }
+    quote! { #(#regs)* #(#get_only)* #(#dispatched)* }
 }

@@ -1545,6 +1545,24 @@ impl<T: 'static + Clone + mlua::MaybeSend + mlua::MaybeSync> TypeBinder<T> for L
         Ok(())
     }
 
+    fn field_get<V: IntoScript + Clone + 'static>(
+        &mut self,
+        name: &'static str,
+        getter: fn(&T) -> V,
+    ) -> Result<(), Self::Error> {
+        // Outbound-only field: installed exactly like a read-only `field` —
+        // a getter accessor and no setter, so writes fail like any other
+        // readonly field.
+        let get_fn: FieldGetFn<T> =
+            Arc::new(move |t, lua| script_to_lua(lua, getter(t).into_script()));
+        self.fields.push(FieldReg {
+            name,
+            getter: get_fn,
+            setter: None,
+        });
+        Ok(())
+    }
+
     fn method(&mut self, name: &'static str, f: CowMethodFn<T>) -> Result<(), Self::Error> {
         self.methods.push(MethodReg { name, f });
         Ok(())

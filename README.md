@@ -90,7 +90,10 @@ documented rule; nothing is silently dropped:
 - **std types** — primitives, containers (`Vec`, maps, sets, tuples,
   `Option`), paths, network/time types, transparent carriers
   (`Box`/`Rc`/`Arc`/`Cow`), and transparent primitive newtypes, spelled bare
-  or through explicit `std::` paths;
+  or through explicit `std::` paths. Composites with `&str`/`&Path` elements
+  cross OUTBOUND only (return types, `readonly` fields with `'static`
+  references, getter-only properties) — inbound positions need owned
+  element types and say so at compile time;
 - **the foreign direction** — `#[script(foreign)]` traits are implemented by
   the script/guest side and called from Rust through a generated handle.
 

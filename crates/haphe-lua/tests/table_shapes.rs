@@ -348,3 +348,86 @@ mod generic_self {
         assert_eq!(out, 2);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Outbound-only reference composites: readonly fields, returns, getters
+// ---------------------------------------------------------------------------
+
+#[derive(Script, Clone)]
+#[script(methods)]
+struct Catalog {
+    #[script(readonly)]
+    tags: Vec<&'static str>,
+}
+
+#[script]
+impl Catalog {
+    #[script(constructor)]
+    fn new() -> Self {
+        Catalog {
+            tags: vec!["alpha", "beta"],
+        }
+    }
+
+    fn all_tags(&self) -> Vec<&'static str> {
+        self.tags.clone()
+    }
+
+    #[script(getter)]
+    fn labels(&self) -> Vec<&'static str> {
+        self.tags.clone()
+    }
+}
+
+fn catalog_env() -> Lua {
+    let lua = Lua::new();
+    let table = lua.create_table().unwrap();
+    lua.globals().set("Catalog", &table).unwrap();
+    bind_type::<Catalog>(&lua, &table).unwrap();
+    lua
+}
+
+/// A readonly `Vec<&'static str>` field registers through the getter-only
+/// channel and reads as a sequence table of native strings.
+#[test]
+fn outbound_readonly_field_reads_as_string_table() {
+    let lua = catalog_env();
+    let (len, first, kind): (i64, String, String) = lua
+        .load(
+            "local c = Catalog.new()
+             local t = c.tags
+             return #t, t[1], type(t[1])",
+        )
+        .eval()
+        .unwrap();
+    assert_eq!((len, first.as_str(), kind.as_str()), (2, "alpha", "string"));
+}
+
+/// Writes fail like any other readonly field.
+#[test]
+fn outbound_readonly_field_rejects_writes() {
+    let lua = catalog_env();
+    let err = lua
+        .load("local c = Catalog.new(); c.tags = { 'x' }")
+        .exec()
+        .expect_err("no setter registered");
+    assert!(!err.to_string().is_empty());
+}
+
+/// Methods and getter-only properties returning `Vec<&'static str>` convert
+/// outbound at the boundary.
+#[test]
+fn outbound_reference_returns_convert() {
+    let lua = catalog_env();
+    let (from_method, from_prop): (String, String) = lua
+        .load(
+            "local c = Catalog.new()
+             return c:all_tags()[2], c.labels[1]",
+        )
+        .eval()
+        .unwrap();
+    assert_eq!(
+        (from_method.as_str(), from_prop.as_str()),
+        ("beta", "alpha")
+    );
+}

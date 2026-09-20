@@ -242,6 +242,84 @@ pub(crate) fn is_reference(ty: &Type) -> bool {
     matches!(ty, Type::Reference(_))
 }
 
+/// A type whose values cross OUTBOUND only (Rust → script): like
+/// [`is_bridge_value_type`], but element positions may also be references to
+/// `str` or `Path` — outbound conversion happens immediately at the
+/// boundary (`From<&str>`/`From<&Path>` clone into the value), so such
+/// composites convert even though no inbound conversion can exist. Used for
+/// return types and read-only fields; inbound positions stay strict.
+pub(crate) fn is_bridge_outbound_type(ty: &Type) -> bool {
+    if let Type::Reference(r) = ty {
+        return match r.elem.as_ref() {
+            Type::Path(p) => {
+                crate::std_types::std_ident(&r.elem).is_some_and(|id| id == "str" || id == "Path")
+                    && p.qself.is_none()
+            }
+            _ => false,
+        };
+    }
+    if is_bridge_primitive(ty) || is_bridge_std_semantic(ty) {
+        return true;
+    }
+    let stripped = strip_carriers(ty);
+    let ty = &stripped;
+    if is_bridge_std_semantic(ty) {
+        return true;
+    }
+    match ty {
+        Type::Tuple(tuple) => tuple.elems.iter().all(is_bridge_outbound_type),
+        Type::Array(array) => is_bridge_outbound_type(&array.elem),
+        Type::Path(p) => {
+            if p.qself.is_some() || !crate::std_types::is_std_path(&p.path) {
+                return false;
+            }
+            let Some(last) = p.path.segments.last() else {
+                return false;
+            };
+            let syn::PathArguments::AngleBracketed(args) = &last.arguments else {
+                return false;
+            };
+            let type_args: Vec<&Type> = args
+                .args
+                .iter()
+                .filter_map(|a| match a {
+                    syn::GenericArgument::Type(t) => Some(t),
+                    _ => None,
+                })
+                .collect();
+            let name = last.ident.to_string();
+            if crate::std_types::UNARY_CONTAINERS.contains(&name.as_str()) {
+                type_args.len() == 1 && is_bridge_outbound_type(type_args[0])
+            } else if crate::std_types::STRING_MAPS.contains(&name.as_str()) {
+                type_args.len() == 2
+                    && matches!(type_args[0], Type::Path(k) if k.path.is_ident("String"))
+                    && is_bridge_outbound_type(type_args[1])
+            } else {
+                false
+            }
+        }
+        _ => false,
+    }
+}
+
+/// Whether every reference inside `ty` carries an explicit `'static`
+/// lifetime — the requirement for reference-bearing FIELD types, whose
+/// borrows must outlive the owning value.
+pub(crate) fn nested_refs_all_static(ty: &Type) -> bool {
+    struct Check(bool);
+    impl syn::visit::Visit<'_> for Check {
+        fn visit_type_reference(&mut self, r: &syn::TypeReference) {
+            if r.lifetime.as_ref().is_none_or(|lt| lt.ident != "static") {
+                self.0 = false;
+            }
+            syn::visit::visit_type_reference(self, r);
+        }
+    }
+    let mut check = Check(true);
+    syn::visit::Visit::visit_type(&mut check, ty);
+    check.0
+}
+
 /// The span of a reference nested INSIDE a composite type — one outer
 /// reference is legitimate (wrappers strip it), but `Vec<&str>` has no
 /// conversion at any bridge surface. `None` when no nested reference exists.

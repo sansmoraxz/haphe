@@ -50,6 +50,7 @@ struct MockBinder<T> {
     arith_self: Vec<BinOp<T>>,
     bnot: Option<fn(&T) -> T>,
     fields: Vec<&'static str>,
+    get_only_fields: Vec<&'static str>,
     methods: Vec<(&'static str, CowMethodFn<T>)>,
     mut_methods: Vec<(&'static str, MutMethodFn<T>)>,
     hash: Option<fn(&T) -> u64>,
@@ -78,6 +79,15 @@ impl<T> TypeBinder<T> for MockBinder<T> {
         _: Option<fn(&mut T, V)>,
     ) -> Result<(), NeverError> {
         self.fields.push(name);
+        Ok(())
+    }
+
+    fn field_get<V: haphe::IntoScript + Clone + 'static>(
+        &mut self,
+        name: &'static str,
+        _: fn(&T) -> V,
+    ) -> Result<(), NeverError> {
+        self.get_only_fields.push(name);
         Ok(())
     }
 
@@ -370,6 +380,7 @@ fn bound<T: ScriptBind>() -> MockBinder<T> {
         arith_self: Vec::new(),
         bnot: None,
         fields: Vec::new(),
+        get_only_fields: Vec::new(),
         methods: Vec::new(),
         mut_methods: Vec::new(),
         hash: None,
@@ -1726,4 +1737,95 @@ fn container_typed_fields_bind() {
             binder.fields
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Outbound-only reference composites: returns and readonly fields
+// ---------------------------------------------------------------------------
+
+#[derive(Script, Clone)]
+#[script(methods)]
+struct Catalog {
+    #[script(readonly)]
+    tags: Vec<&'static str>,
+}
+
+#[haphe::script]
+impl Catalog {
+    fn all_tags(&self) -> Vec<&'static str> {
+        self.tags.clone()
+    }
+
+    /// Non-'static borrows convert immediately at the boundary too.
+    fn first_pair(&self) -> (&str, i64) {
+        (self.tags[0], 1)
+    }
+
+    #[script(getter)]
+    fn labels(&self) -> Vec<&'static str> {
+        self.tags.clone()
+    }
+}
+
+#[haphe::script]
+fn static_tags() -> Vec<&'static str> {
+    vec!["a", "b"]
+}
+
+#[test]
+fn outbound_reference_composites_bind() {
+    let binder = bound::<Catalog>();
+    let c = Catalog { tags: vec!["x"] };
+
+    // Return positions: methods bind and convert.
+    let (_, f) = binder
+        .methods
+        .iter()
+        .find(|(n, _)| *n == "all_tags")
+        .expect("outbound-ref return method bound");
+    let out = f(haphe::ScriptCow::Borrowed(&c), &[]).unwrap();
+    assert!(matches!(&out, ScriptValue::List(items)
+        if matches!(&items[0], ScriptValue::String(s) if s == "x")));
+    assert!(binder.methods.iter().any(|(n, _)| *n == "first_pair"));
+
+    // Readonly field: the getter-only channel.
+    assert!(
+        binder.get_only_fields.contains(&"tags"),
+        "readonly outbound field registers via field_get; got {:?}",
+        binder.get_only_fields
+    );
+    assert!(!binder.fields.contains(&"tags"));
+
+    // Getter-only property.
+    assert!(binder.prop_gets.iter().any(|(n, _)| *n == "labels"));
+}
+
+#[test]
+fn outbound_reference_free_fn_binds() {
+    use haphe::{FnBinder, ScriptBindFn};
+    struct Collect(Vec<&'static str>);
+    impl FnBinder for Collect {
+        type Error = NeverError;
+        fn function(
+            &mut self,
+            name: &'static str,
+            _: &'static [haphe::TypeDescriptor<'static>],
+            _: fn(&[ScriptValue]) -> Result<ScriptValue, ScriptCallError>,
+        ) -> Result<(), NeverError> {
+            self.0.push(name);
+            Ok(())
+        }
+
+        fn function_async(
+            &mut self,
+            _: &'static str,
+            _: &'static [haphe::TypeDescriptor<'static>],
+            _: for<'a> fn(&'a [ScriptValue]) -> haphe::ScriptCallFuture<'a>,
+        ) -> Result<(), NeverError> {
+            Ok(())
+        }
+    }
+    let mut binder = Collect(Vec::new());
+    <static_tags as ScriptBindFn>::bind(&mut binder).unwrap();
+    assert_eq!(binder.0, ["static_tags"]);
 }

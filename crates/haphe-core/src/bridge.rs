@@ -623,6 +623,16 @@ pub trait TypeBinder<T>: Sized {
         setter: Option<fn(&mut T, V)>,
     ) -> Result<(), Self::Error>;
 
+    /// Register a READ-ONLY field whose type converts outbound only —
+    /// e.g. `Vec<&'static str>`, which has `IntoScript` element conversions
+    /// but no inbound counterpart. Surfaced exactly like a read-only
+    /// [`field`](Self::field); there is never a setter.
+    fn field_get<V: IntoScript + Clone + 'static>(
+        &mut self,
+        name: &'static str,
+        getter: fn(&T) -> V,
+    ) -> Result<(), Self::Error>;
+
     /// Register a non-mutating method (`&self` or consuming `self`). The
     /// wrapper converts arguments from `ScriptValue` and returns the result
     /// as `ScriptValue` — the macro generates the conversion code with

@@ -515,8 +515,13 @@ pub fn expand(mut item: ItemImpl) -> TokenStream {
             crate::bind::is_bridge_compatible_type(ty)
                 || crate::bind::is_bridge_value_type(&crate::bind::strip_ref(ty))
         };
-        let bindable =
-            bridgeable(&getter.ret_ty) && setter.as_ref().is_none_or(|st| bridgeable(&st.param_ty));
+        // A getter-only property may return an outbound-only composite
+        // (`Vec<&'static str>`) — conversion is outbound, immediate.
+        let bindable = (bridgeable(&getter.ret_ty)
+            || (setter.is_none()
+                && !crate::bind::is_reference(&getter.ret_ty)
+                && crate::bind::is_bridge_outbound_type(&getter.ret_ty)))
+            && setter.as_ref().is_none_or(|st| bridgeable(&st.param_ty));
         if !bindable {
             for ty in std::iter::once(&getter.ret_ty).chain(setter.as_ref().map(|st| &st.param_ty))
             {
@@ -705,7 +710,9 @@ fn is_bind_compatible(func: &syn::ImplItemFn, info: &crate::fn_desc::FnInfo) -> 
     }
     if let Some(ret) = &info.return_ty
         && !is_bridge_compatible_type(ret)
-        && (is_reference(ret) || !is_bridge_value_type(ret))
+        // Returns convert immediately at the boundary, so outbound-only
+        // composites (`Vec<&str>`) are fine there.
+        && (is_reference(ret) || !crate::bind::is_bridge_outbound_type(ret))
     {
         return false;
     }
@@ -733,7 +740,7 @@ fn reject_nested_references(
         if let Some(span) = crate::bind::nested_reference_span(ty) {
             errors.spanned(
                 span,
-                "references inside composite types cannot cross the bridge; \
+                "references inside composite types cannot cross the bridge inbound; \
                  use owned element types (e.g. `Vec<String>` instead of `Vec<&str>`)",
             );
             return;

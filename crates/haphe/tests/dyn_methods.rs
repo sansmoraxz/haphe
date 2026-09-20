@@ -70,6 +70,14 @@ impl<T> TypeBinder<T> for DynBinder<T> {
         Ok(())
     }
 
+    fn field_get<V: haphe::IntoScript + Clone + 'static>(
+        &mut self,
+        _: &'static str,
+        _: fn(&T) -> V,
+    ) -> Result<(), NeverError> {
+        Ok(())
+    }
+
     fn method(&mut self, name: &'static str, _: DynFn<T>) -> Result<(), NeverError> {
         self.plain_methods.push(name);
         Ok(())

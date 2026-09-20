@@ -298,7 +298,9 @@ pub fn expand(mut item: ItemFn) -> TokenStream {
             .all(|(_, ty)| crate::bind::is_bridge_value_type(&substitute_type_params(ty, subst)))
             && info.return_ty.as_ref().is_none_or(|t| {
                 let t = substitute_type_params(t, subst);
-                !matches!(t, Type::Reference(_)) && crate::bind::is_bridge_value_type(&t)
+                // Returns convert immediately at the boundary, so
+                // outbound-only composites (`Vec<&str>`) are fine there.
+                !matches!(t, Type::Reference(_)) && crate::bind::is_bridge_outbound_type(&t)
             })
     };
 

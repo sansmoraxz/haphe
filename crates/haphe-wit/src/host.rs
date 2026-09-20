@@ -293,6 +293,19 @@ impl<U: 'static> TypeBinder<U> for RawTable<U> {
         Ok(())
     }
 
+    fn field_get<V: IntoScript + Clone + 'static>(
+        &mut self,
+        name: &'static str,
+        getter: fn(&U) -> V,
+    ) -> Result<(), Infallible> {
+        // Outbound-only read-only field: same erased entry as `field`, with
+        // no setter — a readonly field never renders a set member, so the
+        // getter is all the plumbing ever looks up.
+        let get: FieldGet<U> = Box::new(move |u| getter(u).into_script());
+        self.fields.push((name, get, None));
+        Ok(())
+    }
+
     fn method(&mut self, name: &'static str, f: CowFn<U>) -> Result<(), Infallible> {
         self.methods_cow.push((name, f));
         Ok(())

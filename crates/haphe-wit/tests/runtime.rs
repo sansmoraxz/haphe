@@ -4484,6 +4484,10 @@ struct Toggle {
     /// Map-typed FIELD: registers through the widened field gate; the guest
     /// writes it through the field setter (declared-descriptor reshaping).
     weights: std::collections::HashMap<String, i64>,
+    /// Outbound-only READ-ONLY field: `&'static str` elements convert
+    /// outbound, so the getter-only `field_get` channel serves it.
+    #[script(readonly)]
+    tags: Vec<&'static str>,
 }
 
 impl haphe::ops::Call<(std::collections::HashMap<String, i64>,)> for Toggle {
@@ -4500,6 +4504,7 @@ impl Toggle {
         Toggle {
             powered: FlagT(on),
             weights: std::collections::HashMap::new(),
+            tags: vec!["on", "off"],
         }
     }
 
@@ -4549,6 +4554,18 @@ impl Toggle {
     /// free functions.
     fn history(&self) -> Vec<i64> {
         vec![7, 9]
+    }
+
+    /// Outbound-only RETURN: `&'static str` elements convert immediately at
+    /// the boundary.
+    fn tag_list(&self) -> Vec<&'static str> {
+        self.tags.clone()
+    }
+
+    /// Getter-only property of an outbound-only type.
+    #[script(getter)]
+    fn banner(&self) -> Vec<&'static str> {
+        self.tags.clone()
     }
 
     /// Map-typed parameter on a METHOD: lifted by the declared descriptor.
@@ -4983,6 +5000,23 @@ fn transparent_newtype_async_signatures_render_as_bool() {
         text.contains("history: func() -> list<s64>;"),
         "got:\n{text}"
     );
+    // Outbound-only reference composites: the readonly field renders
+    // getter-only, and returns/getter-only properties render as their
+    // owned wire shape.
+    assert!(
+        text.contains("tags: func() -> list<string>;"),
+        "got:\n{text}"
+    );
+    assert!(!text.contains("set-tags"), "got:\n{text}");
+    assert!(
+        text.contains("tag-list: func() -> list<string>;"),
+        "got:\n{text}"
+    );
+    assert!(
+        text.contains("banner: func() -> list<string>;"),
+        "got:\n{text}"
+    );
+    assert!(!text.contains("set-banner"), "got:\n{text}");
     // u64 stays u64 in the text; the runtime carries the i64 bit pattern.
     assert!(text.contains("max-tag: func() -> u64;"), "got:\n{text}");
     assert!(
@@ -5367,6 +5401,84 @@ fn map_property_setter_lifts_by_declared_descriptor() {
 
     let out = run_guest(&engine, &linker, (), MAP_PROP_GUEST).expect("map property setter lifts");
     assert_eq!(out, Val::S64(9));
+}
+
+/// Reads the outbound-only readonly field (`field_get` channel), the
+/// outbound-return method, and the getter-only property live: each returns
+/// `["on", "off"]`, so `run()` = 3 × (len*10 + first-string-len) = 66.
+const OUTBOUND_TAGS_GUEST: &str = r#"
+(component
+  (import "haphe:demo/toggles" (instance $tg
+    (export "toggle" (type $t (sub resource)))
+    (export "[constructor]toggle" (func (param "on" bool) (result (own $t))))
+    (export "[method]toggle.tags" (func (param "self" (borrow $t)) (result (list string))))
+    (export "[method]toggle.tag-list" (func (param "self" (borrow $t)) (result (list string))))
+    (export "[method]toggle.banner" (func (param "self" (borrow $t)) (result (list string))))
+  ))
+  (core module $libc
+    (memory (export "mem") 16)
+    (func (export "realloc") (param i32 i32 i32 i32) (result i32) (i32.const 8192))
+  )
+  (core instance $li (instantiate $libc))
+  (core func $ctor (canon lower (func $tg "[constructor]toggle")))
+  (core func $tags (canon lower (func $tg "[method]toggle.tags")
+    (memory (core memory $li "mem")) (realloc (core func $li "realloc"))))
+  (core func $tag_list (canon lower (func $tg "[method]toggle.tag-list")
+    (memory (core memory $li "mem")) (realloc (core func $li "realloc"))))
+  (core func $banner (canon lower (func $tg "[method]toggle.banner")
+    (memory (core memory $li "mem")) (realloc (core func $li "realloc"))))
+  (core module $m
+    (import "libc" "mem" (memory 1))
+    (import "tg" "ctor" (func $ctor (param i32) (result i32)))
+    (import "tg" "tags" (func $tags (param i32 i32)))
+    (import "tg" "tag_list" (func $tag_list (param i32 i32)))
+    (import "tg" "banner" (func $banner (param i32 i32)))
+    ;; score(ret): list-len * 10 + first element's string length
+    (func $score (param $ret i32) (result i64)
+      (i64.add
+        (i64.mul
+          (i64.extend_i32_u (i32.load offset=4 (local.get $ret)))
+          (i64.const 10))
+        (i64.extend_i32_u (i32.load offset=4 (i32.load (local.get $ret))))))
+    (func (export "run") (result i64) (local $h i32)
+      (local.set $h (call $ctor (i32.const 1)))
+      (call $tags (local.get $h) (i32.const 512))
+      (call $tag_list (local.get $h) (i32.const 640))
+      (call $banner (local.get $h) (i32.const 768))
+      (i64.add (i64.add
+        (call $score (i32.const 512))
+        (call $score (i32.const 640)))
+        (call $score (i32.const 768))))
+  )
+  (core instance $mi (instantiate $m
+    (with "libc" (instance
+      (export "mem" (memory $li "mem"))))
+    (with "tg" (instance
+      (export "ctor" (func $ctor))
+      (export "tags" (func $tags))
+      (export "tag_list" (func $tag_list))
+      (export "banner" (func $banner))))
+  ))
+  (func (export "run") (result s64) (canon lift (core func $mi "run")))
+)
+"#;
+
+#[test]
+fn outbound_reference_composites_read_live() {
+    let engine = Engine::default();
+    let mut linker = Linker::new(&engine);
+    let mut b = WasmBinder::new(WitGenerator::new("haphe:demo"));
+    b.register_type::<Toggle>().unwrap();
+    b.register_fn::<invert_later>().unwrap();
+    b.register_fn::<flip_deep>().unwrap();
+    b.register_fn::<max_tag>().unwrap();
+    b.register_fn::<echo_tag>().unwrap();
+    haphe::bind(&b, &TOGGLE_REGISTRY, &mut linker).expect("binding succeeds");
+
+    // ["on", "off"] per surface: 2*10 + 2 = 22 each, three surfaces = 66.
+    let out = run_guest(&engine, &linker, (), OUTBOUND_TAGS_GUEST)
+        .expect("outbound reference composites read");
+    assert_eq!(out, Val::S64(66));
 }
 
 #[test]

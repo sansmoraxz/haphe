@@ -58,6 +58,14 @@ impl<T> TypeBinder<T> for Collect<T> {
         Ok(())
     }
 
+    fn field_get<V: haphe::IntoScript + Clone + 'static>(
+        &mut self,
+        _: &'static str,
+        _: fn(&T) -> V,
+    ) -> Result<(), NeverError> {
+        Ok(())
+    }
+
     fn method(&mut self, name: &'static str, f: MethodFn<T>) -> Result<(), NeverError> {
         self.methods.push((name, f));
         Ok(())

@@ -116,13 +116,20 @@ fn field_expr(field: &syn::Field, ctx: &TyCtx, errors: &mut Errors) -> Option<To
     if args.skip.is_some() {
         return None;
     }
-    // A nested reference has no bridge conversion at any surface — error at
-    // the declaration instead of leaving the field silently accessor-less.
-    if let Some(span) = crate::bind::nested_reference_span(&field.ty) {
+    // A nested reference has no INBOUND bridge conversion — error at the
+    // declaration instead of leaving the field silently accessor-less. The
+    // exception: a READ-ONLY field of an outbound-convertible type with
+    // `'static` references (`Vec<&'static str>`) registers through the
+    // getter-only channel.
+    let outbound_readonly = args.readonly.is_some()
+        && crate::bind::is_bridge_outbound_type(&field.ty)
+        && crate::bind::nested_refs_all_static(&field.ty);
+    if !outbound_readonly && let Some(span) = crate::bind::nested_reference_span(&field.ty) {
         errors.spanned(
             span,
-            "references inside composite types cannot cross the bridge; \
-             use owned element types (e.g. `Vec<String>` instead of `Vec<&str>`)",
+            "references inside composite types cannot cross the bridge inbound; \
+             use owned element types (e.g. `Vec<String>` instead of `Vec<&str>`), \
+             or mark the field `readonly` with `'static` references",
         );
     }
     let ident = field.ident.as_ref().expect("named field");
