@@ -79,10 +79,14 @@ mod binder;
 mod decl;
 mod error;
 mod foreign;
+#[cfg(feature = "luau-types")]
+mod luau_decl;
 mod module;
 
 pub use decl::{LuaDeclError, LuaDeclGenerator};
 pub use foreign::{foreign_caller, foreign_handle};
+#[cfg(feature = "luau-types")]
+pub use luau_decl::{LuauDeclError, LuauDeclGenerator};
 
 use haphe::{
     BackendCapabilities, RuntimeBinder, ScriptBind, ScriptBindFn, ScriptStruct, ThreadSafety,
