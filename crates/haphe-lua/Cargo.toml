@@ -22,6 +22,7 @@ lua51 = ["mlua/lua51"]
 luajit52 = ["mlua/luajit52"]
 luajit = ["mlua/luajit"]
 luau = ["mlua/luau"]
+luau-types = ["luau"]
 
 # Optional Lua extensions
 luau-jit = ["mlua/luau-jit"]
