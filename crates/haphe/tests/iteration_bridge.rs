@@ -1252,11 +1252,6 @@ impl Meter {
         Meter { raw }
     }
 
-    #[script(constructor)]
-    async fn connect(raw: i64) -> Self {
-        Meter { raw }
-    }
-
     #[script(getter)]
     fn level(&self) -> i64 {
         self.raw * 2
@@ -1323,18 +1318,31 @@ fn async_properties_register_and_await() {
     assert_eq!(target.raw, 41, "async setter mutates in place");
 }
 
+#[derive(Script, Clone)]
+#[script(thread_safety = send_sync, methods)]
+struct AsyncMeter {
+    #[script(skip)]
+    raw: i64,
+}
+
+#[haphe::script]
+impl AsyncMeter {
+    #[script(constructor)]
+    async fn new(raw: i64) -> Self {
+        AsyncMeter { raw }
+    }
+}
+
 #[test]
 fn async_constructor_registers_and_awaits() {
     use std::task::{Context, Poll, Waker};
-    let binder = bound::<Meter>();
-    // The sync ctor stays on the sync channel.
-    assert!(binder.constructors.iter().any(|(n, _)| *n == "new"));
+    let binder = bound::<AsyncMeter>();
     let (name, ctor) = binder
         .async_ctors
         .iter()
-        .find(|(n, _)| *n == "connect")
+        .find(|(n, _)| *n == "new")
         .expect("async constructor registered");
-    assert_eq!(*name, "connect");
+    assert_eq!(*name, "new");
 
     let mut cx = Context::from_waker(Waker::noop());
     let args = [ScriptValue::I64(9)];
@@ -1366,11 +1374,10 @@ struct Gauge {
 )]
 impl Gauge {
     #[script(constructor)]
-    fn try_new(raw: i64) -> Result<Self, TextError> {
+    fn new(raw: i64) -> Result<Self, TextError> {
         Ok(Gauge { raw })
     }
 
-    #[script(constructor)]
     async fn try_connect(raw: i64) -> Result<Self, TextError> {
         Ok(Gauge { raw })
     }
@@ -1384,13 +1391,11 @@ impl Gauge {
 fn fallible_constructors_are_described_and_bound() {
     use haphe::ScriptImpl;
     let ctors = <Gauge as ScriptImpl>::CONSTRUCTORS;
-    assert_eq!(ctors.len(), 2, "both fallible ctors described");
-    assert!(ctors.iter().any(|c| c.name == "try_new"));
-    assert!(ctors.iter().any(|c| c.name == "try_connect" && c.is_async));
+    assert_eq!(ctors.len(), 1, "fallible ctor described");
+    assert!(ctors.iter().any(|c| c.name == "new"));
 
     let binder = bound::<Gauge>();
     assert_eq!(binder.constructors.len(), 1, "fallible sync ctor bound");
-    assert_eq!(binder.async_ctors.len(), 1, "fallible async ctor bound");
 }
 
 // ---------------------------------------------------------------------------

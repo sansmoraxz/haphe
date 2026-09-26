@@ -105,24 +105,8 @@ struct Counter {
 #[script]
 impl Counter {
     #[script(constructor)]
-    fn new() -> Self {
-        Counter { n: 0 }
-    }
-
-    /// Seeds a counter asynchronously.
-    #[script(constructor)]
-    async fn seeded(n: i64) -> Self {
+    fn new(n: i64) -> Self {
         Counter { n }
-    }
-
-    /// Fallible constructor: rejects negative seeds.
-    #[script(constructor, error_kind = "RangeError")]
-    fn bounded(n: i64) -> Result<Self, TextError> {
-        if n < 0 {
-            Err(TextError(format!("negative seed {n}")))
-        } else {
-            Ok(Counter { n })
-        }
     }
 
     /// Fallible method: errors on underflow.
@@ -2174,15 +2158,15 @@ const CROSS_TYPE_GUEST: &str = r#"
     (export "point" (type $point (sub resource)))
     (export "counter" (type $counter (sub resource)))
     (export "[method]point.x" (func (param "self" (borrow $point)) (result f64)))
-    (export "[constructor]counter" (func (result (own $counter))))
+    (export "[constructor]counter" (func (param "n" s64) (result (own $counter))))
   ))
   (core func $cctor (canon lower (func $geo "[constructor]counter")))
   (core func $getx (canon lower (func $geo "[method]point.x")))
   (core module $m
-    (import "geo" "cctor" (func $cctor (result i32)))
+    (import "geo" "cctor" (func $cctor (param i64) (result i32)))
     (import "geo" "getx" (func $getx (param i32) (result f64)))
     (func (export "run") (result f64)
-      (call $getx (call $cctor)))
+      (call $getx (call $cctor (i64.const 0))))
   )
   (core instance $mi (instantiate $m
     (with "geo" (instance
@@ -2934,35 +2918,35 @@ fn async_lifted_guest_dispatches_via_call_async() {
     assert_eq!(block_on(math.add(20, 22)), 42);
 }
 
-/// Properties and async constructors dispatch live: seeded(3) -> n=3;
+/// Properties and constructor dispatch live: new(3) -> n=3;
 /// doubled -> 6; set-doubled(10) -> n=5; set-lagged(107) -> n=7 (async
 /// setter mutation persists); lagged -> 107; bump -> 8. 6+107+8 = 121.
 const COUNTER_PROPS_GUEST: &str = r#"
 (component
   (import "haphe:demo/geometry" (instance $geo
     (export "counter" (type $counter (sub resource)))
-    (export "[static]counter.seeded" (func (param "n" s64) (result (own $counter))))
+    (export "[constructor]counter" (func (param "n" s64) (result (own $counter))))
     (export "[method]counter.doubled" (func (param "self" (borrow $counter)) (result s64)))
     (export "[method]counter.set-doubled" (func (param "self" (borrow $counter)) (param "value" s64)))
     (export "[method]counter.lagged" (func (param "self" (borrow $counter)) (result s64)))
     (export "[method]counter.set-lagged" (func (param "self" (borrow $counter)) (param "value" s64)))
     (export "[method]counter.bump" (func (param "self" (borrow $counter)) (result s64)))
   ))
-  (core func $seeded (canon lower (func $geo "[static]counter.seeded")))
+  (core func $ctor (canon lower (func $geo "[constructor]counter")))
   (core func $doubled (canon lower (func $geo "[method]counter.doubled")))
   (core func $setd (canon lower (func $geo "[method]counter.set-doubled")))
   (core func $lagged (canon lower (func $geo "[method]counter.lagged")))
   (core func $setl (canon lower (func $geo "[method]counter.set-lagged")))
   (core func $bump (canon lower (func $geo "[method]counter.bump")))
   (core module $m
-    (import "geo" "seeded" (func $seeded (param i64) (result i32)))
+    (import "geo" "ctor" (func $ctor (param i64) (result i32)))
     (import "geo" "doubled" (func $doubled (param i32) (result i64)))
     (import "geo" "setd" (func $setd (param i32 i64)))
     (import "geo" "lagged" (func $lagged (param i32) (result i64)))
     (import "geo" "setl" (func $setl (param i32 i64)))
     (import "geo" "bump" (func $bump (param i32) (result i64)))
     (func (export "run") (result i64) (local $c i32) (local $acc i64)
-      (local.set $c (call $seeded (i64.const 3)))
+      (local.set $c (call $ctor (i64.const 3)))
       (local.set $acc (call $doubled (local.get $c)))
       (call $setd (local.get $c) (i64.const 10))
       (call $setl (local.get $c) (i64.const 107))
@@ -2971,7 +2955,7 @@ const COUNTER_PROPS_GUEST: &str = r#"
   )
   (core instance $mi (instantiate $m
     (with "geo" (instance
-      (export "seeded" (func $seeded))
+      (export "ctor" (func $ctor))
       (export "doubled" (func $doubled))
       (export "setd" (func $setd))
       (export "lagged" (func $lagged))
@@ -3001,13 +2985,13 @@ const COUNTER_PROP_STUB_GUEST: &str = r#"
 (component
   (import "haphe:demo/geometry" (instance $geo
     (export "counter" (type $counter (sub resource)))
-    (export "[constructor]counter" (func (result (own $counter))))
+    (export "[constructor]counter" (func (param "n" s64) (result (own $counter))))
     (export "[method]counter.doubled" (func (param "self" (borrow $counter)) (result s64)))
   ))
   (core func $ctor (canon lower (func $geo "[constructor]counter")))
   (core module $m
-    (import "geo" "ctor" (func $ctor (result i32)))
-    (func (export "run") (result i64) (drop (call $ctor)) (i64.const 0))
+    (import "geo" "ctor" (func $ctor (param i64) (result i32)))
+    (func (export "run") (result i64) (drop (call $ctor (i64.const 0))) (i64.const 0))
   )
   (core instance $mi (instantiate $m
     (with "geo" (instance (export "ctor" (func $ctor))))
