@@ -2,19 +2,20 @@
 
 Describe Rust types once, bind them into any embedded scripting runtime.
 
-haphe provides a language-agnostic IR for Rust types, functions, and modules.
+`haphe` provides a language-agnostic IR for Rust types, functions, and modules.
 Backend crates implement `RuntimeBinder` to register types into a live
-scripting runtime. The binding code matches what you'd write by hand — haphe
-adds nothing to your runtime binary beyond the registration calls themselves.
+scripting runtime. Or generate binding artifacts (stubs, declarations, etc.) for
+other tools to consume. The IR is const-constructible, so the compiler can verify
+the registry at build time, and the runtime binding is monomorphized per backend.
 
 Backends officially supported in this workspace:
 
 - [`haphe-lua`](crates/haphe-lua) — mlua: live Lua registration plus LuaLS
-  `---@meta` declaration stubs;
+  declaration stubs.
 - [`haphe-wit`](crates/haphe-wit) — WebAssembly Component Model: `.wit`
   document generation plus live wasmtime host binding.
 - [`haphe-rhai`](crates/haphe-rhai) — Rhai: live Rhai registration plus RhaiLS
-  `---@meta` declaration stubs.
+  declaration stubs.
 
 You are not limited to these backends: implement `RuntimeBinder` for any runtime
 you like, and use haphe's derive macros to describe your types once and bind
@@ -58,10 +59,9 @@ haphe::registry! {
 }
 ```
 
-Everything the macros generate is a compile-time constant, byte-for-byte what
-you would write by hand. Nothing is inferred: trait impls and thread safety
-are declared in the attribute and **verified** — declaring
-`traits(Display)` on a type that isn't `Display`, or `thread_safety =
+Everything the macros generate is a compile-time constant.Nothing is inferred:
+trait impls and thread safety are declared in the attribute and **verified** —
+ declaring `traits(Display)` on a type that isn't `Display`, or `thread_safety =
 send_sync` on a `!Sync` type, is a compile error at the attribute (for generic
 types, at each exposed instantiation). The default thread-safety claim is
 `none`; only types with `async` methods must declare one explicitly (async
@@ -104,7 +104,7 @@ documented rule; nothing is silently dropped:
   the script/guest side and called from Rust through a generated handle.
 
 Signatures the syntactic whitelist can't judge (e.g. methods over
-transparent primitive newtypes) register through compile-time
+transparent primitive newtypes) register through
 trait-presence dispatch: a real registration when the bridge traits hold, a
 no-op otherwise — never a broken binding.
 
@@ -144,7 +144,7 @@ secondary concern handled by `BindingGenerator`.
 
 ### Zero-Cost Design
 
-`haphe-core` is a **build-time only** dependency.
+`haphe-core` is a **build-time only** dependency. At least that's the goal.
 
 With `'static` references, descriptors are compile-time constants. The `RuntimeBinder::bind` implementation is monomorphized per backend.
 
