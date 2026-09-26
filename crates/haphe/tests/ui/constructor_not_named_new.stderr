@@ -1,5 +1,5 @@
 error: constructor must be named `new`; use `rename = "new"` if the Rust function has a different name
-  --> tests/ui/constructor_with_receiver.rs:11:14
+  --> tests/ui/constructor_not_named_new.rs:11:14
    |
 11 |     #[script(constructor)]
    |              ^^^^^^^^^^^

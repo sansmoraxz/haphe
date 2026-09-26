@@ -1,0 +1,41 @@
+[package]
+name = "haphe-rhai"
+version = "0.1.0"
+edition = "2024"
+description = "Rhai backend for the haphe scripting-language binding generator"
+license = "Apache-2.0"
+
+[dependencies]
+haphe = { path = "../haphe", default-features = false }
+rhai = "1.26"
+
+[features]
+default = []
+
+# Thread safety: require all custom types to be Send + Sync.
+sync = ["rhai/sync"]
+
+# Generic dispatch, both directions: export-side static generic
+# methods/associated fns (mangled monomorph names) and dyn candidate
+# scanning (dyn_generics capability); foreign-side generic
+# interfaces/functions (Rhai is dynamically typed, so one function serves
+# every instantiation). Without this feature, generic use is a descriptive
+# error.
+generics = []
+
+# Accept `TypeDescriptor::Borrowed` (e.g. `Cow<'_, str>`) in type and
+# function signatures.  Rhai clones every value at the boundary anyway,
+# so there is no extra cost — this feature exists purely as a
+# compatibility shim so that types written for backends with real borrow
+# semantics can bind without change.  Without it, borrowed signatures
+# are rejected at bind time.
+borrowed = []
+
+# rhai supports no async, so streams and futures are not supported.
+
+[dev-dependencies]
+haphe = { path = "../haphe", features = ["macros", "bitflags"] }
+rhai = { version = "1.26" }
+
+[lints]
+workspace = true

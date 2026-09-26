@@ -273,15 +273,6 @@ impl Gauge {
         }
     }
 
-    #[script(constructor)]
-    async fn fetch(level: i64) -> Result<Self, TextError> {
-        if level < 0 {
-            Err(TextError("negative".into()))
-        } else {
-            Ok(Gauge { level })
-        }
-    }
-
     #[script(error_kind = "RangeError")]
     fn checked_add(&self, amount: i64) -> Result<i64, TextError> {
         self.level
@@ -338,18 +329,6 @@ fn fallible_constructor_maps_err_to_host() {
             assert!(error.to_string().contains("negative level -1"));
         }
         ScriptCallError::Convert(other) => panic!("expected Callee error, got {other:?}"),
-    }
-}
-
-#[test]
-fn fallible_async_constructor_maps_err_to_host() {
-    let binder = bound::<Gauge>();
-    let (name, ctor) = binder.async_ctors[0];
-    assert_eq!(name, "fetch");
-    assert_eq!(poll_ready(ctor(&[ScriptValue::I64(5)])).unwrap().level, 5);
-    match poll_ready(ctor(&[ScriptValue::I64(-1)])).unwrap_err() {
-        ScriptCallError::Callee { kind: None, .. } => {}
-        other => panic!("expected kind-less Host error, got {other:?}"),
     }
 }
 
