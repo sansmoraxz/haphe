@@ -7,12 +7,18 @@ Backend crates implement `RuntimeBinder` to register types into a live
 scripting runtime. The binding code matches what you'd write by hand — haphe
 adds nothing to your runtime binary beyond the registration calls themselves.
 
-Two backends live in this workspace:
+Backends officially supported in this workspace:
 
 - [`haphe-lua`](crates/haphe-lua) — mlua: live Lua registration plus LuaLS
   `---@meta` declaration stubs;
 - [`haphe-wit`](crates/haphe-wit) — WebAssembly Component Model: `.wit`
   document generation plus live wasmtime host binding.
+- [`haphe-rhai`](crates/haphe-rhai) — Rhai: live Rhai registration plus RhaiLS
+  `---@meta` declaration stubs.
+
+You are not limited to these backends: implement `RuntimeBinder` for any runtime
+you like, and use haphe's derive macros to describe your types once and bind
+them into multiple runtimes.
 
 ## Quickstart: derive the descriptors
 
