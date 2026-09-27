@@ -682,6 +682,22 @@ impl<T: 'static + Clone + mlua::MaybeSend + mlua::MaybeSync> LuaTypeBinder<T> {
             type_table.set(*name, lua_fn)?;
         }
 
+        // Table-constructor shorthand: `Type(...)` delegates to `Type.new(...)`.
+        if let Ok(new_fn) = type_table.get::<mlua::Function>("new") {
+            let meta = lua.create_table()?;
+            meta.set(
+                "__call",
+                lua.create_function(move |_lua, args: mlua::MultiValue| {
+                    // First argument is the table itself (Lua __call convention);
+                    // forward the rest to the stored `new` function.
+                    let mut iter = args.into_vec().into_iter();
+                    iter.next();
+                    new_fn.call::<mlua::MultiValue>(mlua::MultiValue::from_iter(iter))
+                })?,
+            )?;
+            type_table.set_metatable(Some(meta))?;
+        }
+
         // Associated fns → Lua functions on the type table, next to
         // constructors: no receiver, so `Type.assoc(...)` with no instance.
         for (name, f) in &self.associated {

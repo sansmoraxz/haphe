@@ -101,7 +101,7 @@ mod async_ctor {
     #[script]
     impl Probe {
         #[script(constructor)]
-        async fn connect(id: i64) -> Self {
+        async fn new(id: i64) -> Self {
             Probe { id }
         }
 
@@ -118,7 +118,7 @@ mod async_ctor {
         bind_type::<Probe>(&lua, &tbl).unwrap();
         lua.globals().set("Probe", tbl).unwrap();
         let out: i64 = lua
-            .load("local p = Probe.connect(9); return p.id")
+            .load("local p = Probe.new(9); return p.id")
             .eval_async()
             .await
             .unwrap();
@@ -140,7 +140,7 @@ mod no_async_feature {
     #[script]
     impl Probe {
         #[script(constructor)]
-        async fn connect(id: i64) -> Self {
+        async fn new(id: i64) -> Self {
             Probe { id }
         }
     }
@@ -154,7 +154,7 @@ mod no_async_feature {
         };
         let msg = err.to_string();
         assert!(
-            msg.contains("connect") && msg.contains("async"),
+            msg.contains("new") && msg.contains("async"),
             "got: {msg}"
         );
     }

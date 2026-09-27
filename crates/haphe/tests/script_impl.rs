@@ -380,6 +380,29 @@ fn self_in_accessor_signatures() {
     assert!(!props[0].readonly);
 }
 
+/// `rename = "new"` on a differently-named function is the valid spelling
+/// for constructors whose Rust name cannot be `new`.
+#[derive(Script)]
+#[script(methods)]
+struct Socket {
+    fd: i64,
+}
+
+#[script]
+impl Socket {
+    #[script(constructor, rename = "new")]
+    fn connect(fd: i64) -> Self {
+        Socket { fd }
+    }
+}
+
+#[test]
+fn renamed_constructor_exposes_as_new() {
+    let ctors = <Socket as ScriptImpl>::CONSTRUCTORS;
+    assert_eq!(ctors.len(), 1);
+    assert_eq!(ctors[0].name, "new");
+}
+
 /// A message-only fixture error: `String` itself no longer crosses (host
 /// errors must implement `std::error::Error`).
 #[derive(Debug)]

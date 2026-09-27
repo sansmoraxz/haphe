@@ -340,3 +340,24 @@ fn lua_table_iteration() {
     assert!(keys.contains(&"mul".to_string()));
     assert!(keys.contains(&"utils".to_string()));
 }
+
+#[test]
+fn table_constructor_shorthand() {
+    let lua = Lua::new();
+    let tbl = lua.create_table().unwrap();
+    haphe_lua::bind_type::<Point>(&lua, &tbl).unwrap();
+    lua.globals().set("Point", tbl).unwrap();
+
+    let (x, y): (f64, f64) = lua
+        .load(
+            r"
+            local p = Point(3.0, 4.0)
+            return p.x, p.y
+            ",
+        )
+        .eval()
+        .unwrap();
+
+    assert!((x - 3.0).abs() < f64::EPSILON);
+    assert!((y - 4.0).abs() < f64::EPSILON);
+}

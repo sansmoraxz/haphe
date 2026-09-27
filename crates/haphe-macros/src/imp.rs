@@ -6,6 +6,7 @@ use std::collections::BTreeMap;
 use proc_macro2::TokenStream;
 use quote::{quote, quote_spanned};
 use syn::spanned::Spanned;
+use syn::ext::IdentExt;
 use syn::{Attribute, ImplItem, ItemImpl, Type};
 
 use crate::attrs::{Errors, option_str_tokens, parse_fn_args, strip_script_attrs};
@@ -269,6 +270,21 @@ pub fn expand(mut item: ItemImpl) -> TokenStream {
         }
 
         if let Some(span) = fn_args.constructor {
+            let script_name = fn_args
+                .rename
+                .as_ref()
+                .map_or_else(|| func.sig.ident.unraw().to_string(), syn::LitStr::value);
+            if script_name != "new" {
+                let target = fn_args
+                    .rename
+                    .as_ref()
+                    .map_or(span, |r| r.span());
+                errors.spanned(
+                    target,
+                    "constructor must be named `new`; use `rename = \"new\"` if the Rust function has a different name",
+                );
+                continue;
+            }
             if info.receiver != ReceiverShape::None {
                 errors.spanned(span, "constructors cannot take a `self` receiver");
                 continue;

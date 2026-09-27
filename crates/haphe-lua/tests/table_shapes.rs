@@ -255,9 +255,9 @@ struct Ledger {
 
 #[script]
 impl Ledger {
-    /// Type-table namespace: `Ledger.reset(seed)` with a LIST parameter.
+    /// Type-table namespace: `Ledger.new(seed)` with a LIST parameter.
     #[script(constructor)]
-    fn reset(seed: Vec<i64>) -> Self {
+    fn new(seed: Vec<i64>) -> Self {
         Ledger { entries: seed }
     }
 
@@ -279,23 +279,22 @@ fn shared_name_converts_per_signature() {
     module.set("Ledger", &ledger).unwrap();
     bind_type::<Ledger>(&lua, &ledger).unwrap();
 
-    // `{}` converts through the CONSTRUCTOR's list param, even though a
-    // method shares the exposed name with a map param.
-    let out: i64 = lua.load("return m.Ledger.reset({}):len()").eval().unwrap();
+    // `{}` converts through the CONSTRUCTOR's list param.
+    let out: i64 = lua.load("return m.Ledger.new({}):len()").eval().unwrap();
     assert_eq!(out, 0);
     let out: i64 = lua
-        .load("return m.Ledger.reset({7, 8}):len()")
+        .load("return m.Ledger.new({7, 8}):len()")
         .eval()
         .unwrap();
     assert_eq!(out, 2);
-    // And the method's `{}` stays a map.
+    // The method's `{}` stays a map.
     let out: i64 = lua
-        .load("local l = m.Ledger.reset({1}) return l:reset({})")
+        .load("local l = m.Ledger.new({1}) return l:reset({})")
         .eval()
         .unwrap();
     assert_eq!(out, 1);
     let out: i64 = lua
-        .load("local l = m.Ledger.reset({1}) return l:reset({ a = 4 })")
+        .load("local l = m.Ledger.new({1}) return l:reset({ a = 4 })")
         .eval()
         .unwrap();
     assert_eq!(out, 5);

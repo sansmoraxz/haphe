@@ -1,0 +1,5 @@
+error: constructor must be named `new`; use `rename = "new"` if the Rust function has a different name
+  --> tests/ui/constructor_rename_rejected.rs:11:36
+   |
+11 |     #[script(constructor, rename = "create")]
+   |                                    ^^^^^^^^
