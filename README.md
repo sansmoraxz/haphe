@@ -10,12 +10,12 @@ the registry at build time, and the runtime binding is monomorphized per backend
 
 Backends officially supported in this workspace:
 
-- [`haphe-lua`](crates/haphe-lua) — mlua: live Lua registration plus LuaLS
-  declaration stubs.
+- [`haphe-lua`](crates/haphe-lua) — mlua: live Lua registration plus
+  [LuaLS](https://github.com/LuaLS/lua-language-server) declaration stubs.
 - [`haphe-wit`](crates/haphe-wit) — WebAssembly Component Model: `.wit`
   document generation plus live wasmtime host binding.
-- [`haphe-rhai`](crates/haphe-rhai) — Rhai: live Rhai registration plus RhaiLS
-  declaration stubs.
+- [`haphe-rhai`](crates/haphe-rhai) — Rhai: live Rhai registration plus
+- [RhaiLSP](https://github.com/rhaiscript/lsp) declaration stubs.
 
 You are not limited to these backends: implement `RuntimeBinder` for any runtime
 you like, and use haphe's derive macros to describe your types once and bind
