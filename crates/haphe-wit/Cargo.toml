@@ -43,7 +43,7 @@ trace-log = ["runtime", "wasmtime/trace-log"]
 [dependencies]
 haphe = { path = "../haphe", default-features = false }
 wit-parser = "0.259"
-wasmtime = { version = "48", optional = true }
+wasmtime = { version = "49", optional = true }
 
 [dev-dependencies]
 haphe = { path = "../haphe", features = ["macros", "streams", "futures"] }
